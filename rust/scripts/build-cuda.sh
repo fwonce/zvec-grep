@@ -65,17 +65,39 @@ backend_dir="$(dirname -- "${cuda_backend}")"
 llama_out_dir="$(dirname -- "${backend_dir}")"
 
 shopt -s nullglob
-llama_core_libraries=(
-  "${llama_out_dir}"/lib*/libllama.so*
-  "${llama_out_dir}"/lib*/libggml.so*
-  "${llama_out_dir}"/lib*/libggml-base.so*
-)
 llama_backend_libraries=("${backend_dir}"/libggml-*.so*)
-if (( ${#llama_core_libraries[@]} == 0 || ${#llama_backend_libraries[@]} == 0 )); then
+if (( ${#llama_backend_libraries[@]} == 0 )); then
   echo "llama.cpp shared libraries are incomplete" >&2
   exit 1
 fi
-cp -a -- "${llama_core_libraries[@]}" "${llama_backend_libraries[@]}" "${staging_dir}/"
+
+copy_core_library() {
+  local stem="$1"
+  local source=""
+  local candidate
+  for candidate in "${llama_out_dir}"/lib*/"${stem}".so*; do
+    if [[ -f "${candidate}" && ! -L "${candidate}" ]]; then
+      source="${candidate}"
+      break
+    fi
+  done
+  if [[ -z "${source}" ]]; then
+    echo "unable to locate the real shared library for ${stem}" >&2
+    exit 1
+  fi
+  local soname
+  soname="$(readelf -d "${source}" | sed -n 's/.*(SONAME).*\[\([^]]*\)\].*/\1/p' | head -n 1)"
+  if [[ -z "${soname}" || "${soname}" == */* ]]; then
+    echo "invalid or missing SONAME for ${source}: ${soname}" >&2
+    exit 1
+  fi
+  cp -L --preserve=mode,timestamps -- "${source}" "${staging_dir}/${soname}"
+}
+
+copy_core_library libllama
+copy_core_library libggml
+copy_core_library libggml-base
+cp -L --preserve=mode,timestamps -- "${llama_backend_libraries[@]}" "${staging_dir}/"
 
 for provider in libonnxruntime_providers_shared.so libonnxruntime_providers_cuda.so; do
   provider_path="$(find "${profile_dir}" -maxdepth 2 -name "${provider}" -print -quit)"

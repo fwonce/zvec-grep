@@ -21,6 +21,7 @@ import {
   run,
   selectPlatform,
   sha256File,
+  stageRuntimeBundle,
   stageZvecRuntime,
   workspaceDir,
 } from "./npm-package-core.mjs";
@@ -35,6 +36,7 @@ function parseOptions(args) {
   const options = {
     build: true,
     binary: undefined,
+    bundleDir: undefined,
     libDir: undefined,
     target: undefined,
   };
@@ -46,6 +48,7 @@ function parseOptions(args) {
     }
     const fields = new Map([
       ["--binary", "binary"],
+      ["--bundle-dir", "bundleDir"],
       ["--lib-dir", "libDir"],
       ["--target", "target"],
     ]);
@@ -60,6 +63,9 @@ function parseOptions(args) {
       continue;
     }
     throw new Error(`unknown option: ${argument}`);
+  }
+  if (options.bundleDir && (options.binary || options.libDir)) {
+    throw new Error("--bundle-dir cannot be combined with --binary or --lib-dir");
   }
   return options;
 }
@@ -132,6 +138,9 @@ async function packPlatform(options) {
   const manifest = loadReleaseManifest();
   const current = currentPlatform(manifest);
   const entry = options.target ? platformByTarget(manifest, options.target) : current;
+  if (options.bundleDir && options.build) {
+    throw new Error("--bundle-dir requires --no-build");
+  }
   if (options.build) {
     if (entry.target !== current.target) {
       throw new Error("cross-platform packaging requires --no-build and --binary");
@@ -139,7 +148,9 @@ async function packPlatform(options) {
     run("cargo", ["build", "--locked", "--release", "--package", "zg"]);
   }
 
-  const binary = options.binary ?? join(workspaceDir, "target", "release", entry.binary);
+  const binary = options.bundleDir
+    ? join(options.bundleDir, entry.binary)
+    : options.binary ?? join(workspaceDir, "target", "release", entry.binary);
   await stat(binary).catch(() => {
     throw new Error(`missing native release binary: ${binary}`);
   });
@@ -148,17 +159,21 @@ async function packPlatform(options) {
   await replaceDirectory(destination, async (temporary) => {
     const binDir = join(temporary, "bin");
     await mkdir(binDir, { recursive: true });
-    const packagedBinary = join(binDir, entry.binary);
-    await copyFile(binary, packagedBinary);
-    if (entry.os !== "win32") {
-      await chmod(packagedBinary, 0o755);
+    if (options.bundleDir) {
+      await stageRuntimeBundle(options.bundleDir, binDir, entry.os, entry.binary);
+    } else {
+      const packagedBinary = join(binDir, entry.binary);
+      await copyFile(binary, packagedBinary);
+      await stageZvecRuntime(options.libDir ?? dirname(binary), binDir, entry.os);
+      if (options.libDir) {
+        await cp(options.libDir, join(temporary, "lib"), {
+          recursive: true,
+          dereference: true,
+        });
+      }
     }
-    await stageZvecRuntime(options.libDir ?? dirname(binary), binDir, entry.os);
-    if (options.libDir) {
-      await cp(options.libDir, join(temporary, "lib"), {
-        recursive: true,
-        dereference: true,
-      });
+    if (entry.os !== "win32") {
+      await chmod(join(binDir, entry.binary), 0o755);
     }
 
     const checksums = await checksumManifest(temporary, entry.target);
@@ -170,7 +185,14 @@ async function packPlatform(options) {
       repository: "https://github.com/zvec-ai/zvec-grep",
       os: [entry.os],
       cpu: [entry.cpu],
-      files: ["bin", "lib", "checksums.json", "README.md", "LICENSES", "SBOM.spdx.json"],
+      files: [
+        "bin",
+        ...(options.bundleDir ? [] : ["lib"]),
+        "checksums.json",
+        "README.md",
+        "LICENSES",
+        "SBOM.spdx.json",
+      ],
       publishConfig: { access: "public", provenance: true },
     };
     if (entry.libc) {
@@ -300,7 +322,7 @@ async function main() {
     return;
   }
   throw new Error(
-    "usage: npm-release.mjs <verify|pack-platform|pack-meta|pack-current|smoke-current> [--target TARGET] [--binary PATH] [--lib-dir PATH] [--no-build]",
+    "usage: npm-release.mjs <verify|pack-platform|pack-meta|pack-current|smoke-current> [--target TARGET] [--binary PATH] [--lib-dir PATH] [--bundle-dir PATH] [--no-build]",
   );
 }
 

@@ -450,6 +450,24 @@ The runtime library directory must include zvec's shared library and its
 `data/jieba_dict` directory. Without `--lib-dir`, these assets are read from
 the binary's directory.
 
+For a complete relocatable bundle such as the Linux CUDA output, stage the
+entire bundle beside the executable instead of splitting its libraries into a
+separate npm `lib/` directory:
+
+```sh
+node scripts/npm-release.mjs pack-platform \
+  --target linux-x64-gnu \
+  --bundle-dir target/release/zg-cuda \
+  --no-build
+```
+
+The equivalent workspace shortcut is `npm run release:cuda`.
+
+Bundle mode requires regular files and packages the complete directory under
+`bin/`. This preserves the bundle's `$ORIGIN` search path and lets llama.cpp
+discover its CPU/CUDA backend modules beside `zg`. It cannot be combined with
+`--binary` or `--lib-dir`.
+
 All native platform packages must be published and smoke-tested before the meta
 package. The release script intentionally does not run `npm publish` or move a
 dist-tag.

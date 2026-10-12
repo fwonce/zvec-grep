@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { copyFile, mkdir, readFile, stat } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { copyFile, mkdir, readFile, readdir, stat } from "node:fs/promises";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -129,4 +129,53 @@ export async function stageZvecRuntime(sourceDir, binDir, platform) {
     await copyFile(join(sourceDir, file), destination);
   }
   return files.map((file) => `bin/${file}`);
+}
+
+async function copyRegularTree(sourceRoot, destinationRoot, directory = sourceRoot) {
+  const copied = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const source = join(directory, entry.name);
+    const payloadPath = relative(sourceRoot, source).split(sep).join("/");
+    const destination = join(destinationRoot, ...payloadPath.split("/"));
+    if (entry.isDirectory()) {
+      await mkdir(destination, { recursive: true });
+      copied.push(...await copyRegularTree(sourceRoot, destinationRoot, source));
+      continue;
+    }
+    if (!entry.isFile()) {
+      throw new Error(`native bundle entry is not a regular file: ${source}`);
+    }
+    await mkdir(dirname(destination), { recursive: true });
+    await copyFile(source, destination);
+    copied.push(`bin/${payloadPath}`);
+  }
+  return copied;
+}
+
+export async function stageRuntimeBundle(sourceDir, binDir, platform, binary) {
+  const sourceMetadata = await stat(sourceDir);
+  if (!sourceMetadata.isDirectory()) {
+    throw new Error(`native bundle is not a directory: ${sourceDir}`);
+  }
+  const required = [
+    binary,
+    {
+      darwin: "libzvec_c_api.dylib",
+      linux: "libzvec_c_api.so",
+      win32: "zvec_c_api.dll",
+    }[platform],
+    "data/jieba_dict/jieba.dict.utf8",
+    "data/jieba_dict/hmm_model.utf8",
+  ];
+  if (!required[1]) {
+    throw new Error(`unsupported native bundle platform: ${platform}`);
+  }
+  for (const file of required) {
+    const source = join(sourceDir, file);
+    if (!(await stat(source)).isFile()) {
+      throw new Error(`native bundle is missing required file: ${source}`);
+    }
+  }
+  await mkdir(binDir, { recursive: true });
+  return (await copyRegularTree(sourceDir, binDir)).sort();
 }

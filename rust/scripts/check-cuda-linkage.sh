@@ -50,6 +50,20 @@ for pattern in \
   require_file "${pattern}"
 done
 
+if find "${bundle}" -maxdepth 1 -type l -print -quit | grep -q .; then
+  echo "CUDA bundle must not contain symbolic links" >&2
+  find "${bundle}" -maxdepth 1 -type l -print >&2
+  exit 1
+fi
+
+for stem in libllama libggml libggml-base; do
+  count="$(find "${bundle}" -maxdepth 1 -type f -name "${stem}.so*" | wc -l)"
+  if [[ "${count}" -ne 1 ]]; then
+    echo "expected one canonical ${stem} shared library, found ${count}" >&2
+    exit 1
+  fi
+done
+
 binary_needed="$(needed "${binary}")"
 require_needed "${binary_needed}" libzvec_c_api.so
 require_needed "${binary_needed}" libllama.so

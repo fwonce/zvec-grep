@@ -15,6 +15,12 @@ LICENSES/
 SBOM.spdx.json
 ```
 
+Relocatable bundles whose native libraries and plugins use executable-relative
+lookup are packaged entirely under `bin/`. In particular, the Linux CUDA
+bundle keeps `libllama`, `libggml`, the CPU/CUDA backend modules, ONNX Runtime
+providers, zvec's C API, and dictionaries beside `zg`; it does not emit a
+second copy under `lib/`.
+
 The meta package locks every platform package to its exact version through
 `optionalDependencies`. Its `postinstall` selects the installed package,
 validates package identity and every payload checksum, copies runtime libraries,
