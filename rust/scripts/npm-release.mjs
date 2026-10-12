@@ -15,6 +15,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   cargoPackageVersion,
+  defaultReleaseVariant,
   loadReleaseManifest,
   npmEnvironment,
   platformByTarget,
@@ -32,11 +33,16 @@ const stagingRoot = join(releaseRoot, "staging");
 const tarballRoot = join(releaseRoot, "tarballs");
 const cacheRoot = join(releaseRoot, "cache");
 
+function cargoTargetDirectory() {
+  return resolve(workspaceDir, process.env.CARGO_TARGET_DIR ?? "target");
+}
+
 function parseOptions(args) {
   const options = {
     build: true,
     binary: undefined,
     bundleDir: undefined,
+    cpuOnly: false,
     libDir: undefined,
     target: undefined,
   };
@@ -44,6 +50,10 @@ function parseOptions(args) {
     const argument = args[index];
     if (argument === "--no-build") {
       options.build = false;
+      continue;
+    }
+    if (argument === "--cpu-only") {
+      options.cpuOnly = true;
       continue;
     }
     const fields = new Map([
@@ -66,6 +76,9 @@ function parseOptions(args) {
   }
   if (options.bundleDir && (options.binary || options.libDir)) {
     throw new Error("--bundle-dir cannot be combined with --binary or --lib-dir");
+  }
+  if (options.cpuOnly && options.bundleDir) {
+    throw new Error("--cpu-only cannot be combined with --bundle-dir");
   }
   return options;
 }
@@ -138,19 +151,33 @@ async function packPlatform(options) {
   const manifest = loadReleaseManifest();
   const current = currentPlatform(manifest);
   const entry = options.target ? platformByTarget(manifest, options.target) : current;
+  const defaultCuda = defaultReleaseVariant(entry) === "cuda" && !options.cpuOnly;
   if (options.bundleDir && options.build) {
     throw new Error("--bundle-dir requires --no-build");
   }
+  if (defaultCuda && (options.binary || options.libDir)) {
+    throw new Error(
+      `${entry.target} defaults to a complete CUDA bundle; use --bundle-dir or --cpu-only`,
+    );
+  }
+  let bundleDir = options.bundleDir;
   if (options.build) {
     if (entry.target !== current.target) {
       throw new Error("cross-platform packaging requires --no-build and --binary");
     }
-    run("cargo", ["build", "--locked", "--release", "--package", "zg"]);
+    if (defaultCuda) {
+      run("bash", ["scripts/build-cuda.sh"]);
+      bundleDir = join(cargoTargetDirectory(), "release", "zg-cuda");
+    } else {
+      run("cargo", ["build", "--locked", "--release", "--package", "zg"]);
+    }
+  } else if (defaultCuda && !bundleDir) {
+    bundleDir = join(cargoTargetDirectory(), "release", "zg-cuda");
   }
 
-  const binary = options.bundleDir
-    ? join(options.bundleDir, entry.binary)
-    : options.binary ?? join(workspaceDir, "target", "release", entry.binary);
+  const binary = bundleDir
+    ? join(bundleDir, entry.binary)
+    : options.binary ?? join(cargoTargetDirectory(), "release", entry.binary);
   await stat(binary).catch(() => {
     throw new Error(`missing native release binary: ${binary}`);
   });
@@ -159,8 +186,8 @@ async function packPlatform(options) {
   await replaceDirectory(destination, async (temporary) => {
     const binDir = join(temporary, "bin");
     await mkdir(binDir, { recursive: true });
-    if (options.bundleDir) {
-      await stageRuntimeBundle(options.bundleDir, binDir, entry.os, entry.binary);
+    if (bundleDir) {
+      await stageRuntimeBundle(bundleDir, binDir, entry.os, entry.binary);
     } else {
       const packagedBinary = join(binDir, entry.binary);
       await copyFile(binary, packagedBinary);
@@ -187,13 +214,17 @@ async function packPlatform(options) {
       cpu: [entry.cpu],
       files: [
         "bin",
-        ...(options.bundleDir ? [] : ["lib"]),
+        ...(bundleDir ? [] : ["lib"]),
         "checksums.json",
         "README.md",
         "LICENSES",
         "SBOM.spdx.json",
       ],
       publishConfig: { access: "public", provenance: true },
+      zvecGrep: {
+        variant: defaultCuda ? "cuda" : "cpu",
+        accelerators: defaultCuda ? ["cpu", "cuda"] : ["cpu"],
+      },
     };
     if (entry.libc) {
       packageJson.libc = [entry.libc];
@@ -202,7 +233,7 @@ async function packPlatform(options) {
     await writeFile(join(temporary, "checksums.json"), `${JSON.stringify(checksums, null, 2)}\n`);
     await writeFile(
       join(temporary, "README.md"),
-      `# ${entry.package}\n\nNative zvec-grep payload for ${entry.target}. Install @zvec/zvec-grep instead.\n`,
+      `# ${entry.package}\n\nNative ${defaultCuda ? "CPU/CUDA" : "CPU"} zvec-grep payload for ${entry.target}. Install @zvec/zvec-grep instead.\n`,
     );
   });
   const tarball = await packDirectory(destination);
@@ -322,7 +353,7 @@ async function main() {
     return;
   }
   throw new Error(
-    "usage: npm-release.mjs <verify|pack-platform|pack-meta|pack-current|smoke-current> [--target TARGET] [--binary PATH] [--lib-dir PATH] [--bundle-dir PATH] [--no-build]",
+    "usage: npm-release.mjs <verify|pack-platform|pack-meta|pack-current|smoke-current> [--target TARGET] [--binary PATH] [--lib-dir PATH] [--bundle-dir PATH] [--cpu-only] [--no-build]",
   );
 }
 

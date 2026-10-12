@@ -14,7 +14,8 @@
     "release:platform": "node scripts/npm-release.mjs pack-platform",
     "release:meta": "node scripts/npm-release.mjs pack-meta",
     "release:pack": "node scripts/npm-release.mjs pack-current",
-    "release:cuda": "node scripts/npm-release.mjs pack-platform --target linux-x64-gnu --bundle-dir target/release/zg-cuda --no-build",
+    "release:cuda": "node scripts/npm-release.mjs pack-platform --target linux-x64-gnu --no-build",
+    "release:cpu": "node scripts/npm-release.mjs pack-current --cpu-only",
     "release:smoke": "node scripts/npm-release.mjs smoke-current",
     "test": "npm run build && cargo test --workspace && node --test scripts/npm-local.test.mjs npm/meta/install.test.cjs",
     "test:package": "npm run build && node scripts/npm-local.mjs smoke --no-build"

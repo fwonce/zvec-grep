@@ -30,6 +30,12 @@ export function loadReleaseManifest() {
         throw new Error(`npm platform entry is missing ${field}`);
       }
     }
+    if (
+      entry.defaultVariant !== undefined
+      && !["cpu", "cuda"].includes(entry.defaultVariant)
+    ) {
+      throw new Error(`unsupported default npm variant for ${entry.target}`);
+    }
     if (targets.has(entry.target)) {
       throw new Error(`duplicate npm target: ${entry.target}`);
     }
@@ -63,6 +69,10 @@ export function platformByTarget(manifest, target) {
     throw new Error(`unknown npm release target: ${target}`);
   }
   return entry;
+}
+
+export function defaultReleaseVariant(entry) {
+  return entry.defaultVariant ?? "cpu";
 }
 
 export function run(command, args, options = {}) {

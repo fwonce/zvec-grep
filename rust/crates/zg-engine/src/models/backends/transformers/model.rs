@@ -635,6 +635,14 @@ impl TransformersExecutionProvider {
 
 fn resolve_execution_provider(device: Option<Device>) -> TransformersExecutionProvider {
     match device {
+        None if cfg!(all(
+            feature = "cuda",
+            target_os = "linux",
+            target_arch = "x86_64"
+        )) =>
+        {
+            TransformersExecutionProvider::Cuda
+        }
         None | Some(Device::Cpu) => TransformersExecutionProvider::Cpu,
         Some(Device::Metal | Device::Auto) if cfg!(target_os = "macos") => {
             TransformersExecutionProvider::Cpu

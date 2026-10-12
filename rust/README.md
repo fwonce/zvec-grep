@@ -344,11 +344,14 @@ docker run --rm --gpus all --platform linux/amd64 \
 Run these Docker commands from the repository root. The image includes
 `libclang-dev`, which bindgen needs while compiling `llama-cpp-sys-2`.
 
-The script detects the CUDA major version and the first visible GPU's compute
-capability. Set `ORT_CUDA_VERSION` or `CMAKE_CUDA_ARCHITECTURES` explicitly for
-cross-builds or multi-architecture packages (for example, `80;89;90`). It
-assembles `target/release/zg-cuda/` and runs `scripts/check-cuda-linkage.sh`
-against that bundle.
+The script detects the CUDA major version and defaults
+`CMAKE_CUDA_ARCHITECTURES` to CMake's `all-major` distribution setting. This
+produces native code for every major architecture supported by the pinned CUDA
+toolchain plus forward-compatible PTX for its newest major architecture. Set
+`ORT_CUDA_VERSION` or `CMAKE_CUDA_ARCHITECTURES` explicitly only when producing
+a deliberately narrower test build. The script assembles
+`target/release/zg-cuda/` and runs `scripts/check-cuda-linkage.sh` against that
+bundle.
 
 The Linux CUDA linkage policy is:
 
@@ -361,11 +364,13 @@ The Linux CUDA linkage policy is:
   dependencies.
 
 The CUDA backend libraries are plugins rather than process-startup dependencies.
-On a machine without CUDA, `zg` and CPU embedding still start normally. An
-`auto` or `cuda` request that cannot load a CUDA backend reports a warning and
-falls back to CPU, matching the existing device fallback policy. The bundle
-must be kept together; `ZVEC_GREP_NATIVE_LIB_DIR` can point llama.cpp at a
-different backend directory when needed for development or packaging.
+The Linux x64 CUDA release defaults local embedding to automatic device
+selection. On a machine without CUDA, `zg` and CPU embedding still start
+normally; CUDA initialization reports a warning and falls back to CPU. Pass
+`--device cpu`, set `ZVEC_GREP_DEVICE=cpu`, or configure the model for CPU to
+opt out explicitly. The bundle must be kept together;
+`ZVEC_GREP_NATIVE_LIB_DIR` can point llama.cpp at a different backend directory
+when needed for development or packaging.
 
 ## Local npm installation
 
@@ -428,6 +433,13 @@ npm run release:verify
 npm run release:pack
 ```
 
+On Linux x64, `release:pack`, `release:platform`, and `release:smoke` default to
+the complete CPU/CUDA bundle. This is the artifact published as
+`@zvec/zvec-grep-linux-x64-gnu`, so a normal `npm install @zvec/zvec-grep`
+requires no user-side CUDA build. Other targets remain CPU/platform-native.
+Use `npm run release:cpu` only to produce a deliberate Linux CPU-only test
+artifact; it is not the default published Linux x64 package.
+
 The release tarballs are written under `dist/npm/release/tarballs/`. Run a real
 two-tarball install in an isolated npm prefix and verify the materialized binary
 with:
@@ -461,7 +473,8 @@ node scripts/npm-release.mjs pack-platform \
   --no-build
 ```
 
-The equivalent workspace shortcut is `npm run release:cuda`.
+The equivalent explicit workspace shortcut is `npm run release:cuda`; normal
+Linux x64 release packaging selects this bundle automatically.
 
 Bundle mode requires regular files and packages the complete directory under
 `bin/`. This preserves the bundle's `$ORIGIN` search path and lets llama.cpp

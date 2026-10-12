@@ -25,15 +25,11 @@ if [[ -z "${ORT_CUDA_VERSION:-}" ]]; then
 fi
 
 if [[ -z "${CMAKE_CUDA_ARCHITECTURES:-}" ]]; then
-  if ! command -v nvidia-smi >/dev/null 2>&1; then
-    echo "nvidia-smi is unavailable; set CMAKE_CUDA_ARCHITECTURES" >&2
-    exit 2
-  fi
-  CMAKE_CUDA_ARCHITECTURES="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | awk 'NR == 1 { gsub(/\./, ""); print; exit }')"
-  if [[ -z "${CMAKE_CUDA_ARCHITECTURES}" ]]; then
-    echo "unable to detect GPU compute capability; set CMAKE_CUDA_ARCHITECTURES" >&2
-    exit 2
-  fi
+  # Distribution builds must not inherit the architecture of whichever GPU
+  # happens to be attached to the builder. CMake's all-major value emits a
+  # relocatable fat binary for every major architecture supported by nvcc,
+  # plus forward-compatible PTX for the newest major architecture.
+  CMAKE_CUDA_ARCHITECTURES="all-major"
   export CMAKE_CUDA_ARCHITECTURES
 fi
 
@@ -42,12 +38,30 @@ if [[ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]]; then
   export CMAKE_BUILD_PARALLEL_LEVEL
 fi
 
-cargo build --locked --release --package zg --features cuda
+cuda_toolkit_version="$(nvcc --version | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' | tail -n 1)"
+if [[ -z "${cuda_toolkit_version}" ]]; then
+  echo "unable to detect the CUDA toolkit version" >&2
+  exit 2
+fi
+echo "CUDA toolkit: ${cuda_toolkit_version} (ORT major ${ORT_CUDA_VERSION})"
+echo "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}"
 
 target_dir="${CARGO_TARGET_DIR:-target}"
 if [[ "${target_dir}" != /* ]]; then
   target_dir="${PWD}/${target_dir}"
 fi
+mkdir -p -- "${target_dir}"
+build_config="cuda_toolkit=${cuda_toolkit_version};ort_cuda_major=${ORT_CUDA_VERSION};architectures=${CMAKE_CUDA_ARCHITECTURES}"
+build_config_file="${target_dir}/.zvec-grep-cuda-build-config"
+previous_build_config="$(sed -n '1p' "${build_config_file}" 2>/dev/null || true)"
+if [[ "${previous_build_config}" != "${build_config}" ]]; then
+  echo "CUDA build configuration changed; rebuilding llama-cpp-sys-2"
+  cargo clean --target-dir "${target_dir}" --package llama-cpp-sys-2
+fi
+
+cargo build --locked --release --package zg --features cuda
+printf '%s\n' "${build_config}" > "${build_config_file}"
+
 profile_dir="${target_dir}/release"
 bundle_dir="${profile_dir}/zg-cuda"
 staging_dir="$(mktemp -d "${profile_dir}/.zg-cuda.XXXXXX")"

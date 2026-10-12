@@ -326,6 +326,7 @@ fn load_model_with_fallback(
     reporter: &ModelDownloadProgressReporter,
 ) -> Result<LoadedLlamaModel, ModelError> {
     llama_backend()?;
+    let device = resolve_device(device);
     let wants_gpu = !matches!(device, None | Some(Device::Cpu));
     if wants_gpu {
         if let Some(selected) = select_gpu_device(device) {
@@ -351,6 +352,20 @@ fn load_model_with_fallback(
     }
 
     load_cpu_model(path)
+}
+
+const fn resolve_device(device: Option<Device>) -> Option<Device> {
+    if device.is_none()
+        && cfg!(all(
+            feature = "cuda",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))
+    {
+        Some(Device::Auto)
+    } else {
+        device
+    }
 }
 
 fn load_gpu_model(path: &Path, device_index: usize) -> Result<LoadedLlamaModel, ModelError> {

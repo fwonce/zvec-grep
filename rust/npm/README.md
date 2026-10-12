@@ -21,6 +21,12 @@ bundle keeps `libllama`, `libggml`, the CPU/CUDA backend modules, ONNX Runtime
 providers, zvec's C API, and dictionaries beside `zg`; it does not emit a
 second copy under `lib/`.
 
+The default `linux-x64-gnu` native package is this CPU/CUDA bundle. CUDA
+libraries remain runtime plugins: compatible NVIDIA libraries enable automatic
+GPU use, while hosts without them continue on CPU. Release maintainers may use
+`--cpu-only` for a diagnostic slim build, but that variant is not published as
+the default Linux x64 package.
+
 The meta package locks every platform package to its exact version through
 `optionalDependencies`. Its `postinstall` selects the installed package,
 validates package identity and every payload checksum, copies runtime libraries,

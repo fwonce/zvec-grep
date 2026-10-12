@@ -23,7 +23,8 @@
       "os": "linux",
       "cpu": "x64",
       "libc": "glibc",
-      "binary": "zg"
+      "binary": "zg",
+      "defaultVariant": "cuda"
     },
     {
       "target": "linux-arm64-gnu",

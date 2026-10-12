@@ -2,10 +2,16 @@ use super::*;
 
 #[test]
 fn maps_devices_to_native_rust_execution_providers() {
-    assert_eq!(
-        resolve_execution_provider(None),
+    let default = if cfg!(all(
+        feature = "cuda",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )) {
+        TransformersExecutionProvider::Cuda
+    } else {
         TransformersExecutionProvider::Cpu
-    );
+    };
+    assert_eq!(resolve_execution_provider(None), default);
     assert_eq!(
         resolve_execution_provider(Some(Device::Cpu)),
         TransformersExecutionProvider::Cpu
@@ -322,7 +328,6 @@ async fn cached_minilm_uses_cuda() {
         entry,
         ModelConfig {
             cache_dir: Some(cache),
-            device: Some(Device::Cuda),
             ..ModelConfig::default()
         },
         crate::models::runtime::ModelComputeRuntime::shared(),

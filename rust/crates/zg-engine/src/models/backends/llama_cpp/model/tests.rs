@@ -1,6 +1,21 @@
 use super::*;
 use crate::models::catalog::{EmbeddingCatalogEntry, get_embedding_model_catalog_entry};
 
+#[test]
+fn cuda_linux_release_defaults_to_automatic_device_selection() {
+    let expected = if cfg!(all(
+        feature = "cuda",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )) {
+        Some(Device::Auto)
+    } else {
+        None
+    };
+    assert_eq!(resolve_device(None), expected);
+    assert_eq!(resolve_device(Some(Device::Cpu)), Some(Device::Cpu));
+}
+
 fn entry(reference: &str) -> LlamaCppConfig {
     get_embedding_model_catalog_entry(reference)
         .and_then(EmbeddingCatalogEntry::llama_cpp_config)
@@ -174,7 +189,6 @@ async fn cached_embeddinggemma_uses_cuda() {
         entry("local/embeddinggemma-300m"),
         ModelConfig {
             cache_dir: Some(cache),
-            device: Some(Device::Cuda),
             ..ModelConfig::default()
         },
         crate::models::runtime::ModelComputeRuntime::shared(),

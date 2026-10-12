@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  defaultReleaseVariant,
   loadReleaseManifest,
   selectPlatform,
   stageRuntimeBundle,
@@ -121,6 +122,7 @@ test("maps supported native npm targets", () => {
     cpu: "x64",
     libc: "glibc",
     binary: "zg",
+    defaultVariant: "cuda",
     target: "linux-x64-gnu",
   });
   assert.deepEqual(selectPlatform(manifest, "win32", "x64"), {
@@ -130,6 +132,15 @@ test("maps supported native npm targets", () => {
     binary: "zg.exe",
     target: "win32-x64-msvc",
   });
+});
+
+test("defaults Linux x64 releases to the CUDA-capable bundle", () => {
+  for (const entry of manifest.platforms) {
+    assert.equal(
+      defaultReleaseVariant(entry),
+      entry.target === "linux-x64-gnu" ? "cuda" : "cpu",
+    );
+  }
 });
 
 test("rejects platforms without a local release target", () => {
