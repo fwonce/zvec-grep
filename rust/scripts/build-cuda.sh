@@ -50,11 +50,10 @@ target_dir="${CARGO_TARGET_DIR:-target}"
 if [[ "${target_dir}" != /* ]]; then
   target_dir="${PWD}/${target_dir}"
 fi
-mkdir -p -- "${target_dir}"
 build_config="cuda_toolkit=${cuda_toolkit_version};ort_cuda_major=${ORT_CUDA_VERSION};architectures=${CMAKE_CUDA_ARCHITECTURES}"
 build_config_file="${target_dir}/.zvec-grep-cuda-build-config"
 previous_build_config="$(sed -n '1p' "${build_config_file}" 2>/dev/null || true)"
-if [[ "${previous_build_config}" != "${build_config}" ]]; then
+if [[ "${previous_build_config}" != "${build_config}" && -f "${target_dir}/CACHEDIR.TAG" ]]; then
   echo "CUDA build configuration changed; rebuilding llama-cpp-sys-2"
   cargo clean --target-dir "${target_dir}" --package llama-cpp-sys-2
 fi
