@@ -331,7 +331,15 @@ fn load_model_with_fallback(
     if wants_gpu {
         if let Some(selected) = select_gpu_device(device) {
             match load_gpu_model(path, selected.index) {
-                Ok(model) => return Ok(model),
+                Ok(model) => {
+                    tracing::debug!(
+                        requested_device = requested_device_name(device),
+                        backend = %selected.backend,
+                        gpu = %selected.name,
+                        "llama.cpp GPU embedding backend selected"
+                    );
+                    return Ok(model);
+                }
                 Err(error) => {
                     let warning =
                         format!("llama.cpp GPU model load failed ({error}), falling back to CPU.");

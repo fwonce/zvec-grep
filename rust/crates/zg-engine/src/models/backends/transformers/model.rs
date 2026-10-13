@@ -378,6 +378,10 @@ impl SessionPool {
                 }
             }
         };
+        tracing::debug!(
+            "Transformers ONNX {} embedding execution provider selected",
+            provider.name()
+        );
         Ok(Self {
             model_path,
             prepacked_weights,
