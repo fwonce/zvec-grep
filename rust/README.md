@@ -345,9 +345,12 @@ Run these Docker commands from the repository root. The image includes
 `libclang-dev`, which bindgen needs while compiling `llama-cpp-sys-2`.
 
 The script detects the CUDA major version and defaults
-`CMAKE_CUDA_ARCHITECTURES` to CMake's `all-major` distribution setting. This
-produces native code for every major architecture supported by the pinned CUDA
-toolchain plus forward-compatible PTX for its newest major architecture. Set
+`CMAKE_CUDA_ARCHITECTURES` to
+`75-real;80-real;86-real;89-real;90-real;90-virtual`. This produces native code
+for commonly deployed x86_64 Turing through Hopper GPUs and keeps Hopper PTX
+for forward compatibility. The explicit list also avoids CUDA 13.2's
+`all-major` expansion to `sm_120`, which the current llama.cpp NVFP4 kernels
+cannot be assembled for. Set
 `ORT_CUDA_VERSION` or `CMAKE_CUDA_ARCHITECTURES` explicitly only when producing
 a deliberately narrower test build. The script assembles
 `target/release/zg-cuda/` and runs `scripts/check-cuda-linkage.sh` against that

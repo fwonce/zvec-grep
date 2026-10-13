@@ -26,10 +26,12 @@ fi
 
 if [[ -z "${CMAKE_CUDA_ARCHITECTURES:-}" ]]; then
   # Distribution builds must not inherit the architecture of whichever GPU
-  # happens to be attached to the builder. CMake's all-major value emits a
-  # relocatable fat binary for every major architecture supported by nvcc,
-  # plus forward-compatible PTX for the newest major architecture.
-  CMAKE_CUDA_ARCHITECTURES="all-major"
+  # happens to be attached to the builder. Keep native code for the deployed
+  # x86_64 generations and PTX for forward compatibility. CMake's all-major
+  # setting is intentionally avoided: CUDA 13.2 expands it to sm_120, while
+  # llama.cpp's NVFP4 kernels currently contain instructions that ptxas cannot
+  # assemble for that target.
+  CMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;90-virtual"
   export CMAKE_CUDA_ARCHITECTURES
 fi
 
@@ -54,8 +56,10 @@ build_config="cuda_toolkit=${cuda_toolkit_version};ort_cuda_major=${ORT_CUDA_VER
 build_config_file="${target_dir}/.zvec-grep-cuda-build-config"
 previous_build_config="$(sed -n '1p' "${build_config_file}" 2>/dev/null || true)"
 if [[ "${previous_build_config}" != "${build_config}" && -f "${target_dir}/CACHEDIR.TAG" ]]; then
-  echo "CUDA build configuration changed; rebuilding llama-cpp-sys-2"
-  cargo clean --target-dir "${target_dir}" --package llama-cpp-sys-2
+  # A failed custom build is not necessarily removed by package-scoped
+  # `cargo clean`, leaving its CMake cache configured for the old architecture.
+  echo "CUDA build configuration changed; rebuilding the target directory"
+  cargo clean --target-dir "${target_dir}"
 fi
 
 cargo build --locked --release --package zg --features cuda
