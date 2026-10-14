@@ -41,6 +41,7 @@ jobs:
         run: |
           python3 rust/scripts/test-cuda-cli-checks.py
           python3 rust/scripts/test-prepare-onnxruntime-cuda.py
+          python3 rust/scripts/test-build-ggml-cuda12.py
 
   # Compile/package on ordinary runners; paid GPUs only run the installed CLI.
   package:

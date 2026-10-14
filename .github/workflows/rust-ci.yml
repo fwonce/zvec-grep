@@ -87,6 +87,7 @@ jobs:
         run: |
           python3 scripts/test-cuda-cli-checks.py
           python3 scripts/test-prepare-onnxruntime-cuda.py
+          python3 scripts/test-build-ggml-cuda12.py
 
   test:
     name: rust test (${{ matrix.os }})
