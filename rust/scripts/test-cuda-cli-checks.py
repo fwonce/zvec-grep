@@ -11,6 +11,16 @@ spec.loader.exec_module(cuda_cli)
 
 
 class CudaEvidenceTests(unittest.TestCase):
+    def test_requested_gguf_plugin_must_really_be_selected(self):
+        selected = "llama.cpp GPU embedding backend selected backend=CUDA\n"
+        for version in ("12.4", "13.1"):
+            message = selected + f'llama.cpp CUDA backend library selected cuda_version="{version}"'
+            cuda_cli.cuda_evidence(message, "gguf", version)
+            with self.assertRaises(AssertionError):
+                cuda_cli.cuda_evidence(selected, "gguf", version)
+            with self.assertRaises(AssertionError):
+                cuda_cli.cuda_evidence(message, "gguf", "13.1" if version == "12.4" else "12.4")
+
     def test_gguf_requires_cuda_not_just_any_gpu(self):
         message = "llama.cpp GPU embedding backend selected backend=CUDA gpu=Tesla T4"
         self.assertEqual(cuda_cli.cuda_evidence(message, "gguf"), [message])

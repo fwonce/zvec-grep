@@ -8,27 +8,18 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   echo "CUDA builds are supported only on Linux" >&2
   exit 2
 fi
-for command in cargo cmake nvcc patchelf readelf; do
+for command in cargo cmake nvcc patchelf readelf python3; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is unavailable: ${command}" >&2
     exit 2
   fi
 done
 
-if [[ -z "${ORT_CUDA_VERSION:-}" ]]; then
-  ORT_CUDA_VERSION="$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\)\..*/\1/p' | tail -n 1)"
-  if [[ -z "${ORT_CUDA_VERSION}" ]]; then
-    echo "unable to detect CUDA major version; set ORT_CUDA_VERSION" >&2
-    exit 2
-  fi
-  export ORT_CUDA_VERSION
-fi
-
 if [[ -z "${CMAKE_CUDA_ARCHITECTURES:-}" ]]; then
   # Distribution builds must not inherit the architecture of whichever GPU
   # happens to be attached to the builder. Keep native code for the deployed
   # x86_64 generations and PTX for forward compatibility. CMake's all-major
-  # setting is intentionally avoided: CUDA 13.2 expands it to sm_120, while
+  # setting is intentionally avoided: newer CUDA expands it to sm_120, while
   # llama.cpp's NVFP4 kernels currently contain instructions that ptxas cannot
   # assemble for that target.
   CMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;90-virtual"
@@ -41,18 +32,18 @@ if [[ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]]; then
 fi
 
 cuda_toolkit_version="$(nvcc --version | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' | tail -n 1)"
-if [[ -z "${cuda_toolkit_version}" ]]; then
-  echo "unable to detect the CUDA toolkit version" >&2
+if [[ "${cuda_toolkit_version}" != "13.1" ]]; then
+  echo "the primary GGUF backend requires CUDA 13.1 (found ${cuda_toolkit_version})" >&2
   exit 2
 fi
-echo "CUDA toolkit: ${cuda_toolkit_version} (ORT major ${ORT_CUDA_VERSION})"
+echo "GGUF toolkit: ${cuda_toolkit_version}; ONNX Runtime: official CUDA 12 dynamic runtime"
 echo "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}"
 
 target_dir="${CARGO_TARGET_DIR:-target}"
 if [[ "${target_dir}" != /* ]]; then
   target_dir="${PWD}/${target_dir}"
 fi
-build_config="cuda_toolkit=${cuda_toolkit_version};ort_cuda_major=${ORT_CUDA_VERSION};architectures=${CMAKE_CUDA_ARCHITECTURES}"
+build_config="cuda_toolkit=${cuda_toolkit_version};ort=1.28.0-cuda12-dynamic;architectures=${CMAKE_CUDA_ARCHITECTURES}"
 build_config_file="${target_dir}/.zvec-grep-cuda-build-config"
 previous_build_config="$(sed -n '1p' "${build_config_file}" 2>/dev/null || true)"
 if [[ "${previous_build_config}" != "${build_config}" && -f "${target_dir}/CACHEDIR.TAG" ]]; then
@@ -116,14 +107,8 @@ copy_core_library libggml
 copy_core_library libggml-base
 cp -L --preserve=mode,timestamps -- "${llama_backend_libraries[@]}" "${staging_dir}/"
 
-for provider in libonnxruntime_providers_shared.so libonnxruntime_providers_cuda.so; do
-  provider_path="$(find "${profile_dir}" -maxdepth 2 -name "${provider}" -print -quit)"
-  if [[ -z "${provider_path}" ]]; then
-    echo "unable to locate ONNX Runtime provider: ${provider}" >&2
-    exit 1
-  fi
-  cp -L --preserve=mode,timestamps -- "${provider_path}" "${staging_dir}/${provider}"
-done
+python3 scripts/prepare-onnxruntime-cuda.py --platform linux \
+  --cache-dir "${target_dir}/ort-cuda12" --destination "${staging_dir}"
 
 if [[ ! -f "${profile_dir}/libzvec_c_api.so" ]]; then
   echo "unable to locate libzvec_c_api.so" >&2
@@ -140,9 +125,15 @@ while IFS= read -r -d '' file; do
   fi
 done < <(find "${staging_dir}" -maxdepth 1 -type f -print0)
 
+chmod 0755 "${staging_dir}"
 rm -rf -- "${bundle_dir}"
 mv -- "${staging_dir}" "${bundle_dir}"
 trap - EXIT
 
-bash scripts/check-cuda-linkage.sh "${bundle_dir}"
+# CI can build the fallback in a separate CUDA 12.4 container before auditing.
+if [[ "${1:-}" != "--primary-only" ]]; then
+  python3 scripts/build-ggml-cuda12.py --bundle "${bundle_dir}" \
+    --cuda-root "${CUDA12_ROOT:-/usr/local/cuda-12.4}"
+  bash scripts/check-cuda-linkage.sh "${bundle_dir}"
+fi
 echo "CUDA bundle: ${bundle_dir}"

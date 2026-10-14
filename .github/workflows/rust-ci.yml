@@ -84,7 +84,9 @@ jobs:
       - name: Test npm packaging
         run: node --test scripts/npm-local.test.mjs npm/meta/install.test.cjs
       - name: Test CUDA evidence assertions without a GPU
-        run: python3 scripts/test-cuda-cli-checks.py
+        run: |
+          python3 scripts/test-cuda-cli-checks.py
+          python3 scripts/test-prepare-onnxruntime-cuda.py
 
   test:
     name: rust test (${{ matrix.os }})
@@ -120,47 +122,13 @@ jobs:
 
   cuda-build:
     name: cuda build (no GPU)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Build the pinned CUDA toolchain image
-        working-directory: ${{ github.workspace }}
-        run: >-
-          docker build --platform linux/amd64
-          --file rust/docker/cuda-builder.Dockerfile
-          --tag zvec-grep-cuda-builder .
-      - name: Build and audit the CUDA bundle without a GPU
-        working-directory: ${{ github.workspace }}
-        run: |
-          mkdir -p "${RUNNER_TEMP}/zvec-grep-target"
-          docker run --rm --platform linux/amd64 \
-            --volume "${GITHUB_WORKSPACE}:/work:ro" \
-            --volume "${RUNNER_TEMP}/zvec-grep-target:/work-target" \
-            --env CARGO_TARGET_DIR=/work-target \
-            --env CMAKE_BUILD_PARALLEL_LEVEL=2 \
-            --env CMAKE_CUDA_ARCHITECTURES=90 \
-            --env ORT_CUDA_VERSION=13 \
-            zvec-grep-cuda-builder \
-            bash -c 'bash scripts/build-cuda.sh && "${CARGO_TARGET_DIR}/release/zg-cuda/zg" --help >/dev/null'
-      - name: Run the CUDA-capable bundle on a host without CUDA
-        working-directory: ${{ github.workspace }}
-        run: |
-          docker run --rm --platform linux/amd64 \
-            --volume "${GITHUB_WORKSPACE}:/workspace:ro" \
-            --volume "${RUNNER_TEMP}/zvec-grep-target/release/zg-cuda:/opt/zg:ro" \
-            ubuntu:24.04 \
-            bash -euo pipefail -c '
-              apt-get update >/dev/null
-              apt-get install --yes --no-install-recommends libstdc++6 >/dev/null
-              ldd /opt/zg/libggml-cuda.so | grep -Eq "lib(cuda|cudart|cublas).*not found"
-              env -u LD_LIBRARY_PATH /opt/zg/zg --help >/dev/null
-              env -u LD_LIBRARY_PATH /opt/zg/zg --rg -F "zvec-grep Rust rewrite" /workspace/rust/README.md >/dev/null
-            '
+    uses: ./.github/workflows/rust-package-build.yml
+    with:
+      target: linux-x64-gnu
+      runner: ubuntu-latest
+      cuda_architectures: "75"
 
   windows-cuda-build:
     name: windows cuda package (no GPU)

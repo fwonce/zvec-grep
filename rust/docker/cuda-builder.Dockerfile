@@ -1,4 +1,4 @@
-ARG CUDA_IMAGE=nvidia/cuda:13.2.0-cudnn-devel-ubuntu24.04@sha256:9a8b00be0596b5a2a088249ef1d5ed8e5cdd45bc662a4e6937e57af0cc495d1f
+ARG CUDA_IMAGE=nvidia/cuda:13.1.1-devel-ubuntu24.04@sha256:9cf8694a27722418a1f175d90f85d5afb5a728fd4a9907d7f0565efecfa14d32
 FROM ${CUDA_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -13,8 +13,10 @@ RUN apt-get update \
         curl \
         git \
         libclang-dev \
+        ninja-build \
         patchelf \
         pkg-config \
+        python3 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 --silent --show-error --fail https://sh.rustup.rs \

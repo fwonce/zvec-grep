@@ -15,4 +15,5 @@ fi
 logs="${ZVEC_GREP_CUDA_TEST_LOGS:-$(mktemp -d)}"
 echo "CUDA CLI logs: ${logs}"
 exec python3 "${script_dir}/test-cuda-cli.py" \
-  --bundle "${bundle_dir}" --model-cache "${model_cache}" --logs "${logs}"
+  --bundle "${bundle_dir}" --model-cache "${model_cache}" --logs "${logs}" \
+  --expected-gguf-cuda "${ZVEC_GREP_TEST_GGUF_CUDA:-13.1}"

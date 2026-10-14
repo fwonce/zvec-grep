@@ -14,7 +14,7 @@ use std::{
 
 use async_trait::async_trait;
 #[cfg(feature = "cuda")]
-use llama_cpp_2::llama_backend::{BACKENDS_DIR, load_backends_from_path};
+use llama_cpp_2::llama_backend::BACKENDS_DIR;
 use llama_cpp_2::{
     LlamaBackendDevice, LlamaBackendDeviceType,
     context::{LlamaContext, params::LlamaContextParams},
@@ -887,7 +887,7 @@ fn load_packaged_llama_backends() -> Result<(), String> {
         if directory.to_str().is_none() || !contains_ggml_backend(&directory) {
             continue;
         }
-        load_backends_from_path(&directory);
+        super::backend_loading::load(&directory);
         return Ok(());
     }
 
