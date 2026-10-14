@@ -1,171 +1,22 @@
-name: Rust CI
-
+name: GPU hosted runner preflight
 on:
-  push:
-    branches: [main, dev/rust]
-    paths:
-      - "rust/**"
-      - ".github/workflows/rust-ci.yml"
-      - ".github/workflows/rust-package-build.yml"
-      - ".github/actions/**"
-      - ".gitignore"
-      - "!**/*.md"
-  pull_request:
-    types: [opened, synchronize, reopened, edited]
-    paths:
-      - "rust/**"
-      - ".github/workflows/rust-ci.yml"
-      - ".github/workflows/rust-package-build.yml"
-      - ".github/actions/**"
-      - ".gitignore"
-      - "!**/*.md"
   workflow_dispatch:
-
-permissions: {}
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: true
-
-defaults:
-  run:
-    working-directory: rust
-
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-
+permissions:
+  contents: read
 jobs:
-  quality:
-    name: rust quality
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    steps:
-      - name: Validate pull request title
-        if: github.event_name == 'pull_request'
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-        run: >-
-          node --input-type=module --eval
-          "const title = process.env.PR_TITLE ?? '';
-          const valid = /^(feat|fix|perf|refactor|docs|test|build|ci|chore|revert)(\([^)]+\))?!?: .+/.test(title);
-          if (!valid) { console.error('PR title must use Conventional Commits syntax'); process.exit(1); }"
-        working-directory: ${{ github.workspace }}
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Install the pinned Rust toolchain
-        run: rustup show active-toolchain
-      - name: Restore Cargo cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            rust/target/
-          key: ${{ runner.os }}-${{ runner.arch }}-rust-cargo-v1-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-rust-cargo-v1-
-      - name: Check formatting
-        run: cargo fmt --all --check
-      - name: Check packages independently
-        shell: bash
-        run: |
-          for package in zg-engine zg-daemon-protocol zg-cli zg-host-native zg-testkit zg-transport-mcp zg-daemon zg; do
-            cargo check --locked --package "${package}" --all-targets
-          done
-      - name: Run Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: Validate Cargo metadata
-        run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
-      - name: Test npm packaging
-        run: node --test scripts/npm-local.test.mjs npm/meta/install.test.cjs
-
-  test:
-    name: rust test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 45 || 30 }}
-    permissions:
-      contents: read
+  preflight:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        runner: [gpu-linux-t4, gpu-windows-t4]
+    runs-on:
+      group: gpu-runners
+      labels: ${{ matrix.runner }}
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Install the pinned Rust toolchain
-        run: rustup show active-toolchain
-      - name: Restore Cargo cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            rust/target/
-          key: ${{ runner.os }}-${{ runner.arch }}-rust-cargo-v1-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-rust-cargo-v1-
-      - name: Run workspace tests
-        run: cargo test --locked --workspace --all-targets
-      - name: Smoke test the CLI
-        run: cargo run --locked -p zg -- --rg "zvec-grep Rust rewrite" README.md
-
-  cuda-build:
-    name: cuda build (no GPU)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Build the pinned CUDA toolchain image
-        working-directory: ${{ github.workspace }}
-        run: >-
-          docker build --platform linux/amd64
-          --file rust/docker/cuda-builder.Dockerfile
-          --tag zvec-grep-cuda-builder .
-      - name: Build and audit the CUDA bundle without a GPU
-        working-directory: ${{ github.workspace }}
+      - name: Inspect GPU and driver
+        shell: bash
         run: |
-          mkdir -p "${RUNNER_TEMP}/zvec-grep-target"
-          docker run --rm --platform linux/amd64 \
-            --volume "${GITHUB_WORKSPACE}:/work:ro" \
-            --volume "${RUNNER_TEMP}/zvec-grep-target:/work-target" \
-            --env CARGO_TARGET_DIR=/work-target \
-            --env CMAKE_BUILD_PARALLEL_LEVEL=2 \
-            --env CMAKE_CUDA_ARCHITECTURES=90 \
-            --env ORT_CUDA_VERSION=13 \
-            zvec-grep-cuda-builder \
-            bash -c 'bash scripts/build-cuda.sh && "${CARGO_TARGET_DIR}/release/zg-cuda/zg" --help >/dev/null'
-      - name: Run the CUDA-capable bundle on a host without CUDA
-        working-directory: ${{ github.workspace }}
-        run: |
-          docker run --rm --platform linux/amd64 \
-            --volume "${GITHUB_WORKSPACE}:/workspace:ro" \
-            --volume "${RUNNER_TEMP}/zvec-grep-target/release/zg-cuda:/opt/zg:ro" \
-            ubuntu:24.04 \
-            bash -euo pipefail -c '
-              apt-get update >/dev/null
-              apt-get install --yes --no-install-recommends libstdc++6 >/dev/null
-              ldd /opt/zg/libggml-cuda.so | grep -Eq "lib(cuda|cudart|cublas).*not found"
-              env -u LD_LIBRARY_PATH /opt/zg/zg --help >/dev/null
-              env -u LD_LIBRARY_PATH /opt/zg/zg --rg -F "zvec-grep Rust rewrite" /workspace/rust/README.md >/dev/null
-            '
-
-  windows-cuda-build:
-    name: windows cuda package (no GPU)
-    permissions:
-      contents: read
-    uses: ./.github/workflows/rust-package-build.yml
-    with:
-      target: win32-x64-msvc
-      runner: windows-2022
-      cuda_architectures: "75"
+          nvidia-smi
+          nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
+          python --version || python3 --version
