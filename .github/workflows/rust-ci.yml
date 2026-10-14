@@ -82,8 +82,15 @@ jobs:
         with:
           ref: ${{ needs.source.outputs.sha }}
           persist-credentials: false
-      - name: Verify the GPU and driver
+      - name: Verify the Linux GPU and driver
+        if: runner.os == 'Linux'
         shell: bash
+        run: |
+          nvidia-smi
+          nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
+      - name: Verify the Windows GPU and driver
+        if: runner.os == 'Windows'
+        shell: powershell
         run: |
           nvidia-smi
           nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
@@ -91,7 +98,6 @@ jobs:
         with:
           node-version: 24
       - uses: actions/setup-python@v6
-        if: runner.os == 'Windows'
         with:
           python-version: "3.12"
       - uses: actions/download-artifact@v8
@@ -99,15 +105,20 @@ jobs:
           name: rust-native-${{ matrix.target }}
           path: gpu-package
       - name: Install the actual native npm tarball
-        shell: bash
+        shell: python
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          shopt -s nullglob
-          packages=(gpu-package/*.tgz)
-          test "${#packages[@]}" -eq 1
-          npm install --prefix gpu-install --no-audit --no-fund --ignore-scripts "${packages[0]}"
-          node -e 'const p=require("./gpu-install/node_modules/@zvec/zvec-grep-"+process.env.TARGET+"/package.json"); if(p.zvecGrep?.variant!=="cuda") throw new Error("Expected CUDA npm package"); console.log(p.name,p.version,p.zvecGrep)'
+          import json, os, pathlib, subprocess
+          packages = list(pathlib.Path("gpu-package").glob("*.tgz"))
+          assert len(packages) == 1, "Expected exactly one platform tarball"
+          subprocess.run(["npm.cmd" if os.name == "nt" else "npm", "install", "--prefix",
+                          "gpu-install", "--no-audit", "--no-fund", "--ignore-scripts",
+                          str(packages[0].resolve())], check=True)
+          package = pathlib.Path("gpu-install/node_modules/@zvec") / ("zvec-grep-" + os.environ["TARGET"])
+          metadata = json.loads((package / "package.json").read_text())
+          assert metadata["zvecGrep"]["variant"] == "cuda", "Expected CUDA npm package"
+          print(metadata["name"], metadata["version"], metadata["zvecGrep"])
       - name: Cache the two public test models
         uses: actions/cache@v5
         with:
@@ -123,7 +134,7 @@ jobs:
           use-local-cache: false
       - name: Install pinned Windows cuDNN
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: |
           python -m pip install --no-deps --require-hashes -r rust/scripts/cuda-windows-runtime.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -133,7 +144,7 @@ jobs:
             Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Run packaged Windows CLI on CUDA
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: |
           python rust/scripts/test-cuda-cli.py --bundle gpu-install/node_modules/@zvec/zvec-grep-win32-x64-msvc/bin --model-cache "$env:RUNNER_TEMP/zvec-grep-model-cache" --logs gpu-logs
       - name: Run packaged Linux CLI on CUDA
@@ -165,3 +176,14 @@ jobs:
           path: gpu-logs/
           if-no-files-found: warn
           retention-days: 7
+
+  windows-image-check:
+    runs-on:
+      group: gpu-runners
+      labels: gpu-windows-t4
+    timeout-minutes: 10
+    steps:
+      - shell: powershell
+        run: |
+          nvidia-smi
+          nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
