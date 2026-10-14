@@ -132,7 +132,8 @@ jobs:
           cuda: "12.8.1"
           method: network
           sub-packages: '["cudart", "cublas", "curand", "cufft", "nvrtc"]'
-          use-local-cache: false
+          # Required when installing two CUDA versions in the same job.
+          use-local-cache: true
       - name: Install pinned Windows cuDNN
         if: runner.os == 'Windows'
         shell: powershell
@@ -155,7 +156,7 @@ jobs:
           cuda: "13.1.1"
           method: network
           sub-packages: '["cudart", "cublas"]'
-          use-local-cache: false
+          use-local-cache: true
       - name: Run Windows GGUF primary with ONNX still on CUDA 12
         if: runner.os == 'Windows'
         shell: powershell
