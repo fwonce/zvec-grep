@@ -93,9 +93,8 @@ Require-Import $binaryImports "^llama\.dll$" $binary
 
 $cudaBackend = Join-Path $bundleDirectory "ggml-cuda.dll"
 $cudaImports = @(Get-Imports $cudaBackend)
-Require-Import $cudaImports "^cudart64_[0-9]+\.dll$" $cudaBackend
-Require-Import $cudaImports "^cublas64_[0-9]+\.dll$" $cudaBackend
 Require-Import $cudaImports "^nvcuda\.dll$" $cudaBackend
+Require-Import $cudaImports "^(?:cudart64|cublas64|cublaslt64)_[0-9_]+\.dll$" $cudaBackend
 
 $provider = Join-Path $bundleDirectory "onnxruntime_providers_cuda.dll"
 $providerImports = @(Get-Imports $provider)

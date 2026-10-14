@@ -1,3 +1,7 @@
+param(
+    [switch]$SkipAudit
+)
+
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3.0
 
@@ -130,10 +134,12 @@ try {
     }
 }
 
-& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
-    -File (Join-Path $scriptDirectory "check-cuda-linkage-windows.ps1") `
-    -Bundle $bundleDirectory
-if ($LASTEXITCODE -ne 0) {
-    throw "Windows CUDA linkage audit failed with exit code $LASTEXITCODE"
+if (-not $SkipAudit) {
+    & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        -File (Join-Path $scriptDirectory "check-cuda-linkage-windows.ps1") `
+        -Bundle $bundleDirectory
+    if ($LASTEXITCODE -ne 0) {
+        throw "Windows CUDA linkage audit failed with exit code $LASTEXITCODE"
+    }
 }
 Write-Host "CUDA bundle: $bundleDirectory"

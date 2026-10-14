@@ -62,7 +62,8 @@ jobs:
         with:
           python-version: "3.12"
       - name: Restore Cargo build state
-        uses: actions/cache@v5
+        id: cargo-cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -149,10 +150,26 @@ jobs:
           ORT_CUDA_VERSION: "13"
         run: >-
           powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass
-          -File scripts/build-cuda-windows.ps1
+          -File scripts/build-cuda-windows.ps1 -SkipAudit
       - name: Build the native target
         if: inputs.target != 'linux-x64-gnu' && inputs.target != 'win32-x64-msvc'
         run: npm run build
+      - name: Save Cargo build state
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            rust/target/release/
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+      - name: Audit the Windows CPU/CUDA bundle
+        if: inputs.target == 'win32-x64-msvc'
+        run: >-
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass
+          -File scripts/check-cuda-linkage-windows.ps1
+          -Bundle target/release/zg-cuda
       - name: Apply local macOS signatures after building
         if: runner.os == 'macOS'
         run: |
