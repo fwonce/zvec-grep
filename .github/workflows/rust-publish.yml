@@ -1,12 +1,6 @@
 name: Publish Rust packages
 
 on:
-  push:
-    branches: [main, "release/rust-*"]
-    paths:
-      - "rust/**"
-      - ".github/workflows/rust-publish.yml"
-      - ".github/workflows/rust-package-build.yml"
   workflow_dispatch:
     inputs:
       publish:
@@ -95,15 +89,19 @@ jobs:
           - target: darwin-arm64
             runner: macos-14
           - target: linux-x64-gnu
-            runner: ubuntu-24.04
+            runner: gpu-linux-t4
+            runner_group: gpu-runners
           - target: linux-arm64-gnu
             runner: ubuntu-24.04-arm
           - target: win32-x64-msvc
-            runner: windows-2022
+            runner: gpu-windows-t4
+            runner_group: gpu-runners
     uses: ./.github/workflows/rust-package-build.yml
     with:
       target: ${{ matrix.target }}
       runner: ${{ matrix.runner }}
+      runner_group: ${{ matrix.runner_group || '' }}
+      cuda_e2e: ${{ matrix.runner_group == 'gpu-runners' }}
 
   collect:
     name: Collect downloadable release packages
@@ -177,7 +175,7 @@ jobs:
   registry-smoke:
     name: Verify registry install/update/rollback (${{ matrix.target }})
     needs: [source, publish]
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner_group != '' && matrix.runner_group != null && fromJSON(format('{{"group":"{0}","labels":"{1}"}}', matrix.runner_group, matrix.runner)) || matrix.runner }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -190,11 +188,13 @@ jobs:
           - target: darwin-arm64
             runner: macos-14
           - target: linux-x64-gnu
-            runner: ubuntu-24.04
+            runner: gpu-linux-t4
+            runner_group: gpu-runners
           - target: linux-arm64-gnu
             runner: ubuntu-24.04-arm
           - target: win32-x64-msvc
-            runner: windows-2022
+            runner: gpu-windows-t4
+            runner_group: gpu-runners
     steps:
       - uses: actions/checkout@v6
         with:
