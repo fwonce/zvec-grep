@@ -54,15 +54,22 @@ $requiredPatterns = @(
     "ggml-base.dll",
     "ggml-cpu*.dll",
     "ggml-cuda.dll",
-    "DirectML.dll",
+    "onnxruntime.dll",
     "onnxruntime_providers_shared.dll",
     "onnxruntime_providers_cuda.dll"
 )
 foreach ($pattern in $requiredPatterns) {
     Require-File $pattern
 }
+$fallback = Join-Path $bundleDirectory "cuda12/ggml-cuda.dll"
+if (-not (Test-Path -LiteralPath $fallback -PathType Leaf)) {
+    throw "CUDA 12.4 fallback plugin is missing"
+}
+if (@(Get-ChildItem -LiteralPath (Join-Path $bundleDirectory "cuda12") -File -Recurse).Count -ne 1) {
+    throw "cuda12 must contain only the fallback CUDA plugin"
+}
 
-$unexpectedBuildFiles = @(Get-ChildItem -LiteralPath $bundleDirectory -File |
+$unexpectedBuildFiles = @(Get-ChildItem -LiteralPath $bundleDirectory -File -Recurse |
     Where-Object { $_.Extension -in @(".lib", ".exp", ".pdb") })
 if ($unexpectedBuildFiles.Count -ne 0) {
     throw "Windows CUDA bundle contains build-only files: $($unexpectedBuildFiles.Name -join ', ')"
@@ -75,6 +82,7 @@ $startupFiles = @(
     (Join-Path $bundleDirectory "llama.dll"),
     (Join-Path $bundleDirectory "ggml.dll"),
     (Join-Path $bundleDirectory "ggml-base.dll"),
+    (Join-Path $bundleDirectory "onnxruntime.dll"),
     (Join-Path $bundleDirectory "onnxruntime_providers_shared.dll")
 )
 $startupFiles += @(Get-ChildItem -LiteralPath $bundleDirectory -File -Filter "ggml-cpu*.dll" |
@@ -95,15 +103,20 @@ $cudaBackend = Join-Path $bundleDirectory "ggml-cuda.dll"
 $cudaImports = @(Get-Imports $cudaBackend)
 # The driver may be loaded through the CUDA runtime rather than imported by
 # this DLL. cuBLAS is shared on Windows even when cudart is statically linked.
-Require-Import $cudaImports "^cublas64_[0-9_]+\.dll$" $cudaBackend
+Require-Import $cudaImports "^cublas64_13\.dll$" $cudaBackend
+$fallbackImports = @(Get-Imports $fallback)
+Require-Import $fallbackImports "^cublas64_12\.dll$" $fallback
+Require-Import $fallbackImports "^ggml-base\.dll$" $fallback
 
 $provider = Join-Path $bundleDirectory "onnxruntime_providers_cuda.dll"
 $providerImports = @(Get-Imports $provider)
+Require-Import $providerImports "^cublas64_12\.dll$" $provider
+Require-Import $providerImports "^cudnn64_9\.dll$" $provider
 if (-not ($providerImports | Where-Object { $_ -match $hostCudaPattern })) {
     throw "ONNX Runtime CUDA provider has no CUDA runtime dependency"
 }
 
-$packagedHostCuda = @(Get-ChildItem -LiteralPath $bundleDirectory -File |
+$packagedHostCuda = @(Get-ChildItem -LiteralPath $bundleDirectory -File -Recurse |
     Where-Object { $_.Name.ToLowerInvariant() -match $hostCudaPattern })
 if ($packagedHostCuda.Count -ne 0) {
     throw "NVIDIA runtime DLLs must remain host dependencies: $($packagedHostCuda.Name -join ', ')"

@@ -45,19 +45,21 @@ for pattern in \
   'libggml-base.so*' \
   'libggml-cpu*.so*' \
   'libggml-cuda.so*' \
+  'cuda12/libggml-cuda.so' \
+  'libonnxruntime.so.1' \
   'libonnxruntime_providers_shared.so' \
   'libonnxruntime_providers_cuda.so'; do
   require_file "${pattern}"
 done
 
-if find "${bundle}" -maxdepth 1 -type l -print -quit | grep -q .; then
+if find "${bundle}" -type l -print -quit | grep -q .; then
   echo "CUDA bundle must not contain symbolic links" >&2
   find "${bundle}" -maxdepth 1 -type l -print >&2
   exit 1
 fi
 
-for stem in libllama libggml libggml-base; do
-  count="$(find "${bundle}" -maxdepth 1 -type f -name "${stem}.so*" | wc -l)"
+for stem in libllama libggml libggml-base libonnxruntime; do
+  count="$(find "${bundle}" -type f -name "${stem}.so*" | wc -l)"
   if [[ "${count}" -ne 1 ]]; then
     echo "expected one canonical ${stem} shared library, found ${count}" >&2
     exit 1
@@ -91,18 +93,37 @@ done < <(find "${bundle}" -maxdepth 1 -type f \( \
   -name 'libggml.so*' -o \
   -name 'libggml-base.so*' -o \
   -name 'libggml-cpu*.so*' -o \
+  -name 'libonnxruntime.so.1' -o \
   -name 'libonnxruntime_providers_shared.so' \
 \) -print0)
 
 cuda_backend="$(find "${bundle}" -maxdepth 1 -name 'libggml-cuda.so*' -type f -print -quit)"
 cuda_needed="$(needed "${cuda_backend}")"
-for library in libcudart.so libcublas.so libcuda.so; do
+for library in libcudart.so.13 libcublas.so.13 libcuda.so.1; do
   require_needed "${cuda_needed}" "${library}"
 done
 
+fallback_needed="$(needed "${bundle}/cuda12/libggml-cuda.so")"
+require_needed "${fallback_needed}" libcublas.so.12
+require_needed "${fallback_needed}" libggml-base.so
+if [[ "$(find "${bundle}/cuda12" -type f | wc -l)" -ne 1 ]]; then
+  echo "cuda12 must contain only the fallback CUDA plugin" >&2
+  exit 1
+fi
+if ! readelf -d "${bundle}/cuda12/libggml-cuda.so" | grep -Fq '$ORIGIN/..'; then
+  echo "CUDA 12 plugin must resolve the shared core from its parent" >&2
+  exit 1
+fi
+
 provider_needed="$(needed "${bundle}/libonnxruntime_providers_cuda.so")"
+require_needed "${provider_needed}" libcublas.so.12
+require_needed "${provider_needed}" libcudnn.so.9
 if ! grep -Eq '^lib(cuda|cudart|cublas|cudnn)' <<<"${provider_needed}"; then
   echo "ONNX Runtime CUDA provider has no CUDA runtime dependency" >&2
+  exit 1
+fi
+if find "${bundle}" -type f -name 'libcu*.so*' -print -quit | grep -q .; then
+  echo "NVIDIA libraries must remain host dependencies" >&2
   exit 1
 fi
 

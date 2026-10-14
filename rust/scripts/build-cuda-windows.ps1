@@ -1,5 +1,6 @@
 param(
-    [switch]$SkipAudit
+    [switch]$SkipAudit,
+    [switch]$PrimaryOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,7 +13,7 @@ if ($env:OS -ne "Windows_NT") {
     throw "Windows CUDA builds require Windows"
 }
 
-foreach ($command in @("cargo", "cmake", "nvcc", "dumpbin")) {
+foreach ($command in @("cargo", "cmake", "nvcc", "dumpbin", "python")) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
         throw "required command is unavailable: $command"
     }
@@ -27,10 +28,8 @@ if (-not $versionMatch.Success) {
     throw "unable to detect the CUDA toolkit version"
 }
 $cudaToolkitVersion = $versionMatch.Groups[1].Value
-$cudaMajorVersion = $cudaToolkitVersion.Split(".")[0]
-
-if ([string]::IsNullOrWhiteSpace($env:ORT_CUDA_VERSION)) {
-    $env:ORT_CUDA_VERSION = $cudaMajorVersion
+if ($cudaToolkitVersion -ne "13.1") {
+    throw "the primary GGUF backend requires CUDA 13.1 (found $cudaToolkitVersion)"
 }
 if ([string]::IsNullOrWhiteSpace($env:CMAKE_CUDA_ARCHITECTURES)) {
     $env:CMAKE_CUDA_ARCHITECTURES = "75-real;80-real;86-real;89-real;90-real;90-virtual"
@@ -39,7 +38,7 @@ if ([string]::IsNullOrWhiteSpace($env:CMAKE_BUILD_PARALLEL_LEVEL)) {
     $env:CMAKE_BUILD_PARALLEL_LEVEL = [Environment]::ProcessorCount.ToString()
 }
 
-Write-Host "CUDA toolkit: $cudaToolkitVersion (ORT major $env:ORT_CUDA_VERSION)"
+Write-Host "GGUF toolkit: $cudaToolkitVersion; ONNX Runtime: official CUDA 12 dynamic runtime"
 Write-Host "CUDA architectures: $env:CMAKE_CUDA_ARCHITECTURES"
 
 $targetDirectoryValue = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
@@ -48,7 +47,7 @@ $targetDirectoryValue = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR))
     $env:CARGO_TARGET_DIR
 }
 $targetDirectory = [IO.Path]::GetFullPath($targetDirectoryValue)
-$buildConfiguration = "cuda_toolkit=$cudaToolkitVersion;ort_cuda_major=$env:ORT_CUDA_VERSION;architectures=$env:CMAKE_CUDA_ARCHITECTURES"
+$buildConfiguration = "cuda_toolkit=$cudaToolkitVersion;ort=1.28.0-cuda12-dynamic;architectures=$env:CMAKE_CUDA_ARCHITECTURES"
 $buildConfigurationFile = Join-Path $targetDirectory ".zvec-grep-cuda-build-config"
 $previousBuildConfiguration = if (Test-Path -LiteralPath $buildConfigurationFile -PathType Leaf) {
     (Get-Content -LiteralPath $buildConfigurationFile -TotalCount 1)
@@ -110,13 +109,14 @@ try {
         "llama.dll",
         "ggml.dll",
         "ggml-base.dll",
-        "zvec_c_api.dll",
-        "DirectML.dll",
-        "onnxruntime_providers_shared.dll",
-        "onnxruntime_providers_cuda.dll"
+        "zvec_c_api.dll"
     )) {
         Copy-RequiredFile (Join-Path $profileDirectory $name) (Join-Path $stagingDirectory $name)
     }
+
+    & python scripts/prepare-onnxruntime-cuda.py --platform win32 `
+        --cache-dir (Join-Path $targetDirectory "ort-cuda12") --destination $stagingDirectory
+    if ($LASTEXITCODE -ne 0) { throw "Preparing the ORT CUDA 12 runtime failed" }
 
     $dataDirectory = Join-Path $profileDirectory "data"
     if (-not (Test-Path -LiteralPath $dataDirectory -PathType Container)) {
@@ -134,7 +134,13 @@ try {
     }
 }
 
-if (-not $SkipAudit) {
+if (-not $PrimaryOnly) {
+    $cuda12Root = if ($env:CUDA12_ROOT) { $env:CUDA12_ROOT } else { $env:CUDA_PATH_V12_4 }
+    if (-not $cuda12Root) { throw "Set CUDA12_ROOT to the CUDA 12.4 toolkit directory" }
+    & python scripts/build-ggml-cuda12.py --bundle $bundleDirectory --cuda-root $cuda12Root
+    if ($LASTEXITCODE -ne 0) { throw "Building the CUDA 12.4 fallback failed" }
+}
+if (-not $SkipAudit -and -not $PrimaryOnly) {
     & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
         -File (Join-Path $scriptDirectory "check-cuda-linkage-windows.ps1") `
         -Bundle $bundleDirectory

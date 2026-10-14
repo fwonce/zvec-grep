@@ -126,6 +126,26 @@ test("stages a complete native bundle entirely beside the executable", async (t)
   }
 });
 
+test("keeps only CUDA plugins in the secondary backend directory", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "zg-dual-cuda-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const [platform, binary, zvec, cuda, core] of [
+    ["linux", "zg", "libzvec_c_api.so", "libggml-cuda.so", "libggml-base.so.0"],
+    ["win32", "zg.exe", "zvec_c_api.dll", "ggml-cuda.dll", "ggml-base.dll"],
+  ]) {
+    const source = join(root, platform, "source");
+    await mkdir(join(source, "cuda12"), { recursive: true });
+    await mkdir(join(source, "data/jieba_dict"), { recursive: true });
+    for (const file of [binary, zvec, cuda, core, `cuda12/${cuda}`,
+      "data/jieba_dict/jieba.dict.utf8", "data/jieba_dict/hmm_model.utf8"]) {
+      await writeFile(join(source, file), file);
+    }
+    const files = await stageRuntimeBundle(source, join(root, platform, "bin"), platform, binary);
+    assert.deepEqual(files.filter((file) => file.startsWith("bin/cuda12/")), [`bin/cuda12/${cuda}`]);
+    assert.equal(files.filter((file) => file.endsWith(core)).length, 1);
+  }
+});
+
 test("rejects symbolic links in a native bundle", async (t) => {
   if (process.platform === "win32") {
     t.skip("creating symbolic links requires elevated Windows privileges");

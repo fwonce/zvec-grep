@@ -339,6 +339,8 @@ impl SessionPool {
         device: Option<Device>,
         reporter: &ModelDownloadProgressReporter,
     ) -> Result<Self, ModelError> {
+        #[cfg(feature = "cuda")]
+        super::native_runtime::initialize()?;
         let prepacked_weights = PrepackedWeights::new();
         let requested = resolve_execution_provider(device);
         if cfg!(target_os = "macos")
@@ -655,6 +657,10 @@ fn resolve_execution_provider(device: Option<Device>) -> TransformersExecutionPr
         Some(Device::Cuda) => TransformersExecutionProvider::Cuda,
         // ORT's CPU/MLAS path is both faster and substantially smaller than
         // CoreML for the catalog's quantized ONNX model on Apple Silicon.
+        Some(Device::Auto) if cfg!(all(target_os = "windows", feature = "cuda")) => {
+            // The official CUDA 12 runtime contains CPU and CUDA, not DirectML.
+            TransformersExecutionProvider::Cuda
+        }
         Some(Device::Auto) if cfg!(target_os = "windows") => {
             TransformersExecutionProvider::DirectMl
         }

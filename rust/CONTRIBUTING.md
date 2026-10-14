@@ -93,11 +93,16 @@ remains independent.
 To reproduce against an unpacked/installed CUDA bundle (Python 3.12 recommended):
 
 ```sh
-python scripts/test-cuda-cli.py --bundle /path/to/package/bin --model-cache /path/to/models --logs /path/to/logs
+python scripts/test-cuda-cli.py --bundle /path/to/package/bin --model-cache /path/to/models --logs /path/to/logs --expected-gguf-cuda 13.1
 python scripts/test-cuda-cli-checks.py  # assertion regression tests; no GPU needed
 ```
 
-The Linux job uses a pinned CUDA 13.2/cuDNN runtime container; Windows provisions
-the CUDA 13.2 runtime and hash-verified cuDNN wheel. The hosted image must supply
-a compatible NVIDIA driver and container GPU support on Linux. Missing/incompatible
-drivers fail validation instead of silently accepting CPU execution.
+Both platforms first run GGUF and ONNX with only CUDA 12.8/cuDNN 9 installed,
+requiring GGUF to select the CUDA 12.4 fallback. Linux then runs GGUF in a separate
+CUDA 13.1 container; Windows adds CUDA 13.1 alongside CUDA 12 and reruns both models,
+requiring the GGUF primary plugin and ONNX CUDA 12 provider to coexist. Logs must
+prove the expected GGUF plugin as well as actual GPU/provider selection.
+The Windows job can update its ephemeral VM's driver with Microsoft's NVIDIA-signed
+591.59 installer. It never reboots; a reboot requirement fails with a clear error.
+The Linux image must supply a compatible driver and NVIDIA container support.
+Driver/runtime failures never count as successful CPU execution.

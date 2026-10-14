@@ -12,6 +12,15 @@ fn maps_devices_to_native_rust_execution_providers() {
         TransformersExecutionProvider::Cpu
     };
     assert_eq!(resolve_execution_provider(None), default);
+    #[cfg(target_os = "windows")]
+    assert_eq!(
+        resolve_execution_provider(Some(Device::Auto)),
+        if cfg!(feature = "cuda") {
+            TransformersExecutionProvider::Cuda
+        } else {
+            TransformersExecutionProvider::DirectMl
+        }
+    );
     assert_eq!(
         resolve_execution_provider(Some(Device::Cpu)),
         TransformersExecutionProvider::Cpu

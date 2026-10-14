@@ -17,11 +17,17 @@ MODELS = (
 MARKER = "cuda_cli_e2e_marker"
 
 
-def cuda_evidence(stderr, backend):
+def cuda_evidence(stderr, backend, expected_gguf_cuda=None):
     """Selection alone is insufficient for ORT: require CUDA graph placement."""
     if re.search(r"fall(?:ing)? back to CPU", stderr, re.IGNORECASE):
         raise AssertionError("CUDA execution fell back to CPU")
     if backend == "gguf":
+        if expected_gguf_cuda and not any(
+            "llama.cpp CUDA backend library selected" in line
+            and re.search(r'cuda_version=["\']?' + re.escape(expected_gguf_cuda) + r'\b', line)
+            for line in stderr.splitlines()
+        ):
+            raise AssertionError(f"Expected GGUF CUDA {expected_gguf_cuda} plugin was not selected")
         lines = [line for line in stderr.splitlines()
                  if "llama.cpp GPU embedding backend selected" in line
                  and re.search(r'backend=["\']?CUDA\b', line, re.IGNORECASE)]
@@ -56,7 +62,7 @@ def run_zg(binary, workspace, logs, stage, args, env):
     return out, err
 
 
-def run_case(binary, model_cache, work, logs, backend, model):
+def run_case(binary, model_cache, work, logs, backend, model, expected_gguf_cuda):
     workspace = work / backend / "workspace"
     workspace.mkdir(parents=True)
     logs.mkdir(parents=True)
@@ -78,7 +84,7 @@ def run_case(binary, model_cache, work, logs, backend, model):
         "--embedding", model, "--embedding-concurrency", "2", *cuda_args,
     ], env)
     require(index_err, "Index complete")
-    index_evidence = cuda_evidence(index_err, backend)
+    index_evidence = cuda_evidence(index_err, backend, expected_gguf_cuda)
     status, _ = run_zg(binary, workspace, logs, "status", [
         "--status", "--mode", "direct", "--check-ready", "--no-color",
     ], env)
@@ -90,8 +96,9 @@ def run_case(binary, model_cache, work, logs, backend, model):
     ], env)
     require(query, "gpu-fixture.md")
     require(query, MARKER)
-    query_evidence = cuda_evidence(query_err, backend)
-    result = {"model": model, "index": index_evidence, "query": query_evidence}
+    query_evidence = cuda_evidence(query_err, backend, expected_gguf_cuda)
+    result = {"model": model, "gguf_cuda": expected_gguf_cuda if backend == "gguf" else None,
+              "index": index_evidence, "query": query_evidence}
     print(json.dumps(result, indent=2), flush=True)
     return result
 
@@ -101,6 +108,8 @@ def main():
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--model-cache", type=Path, required=True)
     parser.add_argument("--logs", type=Path, required=True)
+    parser.add_argument("--backend", choices=("all", "gguf", "onnx"), default="all")
+    parser.add_argument("--expected-gguf-cuda", choices=("12.4", "13.1"), required=True)
     args = parser.parse_args()
     binary = args.bundle.resolve() / ("zg.exe" if os.name == "nt" else "zg")
     if not binary.is_file():
@@ -116,9 +125,11 @@ def main():
     results, failures = {}, []
     with tempfile.TemporaryDirectory(prefix="zg-cuda-e2e-") as temporary:
         for backend, model in MODELS:
+            if args.backend not in ("all", backend):
+                continue
             try:
                 results[backend] = run_case(binary, args.model_cache.resolve(), Path(temporary),
-                                            logs / backend, backend, model)
+                                            logs / backend, backend, model, args.expected_gguf_cuda)
             except (AssertionError, OSError, subprocess.SubprocessError) as error:
                 failures.append(f"{backend}: {error}")
                 print(f"FAILED: {failures[-1]}", flush=True)
@@ -126,7 +137,7 @@ def main():
                                       encoding="utf-8")
     if failures:
         raise SystemExit("CUDA CLI end-to-end validation failed (see retained logs)")
-    print("CUDA CLI end-to-end validation passed: GGUF and ONNX index + query", flush=True)
+    print(f"CUDA CLI end-to-end validation passed: {', '.join(results)} index + query", flush=True)
 
 
 if __name__ == "__main__":

@@ -323,73 +323,91 @@ bash scripts/check.sh
 
 ## Linux CUDA build
 
-Build the release bundle on a machine with the CUDA toolkit, NVIDIA driver,
-CMake, a C/C++ toolchain, libclang, and patchelf installed:
+Build the release bundle with CUDA Toolkit 13.1 on PATH and CUDA Toolkit 12.4
+at `CUDA12_ROOT` (default `/usr/local/cuda-12.4`), CMake, Ninja, Python 3,
+a C/C++ toolchain, libclang, and patchelf. Building does not require a GPU:
 
 ```sh
 bash scripts/build-cuda.sh
 ```
 
-For a reproducible toolchain, build and use the pinned CUDA 13.2/Ubuntu 24.04
-builder image:
+For reproducible builds, use the pinned CUDA 13.1/Ubuntu 24.04 builder for the
+primary bundle, then the CUDA 12.4/Ubuntu 22.04 builder for only the fallback plugin:
 
 ```sh
 docker build --platform linux/amd64 \
   -f rust/docker/cuda-builder.Dockerfile -t zvec-grep-cuda-builder .
-docker run --rm --gpus all --platform linux/amd64 \
+docker run --rm --platform linux/amd64 \
   -v "$PWD:/work" \
-  zvec-grep-cuda-builder bash scripts/build-cuda.sh
+  zvec-grep-cuda-builder bash scripts/build-cuda.sh --primary-only
+docker build --platform linux/amd64 \
+  -f rust/docker/cuda-builder.Dockerfile \
+  --build-arg CUDA_IMAGE=nvidia/cuda:12.4.1-devel-ubuntu22.04@sha256:da6791294b0b04d7e65d87b7451d6f2390b4d36225ab0701ee7dfec5769829f5 \
+  -t zvec-grep-cuda12-builder .
+docker run --rm --platform linux/amd64 -v "$PWD:/work" \
+  zvec-grep-cuda12-builder bash -ec 'python3 scripts/build-ggml-cuda12.py --bundle target/release/zg-cuda; bash scripts/check-cuda-linkage.sh target/release/zg-cuda'
 ```
 
 Run these Docker commands from the repository root. The image includes
 `libclang-dev`, which bindgen needs while compiling `llama-cpp-sys-2`.
 
-The script detects the CUDA major version and defaults
+The script checks the primary toolkit is 13.1 and defaults
 `CMAKE_CUDA_ARCHITECTURES` to
 `75-real;80-real;86-real;89-real;90-real;90-virtual`. This produces native code
 for commonly deployed x86_64 Turing through Hopper GPUs and keeps Hopper PTX
-for forward compatibility. The explicit list also avoids CUDA 13.2's
+for forward compatibility. The explicit list also avoids newer CUDA's
 `all-major` expansion to `sm_120`, which the current llama.cpp NVFP4 kernels
 cannot be assembled for. Set
-`ORT_CUDA_VERSION` or `CMAKE_CUDA_ARCHITECTURES` explicitly only when producing
+`CMAKE_CUDA_ARCHITECTURES` explicitly only when producing
 a deliberately narrower test build. The script assembles
 `target/release/zg-cuda/` and runs `scripts/check-cuda-linkage.sh` against that
 bundle.
 
 The Linux CUDA linkage policy is:
 
-- `llama`, `ggml`, their CPU/CUDA backends, the ONNX Runtime CUDA providers,
+- `llama`, `ggml`, their CPU backends, the primary CUDA 13.1 plugin, ONNX Runtime,
+  its CUDA 12 providers,
   and zvec's C API are packaged shared libraries beside `zg`;
-- the ONNX Runtime core remains statically linked into `zg`;
+- `cuda12/libggml-cuda.so` is the CUDA 12.4 fallback, compiled from the same locked
+  llama.cpp source; no duplicate llama/ggml core or CPU libraries are shipped;
+- ORT 1.28.0 comes from Microsoft's hash-verified CUDA 12 release, including its
+  matching dynamic core and providers, plus license notices;
 - every packaged ELF uses an `$ORIGIN` runtime search path, so the directory is
-  relocatable without `LD_LIBRARY_PATH`; and
+  relocatable without `LD_LIBRARY_PATH` (the fallback uses `$ORIGIN/..`); and
 - the NVIDIA driver/runtime libraries and normal system libraries remain host
   dependencies.
 
 The CUDA backend libraries are plugins rather than process-startup dependencies.
+GGUF tries CUDA 13.1 first and CUDA 12.4 if the first plugin cannot provide a GPU.
+ORT independently requires CUDA 12 runtime libraries and cuDNN 9, even when GGUF
+uses CUDA 13. Both families' runtime libraries can coexist. They are not bundled.
 The Linux x64 CUDA release defaults local embedding to automatic device
 selection. On a machine without CUDA, `zg` and CPU embedding still start
 normally; CUDA initialization reports a warning and falls back to CPU. Pass
 `--device cpu`, set `ZVEC_GREP_DEVICE=cpu`, or configure the model for CPU to
 opt out explicitly. The bundle must be kept together;
-`ZVEC_GREP_NATIVE_LIB_DIR` can point llama.cpp at a different backend directory
-when needed for development or packaging.
+`ZVEC_GREP_NATIVE_LIB_DIR` can point llama.cpp and ORT at a different runtime
+directory. `ORT_DYLIB_PATH` overrides only the ORT core path.
 
 ## Windows CUDA build
 
-On Windows x64, install Visual Studio 2022 Build Tools and CUDA Toolkit 13, open
-an x64 developer shell, prepare the verified ONNX Runtime CUDA distribution,
-and build the release bundle:
+On Windows x64, install Visual Studio 2022 Build Tools and CUDA Toolkits 13.1
+and 12.4. Use an x64 developer shell with CUDA 13.1 on PATH for the primary build,
+then use the CUDA-12.4-compatible MSVC 14.38 toolset for the fallback:
 
 ```powershell
-python scripts/prepare-onnxruntime-windows.py --cuda
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
-  -File scripts/build-cuda-windows.ps1
+  -File scripts/build-cuda-windows.ps1 -PrimaryOnly
+# After selecting MSVC 14.38:
+python scripts/build-ggml-cuda12.py --bundle target/release/zg-cuda --cuda-root "$env:CUDA_PATH_V12_4"
+powershell.exe -File scripts/check-cuda-linkage-windows.ps1
 ```
 
 The output is `target/release/zg-cuda/`. It contains `zg.exe`, zvec's C API,
-the llama/ggml core and CPU/CUDA backend DLLs, and the ONNX Runtime CUDA and
-DirectML providers. NVIDIA driver, CUDA runtime, cuBLAS, and cuDNN DLLs remain
+the shared llama/ggml core and CPU backend DLLs, `ggml-cuda.dll` (13.1),
+`cuda12/ggml-cuda.dll` (12.4), and the matching ORT CUDA 12 core/providers.
+This CUDA variant supports CPU and CUDA, not DirectML; the non-CUDA build retains
+its existing DirectML runtime. NVIDIA driver, CUDA runtime, cuBLAS, and cuDNN DLLs remain
 host dependencies. `scripts/check-cuda-linkage-windows.ps1` verifies that CUDA
 is loaded only through the backend/provider plugins, so CLI startup and CPU
 fallback do not acquire a process-startup CUDA dependency.
@@ -521,7 +539,7 @@ builds start. The final artifact is collected after all five targets pass.
 
 Linux candidates are built and smoke-tested on Ubuntu 24.04. Linux x64 uses the
 pinned CUDA builder image to produce the default CPU/CUDA bundle; Linux ARM64
-uses the native runner. Windows x64 installs a pinned CUDA 13.2 toolchain on the
+uses the native runner. Windows x64 installs pinned CUDA 13.1 and 12.4 toolchains on the
 standard Windows runner and produces the corresponding CPU/CUDA bundle without
 requiring a GPU. The current ONNX Runtime prebuilt libraries cannot link against
 Ubuntu 22.04's glibc and C++ runtime, so older Linux distributions are not

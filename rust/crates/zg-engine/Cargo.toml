@@ -15,7 +15,7 @@ default = []
 cuda = [
     "llama-cpp-2/cuda",
     "llama-cpp-2/dynamic-backends",
-    "ort/copy-dylibs",
+    "ort/load-dynamic",
     "ort/cuda",
 ]
 vulkan = ["llama-cpp-2/vulkan", "ort/webgpu"]
