@@ -19,16 +19,16 @@ SBOM.spdx.json
 ```
 
 Relocatable bundles whose native libraries and plugins use executable-relative
-lookup are packaged entirely under `bin/`. In particular, the Linux CUDA
-bundle keeps `libllama`, `libggml`, the CPU/CUDA backend modules, ONNX Runtime
-providers, zvec's C API, and dictionaries beside `zg`; it does not emit a
+lookup are packaged entirely under `bin/`. In particular, the Linux and Windows
+CUDA bundles keep llama/ggml, the CPU/CUDA backend modules, ONNX Runtime
+providers, zvec's C API, and dictionaries beside `zg`; they do not emit a
 second copy under `lib/`.
 
-The default `linux-x64-gnu` native package is this CPU/CUDA bundle. CUDA
-libraries remain runtime plugins: compatible NVIDIA libraries enable automatic
-GPU use, while hosts without them continue on CPU. Release maintainers may use
-`--cpu-only` for a diagnostic slim build, but that variant is not published as
-the default Linux x64 package.
+The default `linux-x64-gnu` and `win32-x64-msvc` native packages are CPU/CUDA
+bundles. CUDA libraries remain runtime plugins: compatible NVIDIA libraries
+enable GPU use, while hosts without them continue on CPU. Release maintainers
+may use `--cpu-only` for a diagnostic slim build, but that variant is not
+published as the default x64 package on Linux or Windows.
 
 The meta package locks every platform package to its exact version through
 `optionalDependencies`. Its `postinstall` selects the installed package,
@@ -62,10 +62,11 @@ platform builds start. Its ONNX Runtime with CoreML and zvec SDK are built from
 pinned sources, cached, and bundled with the native package. The Intel release
 targets macOS 14 and later.
 
-Windows prepares the prebuilt ONNX Runtime selected by locked `ort-sys` with
-bounded download retries, verifies its SHA-256, and caches the complete archive
-and extracted runtime before compiling. The original static-link configuration
-is preserved.
+Windows installs the pinned CUDA 13.2 build components, prepares the CUDA 13 and
+DirectML ONNX Runtime distribution selected by locked `ort-sys`, verifies its
+SHA-256, and caches the complete archive and extracted runtime before compiling.
+The ONNX Runtime core remains statically linked; its CUDA provider and the
+llama.cpp CUDA backend are packaged as runtime DLL plugins.
 
 Explicit publication runs from a `rust-v<version>`-tagged commit on `main` and
 uses npm provenance with trusted publishing or `NPM_TOKEN`. Native packages are

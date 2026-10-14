@@ -9,6 +9,10 @@ on:
       runner:
         type: string
         required: true
+      cuda_architectures:
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -22,7 +26,7 @@ jobs:
   native:
     name: Build ${{ inputs.target }}
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: ${{ inputs.target == 'darwin-x64' && 180 || 90 }}
+    timeout-minutes: ${{ (inputs.target == 'darwin-x64' || inputs.target == 'win32-x64-msvc') && 180 || 90 }}
     defaults:
       run:
         working-directory: rust
@@ -38,6 +42,14 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      - name: Install the pinned Windows CUDA toolkit
+        if: inputs.target == 'win32-x64-msvc'
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: "13.2.0"
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cccl", "visual_studio_integration"]'
+          use-local-cache: false
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -65,13 +77,13 @@ jobs:
         uses: actions/cache@v5
         with:
           path: rust/target/ort-prebuilt/
-          key: rust-ort-windows-v1-${{ hashFiles('rust/Cargo.lock', 'rust/scripts/prepare-onnxruntime-windows.py') }}
+          key: rust-ort-windows-cuda13-v2-${{ hashFiles('rust/Cargo.lock', 'rust/scripts/prepare-onnxruntime-windows.py') }}
       - name: Prepare the verified Windows ONNX Runtime
         if: runner.os == 'Windows'
         run: |
           python scripts/test-prepare-onnxruntime-windows.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python scripts/prepare-onnxruntime-windows.py
+          python scripts/prepare-onnxruntime-windows.py --cuda
       - name: Restore the Intel macOS ONNX Runtime
         if: inputs.target == 'darwin-x64'
         id: ort-cache
@@ -130,8 +142,16 @@ jobs:
             --env ORT_CUDA_VERSION=13 \
             zvec-grep-cuda-builder \
             bash scripts/build-cuda.sh
+      - name: Build the Windows CPU/CUDA bundle
+        if: inputs.target == 'win32-x64-msvc'
+        env:
+          CMAKE_CUDA_ARCHITECTURES: ${{ inputs.cuda_architectures }}
+          ORT_CUDA_VERSION: "13"
+        run: >-
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass
+          -File scripts/build-cuda-windows.ps1
       - name: Build the native target
-        if: inputs.target != 'linux-x64-gnu'
+        if: inputs.target != 'linux-x64-gnu' && inputs.target != 'win32-x64-msvc'
         run: npm run build
       - name: Apply local macOS signatures after building
         if: runner.os == 'macOS'

@@ -1,0 +1,116 @@
+param(
+    [string]$Bundle = "target/release/zg-cuda"
+)
+
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version 3.0
+
+$bundleDirectory = [IO.Path]::GetFullPath($Bundle)
+$binary = Join-Path $bundleDirectory "zg.exe"
+if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+    throw "zg binary is missing: $binary"
+}
+if (-not (Get-Command dumpbin -ErrorAction SilentlyContinue)) {
+    throw "dumpbin is required; run from an MSVC developer environment"
+}
+
+function Require-File {
+    param([Parameter(Mandatory = $true)][string]$Pattern)
+    if (@(Get-ChildItem -LiteralPath $bundleDirectory -File -Filter $Pattern).Count -eq 0) {
+        throw "missing packaged shared library: $Pattern"
+    }
+}
+
+function Get-Imports {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $output = (& dumpbin /nologo /dependents $Path 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "dumpbin failed for $Path"
+    }
+    $imports = @()
+    foreach ($line in ($output -split "`r?`n")) {
+        if ($line -match "^\s+([A-Za-z0-9_.+-]+\.dll)\s*$") {
+            $imports += $Matches[1].ToLowerInvariant()
+        }
+    }
+    return $imports | Sort-Object -Unique
+}
+
+function Require-Import {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Imports,
+        [Parameter(Mandatory = $true)][string]$Pattern,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    if (-not ($Imports | Where-Object { $_ -match $Pattern })) {
+        throw "missing expected dynamic dependency in ${Path}: $Pattern"
+    }
+}
+
+$requiredPatterns = @(
+    "zvec_c_api.dll",
+    "llama.dll",
+    "ggml.dll",
+    "ggml-base.dll",
+    "ggml-cpu*.dll",
+    "ggml-cuda.dll",
+    "DirectML.dll",
+    "onnxruntime_providers_shared.dll",
+    "onnxruntime_providers_cuda.dll"
+)
+foreach ($pattern in $requiredPatterns) {
+    Require-File $pattern
+}
+
+$unexpectedBuildFiles = @(Get-ChildItem -LiteralPath $bundleDirectory -File |
+    Where-Object { $_.Extension -in @(".lib", ".exp", ".pdb") })
+if ($unexpectedBuildFiles.Count -ne 0) {
+    throw "Windows CUDA bundle contains build-only files: $($unexpectedBuildFiles.Name -join ', ')"
+}
+
+$hostCudaPattern = "^(?:cudart|cublas|cudnn|nvcuda|nvrtc|cufft|curand)[a-z0-9_.-]*\.dll$"
+$startupFiles = @(
+    $binary,
+    (Join-Path $bundleDirectory "zvec_c_api.dll"),
+    (Join-Path $bundleDirectory "llama.dll"),
+    (Join-Path $bundleDirectory "ggml.dll"),
+    (Join-Path $bundleDirectory "ggml-base.dll"),
+    (Join-Path $bundleDirectory "onnxruntime_providers_shared.dll")
+)
+$startupFiles += @(Get-ChildItem -LiteralPath $bundleDirectory -File -Filter "ggml-cpu*.dll" |
+    ForEach-Object { $_.FullName })
+foreach ($path in $startupFiles) {
+    $imports = @(Get-Imports $path)
+    $cudaImports = @($imports | Where-Object { $_ -match $hostCudaPattern })
+    if ($cudaImports.Count -ne 0) {
+        throw "CPU/startup library must not require CUDA: $path ($($cudaImports -join ', '))"
+    }
+}
+
+$binaryImports = @(Get-Imports $binary)
+Require-Import $binaryImports "^zvec_c_api\.dll$" $binary
+Require-Import $binaryImports "^llama\.dll$" $binary
+
+$cudaBackend = Join-Path $bundleDirectory "ggml-cuda.dll"
+$cudaImports = @(Get-Imports $cudaBackend)
+Require-Import $cudaImports "^cudart64_[0-9]+\.dll$" $cudaBackend
+Require-Import $cudaImports "^cublas64_[0-9]+\.dll$" $cudaBackend
+Require-Import $cudaImports "^nvcuda\.dll$" $cudaBackend
+
+$provider = Join-Path $bundleDirectory "onnxruntime_providers_cuda.dll"
+$providerImports = @(Get-Imports $provider)
+if (-not ($providerImports | Where-Object { $_ -match $hostCudaPattern })) {
+    throw "ONNX Runtime CUDA provider has no CUDA runtime dependency"
+}
+
+$packagedHostCuda = @(Get-ChildItem -LiteralPath $bundleDirectory -File |
+    Where-Object { $_.Name.ToLowerInvariant() -match $hostCudaPattern })
+if ($packagedHostCuda.Count -ne 0) {
+    throw "NVIDIA runtime DLLs must remain host dependencies: $($packagedHostCuda.Name -join ', ')"
+}
+
+Write-Host "Windows CUDA bundle linkage policy passed for $bundleDirectory"
+Write-Host "zg dependencies:"
+$binaryImports | ForEach-Object { Write-Host $_ }
+Write-Host "llama.cpp CUDA backend dependencies:"
+$cudaImports | ForEach-Object { Write-Host $_ }

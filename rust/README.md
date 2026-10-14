@@ -375,6 +375,25 @@ opt out explicitly. The bundle must be kept together;
 `ZVEC_GREP_NATIVE_LIB_DIR` can point llama.cpp at a different backend directory
 when needed for development or packaging.
 
+## Windows CUDA build
+
+On Windows x64, install Visual Studio 2022 Build Tools and CUDA Toolkit 13, open
+an x64 developer shell, prepare the verified ONNX Runtime CUDA distribution,
+and build the release bundle:
+
+```powershell
+python scripts/prepare-onnxruntime-windows.py --cuda
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+  -File scripts/build-cuda-windows.ps1
+```
+
+The output is `target/release/zg-cuda/`. It contains `zg.exe`, zvec's C API,
+the llama/ggml core and CPU/CUDA backend DLLs, and the ONNX Runtime CUDA and
+DirectML providers. NVIDIA driver, CUDA runtime, cuBLAS, and cuDNN DLLs remain
+host dependencies. `scripts/check-cuda-linkage-windows.ps1` verifies that CUDA
+is loaded only through the backend/provider plugins, so CLI startup and CPU
+fallback do not acquire a process-startup CUDA dependency.
+
 ## Local npm installation
 
 Build the release binary with the same script name used by the TypeScript
@@ -436,12 +455,14 @@ npm run release:verify
 npm run release:pack
 ```
 
-On Linux x64, `release:pack`, `release:platform`, and `release:smoke` default to
-the complete CPU/CUDA bundle. This is the artifact published as
-`@zvec/zvec-grep-linux-x64-gnu`, so a normal `npm install @zvec/zvec-grep`
-requires no user-side CUDA build. Other targets remain CPU/platform-native.
-Use `npm run release:cpu` only to produce a deliberate Linux CPU-only test
-artifact; it is not the default published Linux x64 package.
+On Linux x64 and Windows x64, `release:pack`, `release:platform`, and
+`release:smoke` default to complete CPU/CUDA bundles. These are the artifacts
+published as `@zvec/zvec-grep-linux-x64-gnu` and
+`@zvec/zvec-grep-win32-x64-msvc`, so a normal
+`npm install @zvec/zvec-grep` requires no user-side CUDA build. Other targets
+remain CPU/platform-native. Use `npm run release:cpu` only to produce a
+deliberate CPU-only diagnostic artifact; it is not the default published x64
+package on Linux or Windows.
 
 The release tarballs are written under `dist/npm/release/tarballs/`. Run a real
 two-tarball install in an isolated npm prefix and verify the materialized binary
@@ -500,9 +521,11 @@ builds start. The final artifact is collected after all five targets pass.
 
 Linux candidates are built and smoke-tested on Ubuntu 24.04. Linux x64 uses the
 pinned CUDA builder image to produce the default CPU/CUDA bundle; Linux ARM64
-uses the native runner. The current ONNX Runtime prebuilt libraries cannot link
-against Ubuntu 22.04's glibc and C++ runtime, so older Linux distributions are
-not covered by this release workflow.
+uses the native runner. Windows x64 installs a pinned CUDA 13.2 toolchain on the
+standard Windows runner and produces the corresponding CPU/CUDA bundle without
+requiring a GPU. The current ONNX Runtime prebuilt libraries cannot link against
+Ubuntu 22.04's glibc and C++ runtime, so older Linux distributions are not
+covered by this release workflow.
 Intel macOS builds ONNX Runtime 1.28.0 with CoreML and the native zvec SDK from
 pinned source revisions because neither dependency supplies prebuilt Intel
 macOS libraries. Both SDKs are cached and their shared libraries are included

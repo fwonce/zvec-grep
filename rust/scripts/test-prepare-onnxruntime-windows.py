@@ -33,7 +33,9 @@ class VerifiedRuntimeTests(unittest.TestCase):
             archive = root / "runtime.tar.lzma2"
             archive.write_bytes(compressed)
             destination = root / "cache" / expected
-            prepare_ort.extract_verified(archive, destination, expected)
+            prepare_ort.extract_verified(
+                archive, destination, expected, prepare_ort.CPU_REQUIRED_FILES
+            )
             self.assertEqual((destination / "DirectML.dll").read_bytes(), b"runtime")
             self.assertEqual((destination / ".verified-sha256").read_text(), expected)
 
@@ -44,8 +46,37 @@ class VerifiedRuntimeTests(unittest.TestCase):
             archive.write_bytes(b"truncated download")
             destination = root / "cache"
             with self.assertRaisesRegex(RuntimeError, "SHA-256"):
-                prepare_ort.extract_verified(archive, destination, "0" * 64)
+                prepare_ort.extract_verified(
+                    archive,
+                    destination,
+                    "0" * 64,
+                    prepare_ort.CPU_REQUIRED_FILES,
+                )
             self.assertFalse(destination.exists())
+
+    def test_cuda_runtime_requires_both_provider_dlls(self):
+        tar_bytes = io.BytesIO()
+        with tarfile.open(fileobj=tar_bytes, mode="w") as tar:
+            for name in prepare_ort.CPU_REQUIRED_FILES:
+                entry = tarfile.TarInfo(name)
+                entry.size = 7
+                tar.addfile(entry, io.BytesIO(b"runtime"))
+        compressed = lzma.compress(
+            tar_bytes.getvalue(), format=lzma.FORMAT_RAW,
+            filters=[{"id": lzma.FILTER_LZMA2, "dict_size": 1 << 26}],
+        )
+        expected = hashlib.sha256(compressed).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "runtime.tar.lzma2"
+            archive.write_bytes(compressed)
+            with self.assertRaisesRegex(RuntimeError, "providers_shared"):
+                prepare_ort.extract_verified(
+                    archive,
+                    root / "cache",
+                    expected,
+                    prepare_ort.CUDA_REQUIRED_FILES,
+                )
 
 
 if __name__ == "__main__":

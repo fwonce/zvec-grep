@@ -6,6 +6,7 @@ on:
     paths:
       - "rust/**"
       - ".github/workflows/rust-ci.yml"
+      - ".github/workflows/rust-package-build.yml"
       - ".github/actions/**"
       - ".gitignore"
       - "!**/*.md"
@@ -14,6 +15,7 @@ on:
     paths:
       - "rust/**"
       - ".github/workflows/rust-ci.yml"
+      - ".github/workflows/rust-package-build.yml"
       - ".github/actions/**"
       - ".gitignore"
       - "!**/*.md"
@@ -157,3 +159,13 @@ jobs:
               env -u LD_LIBRARY_PATH /opt/zg/zg --help >/dev/null
               env -u LD_LIBRARY_PATH /opt/zg/zg --rg -F "zvec-grep Rust rewrite" /workspace/rust/README.md >/dev/null
             '
+
+  windows-cuda-build:
+    name: windows cuda package (no GPU)
+    permissions:
+      contents: read
+    uses: ./.github/workflows/rust-package-build.yml
+    with:
+      target: win32-x64-msvc
+      runner: windows-2022
+      cuda_architectures: "75"

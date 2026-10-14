@@ -15,9 +15,14 @@ import tempfile
 
 
 TARGET = "x86_64-pc-windows-msvc"
+CPU_REQUIRED_FILES = ("onnxruntime.lib", "DirectML.dll")
+CUDA_REQUIRED_FILES = CPU_REQUIRED_FILES + (
+    "onnxruntime_providers_shared.dll",
+    "onnxruntime_providers_cuda.dll",
+)
 
 
-def distribution(workspace):
+def distribution(workspace, cuda):
     metadata = json.loads(subprocess.check_output(
         ["cargo", "metadata", "--locked", "--format-version", "1",
          "--filter-platform", TARGET],
@@ -26,10 +31,21 @@ def distribution(workspace):
     package = next(p for p in metadata["packages"] if p["name"] == "ort-sys")
     manifest = Path(package["manifest_path"]).parent / "build/download/dist.tsv"
     with manifest.open(newline="", encoding="utf-8") as source:
-        matches = [row for row in csv.DictReader(source, delimiter="\t")
-                   if row["target"] == TARGET and row["feature_set"] == "directml"]
+        rows = list(csv.DictReader(source, delimiter="\t"))
+    if cuda:
+        matches = [row for row in rows
+                   if row["target"] == TARGET
+                   and {"cuda13", "directml"}.issubset(
+                       set(row["feature_set"].split(",")))]
+        variant = "CUDA 13/DirectML"
+    else:
+        matches = [row for row in rows
+                   if row["target"] == TARGET
+                   and row["feature_set"] == "directml"]
+        variant = "DirectML"
     if len(matches) != 1:
-        raise RuntimeError("locked ort-sys must provide one Windows DirectML distribution")
+        raise RuntimeError(
+            f"locked ort-sys must provide one Windows {variant} distribution")
     return matches[0]
 
 
@@ -38,7 +54,7 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def extract_verified(archive, destination, expected):
+def extract_verified(archive, destination, expected, required_files):
     if digest(archive) != expected:
         raise RuntimeError("ONNX Runtime archive SHA-256 differs from locked ort-sys")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -49,7 +65,7 @@ def extract_verified(archive, destination, expected):
                        filters=[{"id": lzma.FILTER_LZMA2, "dict_size": 1 << 26}]) as stream:
             with tarfile.open(fileobj=stream, mode="r|") as tar:
                 tar.extractall(temporary, filter="data")
-        for name in ("onnxruntime.lib", "DirectML.dll"):
+        for name in required_files:
             if not (Path(temporary) / name).is_file():
                 raise RuntimeError(f"ONNX Runtime archive is missing {name}")
         (Path(temporary) / ".verified-sha256").write_text(expected, encoding="ascii")
@@ -58,8 +74,9 @@ def extract_verified(archive, destination, expected):
         Path(temporary).rename(destination)
 
 
-def prepare(workspace, cache):
-    dist = distribution(workspace)
+def prepare(workspace, cache, cuda=False):
+    required_files = CUDA_REQUIRED_FILES if cuda else CPU_REQUIRED_FILES
+    dist = distribution(workspace, cuda)
     expected = dist["sha256_hash"]
     if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
         raise RuntimeError("locked ort-sys has an invalid distribution checksum")
@@ -81,9 +98,10 @@ def prepare(workspace, cache):
     marker = destination / ".verified-sha256"
     if (not marker.is_file() or marker.read_text(encoding="ascii") != expected
             or not all((destination / name).is_file()
-                       for name in ("onnxruntime.lib", "DirectML.dll"))):
-        extract_verified(archive, destination, expected)
-    print(f"Verified Windows ONNX Runtime cache: {destination}")
+                       for name in required_files)):
+        extract_verified(archive, destination, expected, required_files)
+    variant = "CUDA 13/DirectML" if cuda else "DirectML"
+    print(f"Verified Windows ONNX Runtime {variant} cache: {destination}")
     if output := os.environ.get("GITHUB_ENV"):
         with open(output, "a", encoding="utf-8") as environment:
             environment.write(f"ORT_CACHE_DIR={cache}\n")
@@ -92,5 +110,7 @@ def prepare(workspace, cache):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-dir", type=Path, default=Path("target/ort-prebuilt"))
+    parser.add_argument("--cuda", action="store_true",
+                        help="prepare the locked CUDA 13/DirectML distribution")
     args = parser.parse_args()
-    prepare(Path(__file__).resolve().parent.parent, args.cache_dir.resolve())
+    prepare(Path(__file__).resolve().parent.parent, args.cache_dir.resolve(), args.cuda)

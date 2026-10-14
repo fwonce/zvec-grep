@@ -53,6 +53,25 @@ function cargoTargetDirectory() {
   return resolve(workspaceDir, process.env.CARGO_TARGET_DIR ?? "target");
 }
 
+function buildCudaBundle(entry) {
+  if (entry.os === "linux") {
+    run("bash", ["scripts/build-cuda.sh"]);
+    return;
+  }
+  if (entry.os === "win32") {
+    run("powershell.exe", [
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      "scripts/build-cuda-windows.ps1",
+    ]);
+    return;
+  }
+  throw new Error(`CUDA release bundles are unsupported on ${entry.target}`);
+}
+
 function parseOptions(args) {
   const options = {
     build: true,
@@ -193,7 +212,7 @@ async function packPlatform(options) {
       );
     }
     if (defaultCuda) {
-      run("bash", ["scripts/build-cuda.sh"]);
+      buildCudaBundle(entry);
       bundleDir = join(cargoTargetDirectory(), "release", "zg-cuda");
     } else {
       run("cargo", ["build", "--locked", "--release", "--package", "zg"]);

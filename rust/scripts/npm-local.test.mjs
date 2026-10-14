@@ -179,15 +179,17 @@ test("maps supported native npm targets", () => {
     os: "win32",
     cpu: "x64",
     binary: "zg.exe",
+    defaultVariant: "cuda",
     target: "win32-x64-msvc",
   });
 });
 
-test("defaults Linux x64 releases to the CUDA-capable bundle", () => {
+test("defaults Linux and Windows x64 releases to CUDA-capable bundles", () => {
+  const cudaTargets = new Set(["linux-x64-gnu", "win32-x64-msvc"]);
   for (const entry of manifest.platforms) {
     assert.equal(
       defaultReleaseVariant(entry),
-      entry.target === "linux-x64-gnu" ? "cuda" : "cpu",
+      cudaTargets.has(entry.target) ? "cuda" : "cpu",
     );
   }
 });
