@@ -1,64 +1,73 @@
-name: Rust CUDA GPU CI
-run-name: Rust CUDA GPU CI / ${{ inputs.ref }}
+name: Rust CUDA npm artifact replay
+run-name: Windows CUDA package replay / ${{ inputs.artifact_run_id }}
 
-# GPU resources are deliberately opt-in. Do not add push/pull_request triggers.
+# Temporary validation-branch entry point. Do not merge over ordinary Rust CI.
 on:
   workflow_dispatch:
     inputs:
-      ref:
-        description: Reviewed branch, SHA, or PR merge ref (for example refs/pull/235/merge)
+      artifact_run_id:
+        description: Reviewed run that produced the Windows npm package to retest
         required: true
-        default: main
+        default: "38539990022"
         type: string
       confirm_reviewed:
-        description: I reviewed and trust this ref to execute on the hosted GPU runners
+        description: I trust the selected package and validation code on this GPU runner
         required: true
         default: false
         type: boolean
 
-permissions: {}
+permissions:
+  contents: read
+  actions: read
 
 concurrency:
   group: rust-cuda-gpu-validation-windows
   cancel-in-progress: false
 
 jobs:
-  source:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm_reviewed }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      sha: ${{ steps.source.outputs.sha }}
+  replay:
+    if: ${{ inputs.confirm_reviewed }}
+    runs-on:
+      group: gpu-runners
+      labels: gpu-windows-t4
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.ref }}
           persist-credentials: false
-      - id: source
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Test CUDA evidence assertions without a GPU
+      - name: Check the existing GPU driver without changing it
+        shell: powershell
         run: |
-          python3 rust/scripts/test-cuda-cli-checks.py
-          python3 rust/scripts/test-prepare-onnxruntime-cuda.py
-          python3 rust/scripts/test-build-ggml-cuda12.py
-
-  cuda:
-    name: Build and verify CUDA / ${{ matrix.target }}
-    needs: source
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: win32-x64-msvc
-            runner: gpu-windows-t4
-    uses: ./.github/workflows/rust-package-build.yml
-    with:
-      target: ${{ matrix.target }}
-      runner: ${{ matrix.runner }}
-      runner_group: gpu-runners
-      source_ref: ${{ needs.source.outputs.sha }}
-      cuda_architectures: "75"
-      cuda_e2e: true
+          & rust/scripts/prepare-windows-gpu-driver.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Test GPU evidence and workspace isolation assertions
+        shell: powershell
+        run: python rust/scripts/test-cuda-cli-checks.py
+      - name: Download the already built npm package (no compilation)
+        uses: actions/download-artifact@v8
+        with:
+          name: rust-native-win32-x64-msvc
+          run-id: ${{ inputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+          path: rust/dist/npm/release/tarballs
+      - name: Record the exact package being retested
+        shell: powershell
+        run: Get-ChildItem rust/dist/npm/release/tarballs/*.tgz | Get-FileHash -Algorithm SHA256 | Format-List
+      - name: Install and verify both GGUF backends and ONNX on CUDA
+        uses: ./.github/actions/cuda-cli-e2e
+        with:
+          target: win32-x64-msvc
+      - name: Retain driver evidence even when preflight fails
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-driver-preflight
+          path: gpu-logs/driver/
+          if-no-files-found: warn
+          retention-days: 7

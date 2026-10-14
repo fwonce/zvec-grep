@@ -1,41 +1,27 @@
-# Only for the ephemeral, manually triggered hosted GPU CI VM, not user machines.
+# Keep the existing workflow entry point, but only CHECK the host driver.
+# Driver installation/upgrades belong to the runner image, not a product CI job.
 param([string]$Logs = "gpu-logs/driver")
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3.0
+if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
+    throw "nvidia-smi is missing. Select a GPU runner image with a working NVIDIA driver; CI will not install one."
+}
 [IO.Directory]::CreateDirectory([IO.Path]::GetFullPath($Logs)) | Out-Null
 $before = (& nvidia-smi 2>&1 | Out-String)
-if ($LASTEXITCODE -ne 0) { throw "The hosted runner has no working NVIDIA driver" }
+$status = $LASTEXITCODE
 $before | Set-Content (Join-Path $Logs "before.txt")
 Write-Host $before
-if ($before -match "CUDA Version:\s+([0-9]+\.[0-9]+)" -and [version]$Matches[1] -ge [version]"13.1") {
-    Write-Host "The existing driver supports both tested CUDA families"
-    exit 0
+if ($status -ne 0) {
+    throw "nvidia-smi failed (exit $status). Fix the GPU runner image before retrying; CI will not install or upgrade its driver."
 }
-
-# Microsoft/Azure's signed Tesla T4 driver, also supporting Server 2022/2025.
-# https://www.microsoft.com/en-us/download/details.aspx?id=108602
-$installer = Join-Path $env:RUNNER_TEMP "nvidia-591.59.exe"
-$url = "https://download.microsoft.com/download/8920fc6c-3546-458b-99d9-647c4e8621a4/591.59-data-center-tesla-desktop-win10-win11-64bit-dch-international.exe"
-& curl.exe -fL --retry 3 --connect-timeout 20 --max-time 600 -o $installer $url
-if ($LASTEXITCODE -ne 0) { throw "Downloading the hosted GPU driver failed" }
-$signature = Get-AuthenticodeSignature -LiteralPath $installer
-if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "NVIDIA Corporation") {
-    throw "The GPU driver is not authentically signed by NVIDIA"
+if ($before -notmatch "CUDA Version:\s+([0-9]+\.[0-9]+)") {
+    throw "nvidia-smi did not report a CUDA driver capability. Verify the GPU runner image; CPU fallback is not a passing GPU test."
 }
-$expanded = Join-Path $env:RUNNER_TEMP "nvidia-591.59"
-& 7z x $installer "-o$expanded" -y | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Extracting the GPU driver failed" }
-$setup = Join-Path $expanded "setup.exe"
-$logPath = [IO.Path]::GetFullPath($Logs)
-$process = Start-Process -FilePath $setup -ArgumentList @("-s", "-n", "Display.Driver", "-log:`"$logPath`"", "-loglevel:6") -Wait -PassThru
-$process.ExitCode | Set-Content (Join-Path $Logs "installer-exit-code.txt")
-if ($process.ExitCode -eq 1) {
-    throw "Driver installation requires a reboot. Use a hosted image with an updated driver; this job will not reboot the runner."
+$supportedCuda = [version]$Matches[1]
+# Preserve the suite's existing full CUDA 13.1 capability requirement. This is
+# the driver's advertised capability, NOT the installed Toolkit version, and
+# does not replace the real GGUF/ONNX CUDA execution checks.
+if ($supportedCuda -lt [version]"13.1") {
+    throw "The runner driver reports CUDA $supportedCuda; this suite requires CUDA 13.1 or newer driver capability. Select/update the runner image outside this job. CI will not download, upgrade, or reboot its driver."
 }
-if ($process.ExitCode -ne 0) { throw "GPU driver setup failed with exit code $($process.ExitCode)" }
-$after = (& nvidia-smi 2>&1 | Out-String)
-$after | Set-Content (Join-Path $Logs "after.txt")
-Write-Host $after
-if ($LASTEXITCODE -ne 0 -or $after -notmatch "CUDA Version:\s+([0-9]+\.[0-9]+)" -or [version]$Matches[1] -lt [version]"13.1") {
-    throw "The installed driver is not active with CUDA 13.1 support; a newer hosted image is required"
-}
+Write-Host "GPU driver preflight passed (CUDA capability $supportedCuda); no driver changes made."
