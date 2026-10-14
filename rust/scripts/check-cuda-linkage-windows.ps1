@@ -43,7 +43,7 @@ function Require-Import {
         [Parameter(Mandatory = $true)][string]$Path
     )
     if (-not ($Imports | Where-Object { $_ -match $Pattern })) {
-        throw "missing expected dynamic dependency in ${Path}: $Pattern"
+        throw "missing expected dynamic dependency in ${Path}: $Pattern (actual imports: $($Imports -join ', '))"
     }
 }
 
@@ -93,8 +93,9 @@ Require-Import $binaryImports "^llama\.dll$" $binary
 
 $cudaBackend = Join-Path $bundleDirectory "ggml-cuda.dll"
 $cudaImports = @(Get-Imports $cudaBackend)
-Require-Import $cudaImports "^nvcuda\.dll$" $cudaBackend
-Require-Import $cudaImports "^(?:cudart64|cublas64|cublaslt64)_[0-9_]+\.dll$" $cudaBackend
+# The driver may be loaded through the CUDA runtime rather than imported by
+# this DLL. cuBLAS is shared on Windows even when cudart is statically linked.
+Require-Import $cudaImports "^cublas64_[0-9_]+\.dll$" $cudaBackend
 
 $provider = Join-Path $bundleDirectory "onnxruntime_providers_cuda.dll"
 $providerImports = @(Get-Imports $provider)
@@ -113,3 +114,5 @@ Write-Host "zg dependencies:"
 $binaryImports | ForEach-Object { Write-Host $_ }
 Write-Host "llama.cpp CUDA backend dependencies:"
 $cudaImports | ForEach-Object { Write-Host $_ }
+Write-Host "ONNX Runtime CUDA provider dependencies:"
+$providerImports | ForEach-Object { Write-Host $_ }

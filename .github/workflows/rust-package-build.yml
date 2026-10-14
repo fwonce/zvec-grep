@@ -68,8 +68,10 @@ jobs:
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
+            ~/.cargo/registry/src/
             ~/.cargo/git/db/
             rust/target/release/
+            rust/target/.zvec-grep-cuda-build-config
           key: rust-release-v2-${{ inputs.target }}-${{ inputs.runner }}-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml') }}-${{ github.sha }}
           restore-keys: |
             rust-release-v2-${{ inputs.target }}-${{ inputs.runner }}-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml') }}-
@@ -161,8 +163,10 @@ jobs:
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
+            ~/.cargo/registry/src/
             ~/.cargo/git/db/
             rust/target/release/
+            rust/target/.zvec-grep-cuda-build-config
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
       - name: Audit the Windows CPU/CUDA bundle
         if: inputs.target == 'win32-x64-msvc'
