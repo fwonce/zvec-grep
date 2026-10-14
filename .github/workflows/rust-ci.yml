@@ -15,6 +15,11 @@ on:
         required: true
         default: false
         type: boolean
+      allow_driver_install:
+        description: Allow the fixed driver installer only on this disposable hosted Windows GPU VM
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -35,10 +40,19 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Check the existing GPU driver without changing it
+      - name: Test hosted driver preparation safety gates (mocked, no installation)
+        shell: powershell
+        run: rust/scripts/test-hosted-windows-gpu-driver.ps1
+      - name: Prepare the fixed driver only when explicitly allowed and needed
+        if: ${{ inputs.allow_driver_install }}
         shell: powershell
         run: |
-          & rust/scripts/prepare-windows-gpu-driver.ps1
+          & rust/scripts/prepare-hosted-windows-gpu-driver.ps1 -AllowInstallation
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify the active GPU driver without changing it
+        shell: powershell
+        run: |
+          & rust/scripts/prepare-windows-gpu-driver.ps1 -Logs gpu-logs/driver/verified
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/setup-node@v6
         with:

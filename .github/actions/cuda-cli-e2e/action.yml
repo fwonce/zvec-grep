@@ -17,7 +17,7 @@ runs:
         PACKAGE_DIRECTORY: ${{ inputs.package_directory }}
       working-directory: ${{ github.workspace }}
       run: |
-        import json, os, pathlib, subprocess
+        import hashlib, json, os, pathlib, subprocess
         pattern = "zvec-zvec-grep-" + os.environ["TARGET"] + "-*.tgz"
         packages = list(pathlib.Path(os.environ["PACKAGE_DIRECTORY"]).glob(pattern))
         assert len(packages) == 1, "Expected exactly one platform tarball"
@@ -28,6 +28,18 @@ runs:
         metadata = json.loads((package / "package.json").read_text())
         assert metadata["zvecGrep"]["variant"] == "cuda", "Expected CUDA npm package"
         print(metadata["name"], metadata["version"], metadata["zvecGrep"])
+        checksums = json.loads((package / "checksums.json").read_text())
+        assert checksums["target"] == os.environ["TARGET"], "Checksum target mismatch"
+        payload = {p.relative_to(package).as_posix() for p in (package / "bin").rglob("*") if p.is_file()}
+        assert payload == set(checksums["files"]), "Unlisted or missing package payload files"
+        for name, expected in checksums["files"].items():
+            path = (package / name).resolve()
+            assert path.is_relative_to(package.resolve()), "Payload path escapes the package"
+            assert path.stat().st_size == expected["bytes"], f"Size mismatch: {name}"
+            with path.open("rb") as stream:
+                actual = hashlib.file_digest(stream, "sha256").hexdigest()
+            assert actual == expected["sha256"], f"SHA256 mismatch: {name}"
+        print(f"Verified installed package: {len(payload)} payload files, all SHA256 checks passed")
     - name: Cache the two public test models
       uses: actions/cache@v5
       with:
