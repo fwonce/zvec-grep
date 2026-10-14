@@ -78,7 +78,8 @@ run_case() {
   export ZVEC_GREP_HOME="${case_dir}/runtime"
 
   run_zg "${workspace}" "${logs}/index.stdout" "${logs}/index.stderr" \
-    --index --mode direct --embedding "${model}" --device cuda \
+    --index --name "cuda-e2e-${label}" --mode direct \
+    --embedding "${model}" --device cuda \
     --model-cache "${model_cache}" --embedding-concurrency 2 --debug --no-color
   assert_contains "${logs}/index.stderr" 'Index complete'
   assert_cuda_without_fallback "${logs}/index.stderr" "${selected}"
