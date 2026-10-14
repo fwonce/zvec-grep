@@ -31,6 +31,13 @@ def cuda_evidence(stderr, backend, expected_gguf_cuda=None):
         lines = [line for line in stderr.splitlines()
                  if "llama.cpp GPU embedding backend selected" in line
                  and re.search(r'backend=["\']?CUDA\b', line, re.IGNORECASE)]
+        offload = [line for line in stderr.splitlines()
+                   if re.search(r"offloaded [1-9]\d*/\d+ layers to GPU", line)]
+        if not offload:
+            raise AssertionError("GGUF did not report any layers offloaded to GPU")
+        if not lines:
+            raise AssertionError("GGUF offload must use CUDA, not another GPU backend")
+        lines += offload
     else:
         if "Transformers ONNX cuda embedding execution provider selected" not in stderr:
             raise AssertionError("ONNX CUDA execution provider was not selected")
@@ -75,7 +82,7 @@ def run_case(binary, model_cache, work, logs, backend, model, expected_gguf_cuda
         "XDG_CONFIG_HOME": str(work / backend / "config"),
         "ZVEC_GREP_HOME": str(work / backend / "runtime"),
         "ORT_LOG": "verbose",
-        "RUST_LOG": "warn,zg=debug,zg_engine=debug,ort=trace",
+        "RUST_LOG": "warn,zg=debug,zg_engine=debug,ort=trace,llama-cpp-2=info",
         "NO_COLOR": "1",
     })
     cuda_args = ["--device", "cuda", "--model-cache", str(model_cache), "--debug", "--no-color"]

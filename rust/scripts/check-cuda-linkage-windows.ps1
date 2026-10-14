@@ -111,7 +111,8 @@ Require-Import $fallbackImports "^ggml-base\.dll$" $fallback
 $provider = Join-Path $bundleDirectory "onnxruntime_providers_cuda.dll"
 $providerImports = @(Get-Imports $provider)
 Require-Import $providerImports "^cublas64_12\.dll$" $provider
-Require-Import $providerImports "^cudnn64_9\.dll$" $provider
+Require-Import $providerImports "^cudart64_12\.dll$" $provider
+# ORT 1.28 loads cuDNN/cuFFT on demand rather than importing them at startup.
 if (-not ($providerImports | Where-Object { $_ -match $hostCudaPattern })) {
     throw "ONNX Runtime CUDA provider has no CUDA runtime dependency"
 }

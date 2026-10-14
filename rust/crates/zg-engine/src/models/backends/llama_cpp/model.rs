@@ -857,7 +857,12 @@ fn llama_backend() -> Result<&'static LlamaBackend, ModelError> {
         LlamaBackend::init()
             .map_err(|error| error.to_string())
             .map(|mut backend| {
-                backend.void_logs();
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    // Preserve native offload evidence for --debug / GPU CI.
+                    llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default());
+                } else {
+                    backend.void_logs();
+                }
                 backend
             })
     }) {

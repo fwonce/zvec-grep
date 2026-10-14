@@ -80,7 +80,8 @@ for this test; release builds retain their full architecture list.
 Both platforms run the same CLI index, readiness and vector-search test with
 GGUF `local/embeddinggemma-300m` and ONNX `local/all-minilm-l6-v2`, explicitly
 requesting CUDA with indexing concurrency 2. A successful command alone is not
-a pass: index and search must select CUDA, ONNX must place a nonzero number of
+a pass: index and search must select CUDA, GGUF must report positive layer offload
+to the GPU, ONNX must place a nonzero number of
 graph nodes on `CUDAExecutionProvider`, and any model-level CPU fallback fails
 the test. ORT may still put supported shape/other nodes on CPU; this test does
 not claim every ONNX operator runs on GPU.

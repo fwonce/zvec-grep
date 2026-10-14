@@ -12,7 +12,7 @@ spec.loader.exec_module(cuda_cli)
 
 class CudaEvidenceTests(unittest.TestCase):
     def test_requested_gguf_plugin_must_really_be_selected(self):
-        selected = "llama.cpp GPU embedding backend selected backend=CUDA\n"
+        selected = "llama.cpp GPU embedding backend selected backend=CUDA\noffloaded 24/24 layers to GPU\n"
         for version in ("12.4", "13.1"):
             message = selected + f'llama.cpp CUDA backend library selected cuda_version="{version}"'
             cuda_cli.cuda_evidence(message, "gguf", version)
@@ -23,9 +23,13 @@ class CudaEvidenceTests(unittest.TestCase):
 
     def test_gguf_requires_cuda_not_just_any_gpu(self):
         message = "llama.cpp GPU embedding backend selected backend=CUDA gpu=Tesla T4"
-        self.assertEqual(cuda_cli.cuda_evidence(message, "gguf"), [message])
+        offload = "offloaded 24/24 layers to GPU"
+        self.assertEqual(cuda_cli.cuda_evidence(message + "\n" + offload, "gguf"), [message, offload])
         with self.assertRaises(AssertionError):
-            cuda_cli.cuda_evidence(message.replace("CUDA", "Vulkan"), "gguf")
+            cuda_cli.cuda_evidence(message.replace("CUDA", "Vulkan") + "\n" + offload, "gguf")
+        for invalid in (message, message + "\n" + offload.replace("24/24", "0/24")):
+            with self.assertRaises(AssertionError):
+                cuda_cli.cuda_evidence(invalid, "gguf")
 
     def test_onnx_requires_nonzero_cuda_node_placement(self):
         selected = "Transformers ONNX cuda embedding execution provider selected\n"
