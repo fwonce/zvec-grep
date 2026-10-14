@@ -22,6 +22,7 @@ def configure(source, build, cuda_root, architectures):
             "-DGGML_CUDA=ON", "-DGGML_CUDA_NCCL=OFF", "-DGGML_OPENMP=OFF",
             "-DLLAMA_BUILD_TESTS=OFF", "-DLLAMA_BUILD_EXAMPLES=OFF",
             "-DLLAMA_BUILD_TOOLS=OFF", "-DLLAMA_BUILD_COMMON=OFF",
+            "-DLLAMA_BUILD_APP=OFF", "-DLLAMA_BUILD_SERVER=OFF", "-DLLAMA_CURL=OFF",
             f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DCUDAToolkit_ROOT={cuda_root}",
             f"-DCMAKE_CUDA_ARCHITECTURES={architectures}"]
     if os.name == "nt":
