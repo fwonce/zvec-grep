@@ -134,7 +134,7 @@ jobs:
         with:
           cuda: "12.8.1"
           method: network
-          sub-packages: '["cudart", "cublas", "nvrtc"]'
+          sub-packages: '["cudart", "cublas", "curand", "cufft", "nvrtc"]'
           use-local-cache: false
       - name: Install pinned Windows cuDNN
         if: runner.os == 'Windows'
@@ -210,25 +210,3 @@ jobs:
           path: gpu-logs/
           if-no-files-found: warn
           retention-days: 7
-
-  windows-driver-preflight:
-    needs: source
-    runs-on:
-      group: gpu-runners
-      labels: gpu-windows-t4
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.source.outputs.sha }}
-          persist-credentials: false
-      - name: Probe driver upgrade before the long native builds finish
-        shell: powershell
-        run: '& rust/scripts/prepare-windows-gpu-driver.ps1'
-      - uses: actions/upload-artifact@v7
-        if: ${{ always() }}
-        with:
-          name: windows-driver-preflight
-          path: gpu-logs/

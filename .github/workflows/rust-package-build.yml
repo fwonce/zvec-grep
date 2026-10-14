@@ -77,6 +77,7 @@ jobs:
             ~/.cargo/registry/src/
             ~/.cargo/git/db/
             rust/target/release/
+            rust/target/ggml-cuda12/
             rust/target/.zvec-grep-cuda-build-config
           key: rust-release-v2-${{ inputs.target }}-${{ inputs.runner }}-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml') }}-${{ github.sha }}
           restore-keys: |
@@ -222,7 +223,7 @@ jobs:
         if: inputs.target != 'linux-x64-gnu' && inputs.target != 'win32-x64-msvc'
         run: npm run build
       - name: Save Cargo build state
-        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        if: ${{ always() && steps.cargo-cache.outputs.cache-primary-key != '' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v5
         with:
           path: |
@@ -231,6 +232,7 @@ jobs:
             ~/.cargo/registry/src/
             ~/.cargo/git/db/
             rust/target/release/
+            rust/target/ggml-cuda12/
             rust/target/.zvec-grep-cuda-build-config
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
       - name: Audit the Windows CPU/CUDA bundle

@@ -134,7 +134,7 @@ jobs:
         with:
           cuda: "12.8.1"
           method: network
-          sub-packages: '["cudart", "cublas", "nvrtc"]'
+          sub-packages: '["cudart", "cublas", "curand", "cufft", "nvrtc"]'
           use-local-cache: false
       - name: Install pinned Windows cuDNN
         if: runner.os == 'Windows'
