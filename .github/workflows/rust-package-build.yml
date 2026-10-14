@@ -48,7 +48,7 @@ jobs:
         with:
           cuda: "13.2.0"
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+          sub-packages: '["nvcc", "nvvm", "crt", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
           use-local-cache: false
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
