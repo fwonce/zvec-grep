@@ -67,3 +67,37 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc -p zg-engine --no-deps
 ```
+
+## Manual CUDA CLI validation
+
+`Rust CUDA GPU CI` only runs through `workflow_dispatch`; PR updates and merges
+do not allocate GPUs. Select a reviewed source ref and check `confirm_reviewed`.
+The workflow resolves the ref once to a SHA, builds CUDA npm packages on ordinary
+Linux/Windows runners, then installs those tarballs on the `gpu-runners` group's
+`gpu-linux-t4` and `gpu-windows-t4` GitHub-hosted runners. Builds target T4 (SM 75)
+for this test; release builds retain their full architecture list.
+
+Both platforms run the same CLI index, readiness and vector-search test with
+GGUF `local/embeddinggemma-300m` and ONNX `local/all-minilm-l6-v2`, explicitly
+requesting CUDA with indexing concurrency 2. A successful command alone is not
+a pass: index and search must select CUDA, ONNX must place a nonzero number of
+graph nodes on `CUDAExecutionProvider`, and any model-level CPU fallback fails
+the test. ORT may still put supported shape/other nodes on CPU; this test does
+not claim every ONNX operator runs on GPU.
+
+Per-command stdout/stderr, GPU/driver details and a machine-readable result are
+retained as `cuda-cli-evidence-*` artifacts, including when a model fails. Model
+caches are reused, and only one GPU workflow runs at a time. Ordinary no-GPU CI
+remains independent.
+
+To reproduce against an unpacked/installed CUDA bundle (Python 3.12 recommended):
+
+```sh
+python scripts/test-cuda-cli.py --bundle /path/to/package/bin --model-cache /path/to/models --logs /path/to/logs
+python scripts/test-cuda-cli-checks.py  # assertion regression tests; no GPU needed
+```
+
+The Linux job uses a pinned CUDA 13.2/cuDNN runtime container; Windows provisions
+the CUDA 13.2 runtime and hash-verified cuDNN wheel. The hosted image must supply
+a compatible NVIDIA driver and container GPU support on Linux. Missing/incompatible
+drivers fail validation instead of silently accepting CPU execution.

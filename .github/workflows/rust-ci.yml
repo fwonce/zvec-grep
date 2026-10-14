@@ -83,6 +83,8 @@ jobs:
         run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
       - name: Test npm packaging
         run: node --test scripts/npm-local.test.mjs npm/meta/install.test.cjs
+      - name: Test CUDA evidence assertions without a GPU
+        run: python3 scripts/test-cuda-cli-checks.py
 
   test:
     name: rust test (${{ matrix.os }})
