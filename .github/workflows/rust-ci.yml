@@ -43,6 +43,36 @@ jobs:
       - name: Test hosted driver preparation safety gates (mocked, no installation)
         shell: powershell
         run: rust/scripts/test-hosted-windows-gpu-driver.ps1
+      - name: Prepare pinned Node without copying into the global tool cache
+        timeout-minutes: 5
+        shell: powershell
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "node-24.21.0-win32-x64.7z"
+          $url = "https://github.com/actions/node-versions/releases/download/24.21.0-34304089047/node-24.21.0-win32-x64.7z"
+          & curl.exe -fL --retry 2 --connect-timeout 15 --max-time 120 -o $archive $url
+          if ($LASTEXITCODE -ne 0) { throw "Downloading the fixed Node runtime failed" }
+          $expected = "469538b0d9f1cb576d3a59f78d50eafe2deddc1b0fd3ba394aa951ab97e4fd5a"
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) {
+            throw "Node runtime checksum mismatch"
+          }
+          $runtime = Join-Path $env:RUNNER_TEMP "zg-node-24.21.0"
+          & 7z x $archive "-o$runtime" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Extracting Node failed" }
+          $nodes = @(Get-ChildItem -LiteralPath $runtime -Filter node.exe -Recurse |
+            Where-Object { Test-Path (Join-Path $_.DirectoryName "npm.cmd") })
+          if ($nodes.Count -ne 1) { throw "Expected exactly one complete Node/npm runtime" }
+          $nodeDir = $nodes[0].DirectoryName
+          $env:PATH = "$nodeDir;$env:PATH"
+          $actual = (& ($nodes[0].FullName) --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne "v24.21.0") { throw "Unexpected Node version: $actual" }
+          $nodeDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "Node $actual, archive SHA256 verified; using extracted runtime directly"
+          & (Join-Path $nodeDir "npm.cmd") --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/setup-python@v6
+        timeout-minutes: 5
+        with:
+          python-version: "3.12"
       - name: Prepare the fixed driver only when explicitly allowed and needed
         if: ${{ inputs.allow_driver_install }}
         shell: powershell
@@ -54,12 +84,6 @@ jobs:
         run: |
           & rust/scripts/prepare-windows-gpu-driver.ps1 -Logs gpu-logs/driver/verified
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
       - name: Test GPU evidence and workspace isolation assertions
         shell: powershell
         run: python rust/scripts/test-cuda-cli-checks.py
