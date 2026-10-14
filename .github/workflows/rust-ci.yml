@@ -19,7 +19,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: rust-cuda-gpu
+  group: rust-cuda-gpu-validation-windows
   cancel-in-progress: false
 
 jobs:
@@ -52,8 +52,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: linux-x64-gnu
-            runner: gpu-linux-t4
           - target: win32-x64-msvc
             runner: gpu-windows-t4
     uses: ./.github/workflows/rust-package-build.yml
