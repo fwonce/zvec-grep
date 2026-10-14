@@ -6,6 +6,13 @@ Set-StrictMode -Version 3.0
 if ($env:GITHUB_ACTIONS -ne "true" -or $env:OS -ne "Windows_NT") {
     throw "This helper is only for ephemeral Windows GitHub Actions runners"
 }
+# System32/bash.exe is the WSL launcher on this image, with no distro installed.
+# Prefer Git Bash for the Rust setup action and other cross-platform steps.
+$gitBash = Join-Path $env:ProgramFiles "Git/bin"
+if (-not (Test-Path -LiteralPath (Join-Path $gitBash "bash.exe"))) {
+    throw "Git Bash is required on the Windows GPU runner"
+}
+$gitBash | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
 $components = @(
     "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
