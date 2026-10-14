@@ -55,7 +55,9 @@ jobs:
           cuda: "13.1.1"
           method: network
           sub-packages: '["nvcc", "nvvm", "crt", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
-          use-local-cache: false
+          # Keep each installer in a version-specific directory: the action's
+          # uncached download directory cannot contain two CUDA versions.
+          use-local-cache: true
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -197,7 +199,7 @@ jobs:
           cuda: "12.4.1"
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
-          use-local-cache: false
+          use-local-cache: true
       - name: Install the CUDA 12.4 compatible MSVC toolset
         if: inputs.target == 'win32-x64-msvc'
         shell: powershell
