@@ -524,8 +524,8 @@ discover its CPU/CUDA backend modules beside `zg`. It cannot be combined with
 `--binary` or `--lib-dir`.
 
 The `Publish Rust packages` workflow builds all five published native targets on matching
-GitHub runners. Pushes to `main` or `release/rust-*` branches and manual runs
-produce downloadable candidates without publishing to npm. Each runner installs
+GitHub runners. Manual runs produce downloadable candidates without publishing
+to npm unless publication is explicitly selected. Each runner installs
 its platform and meta tarballs, then runs `zg --version`, checks managed-rg,
 starts the packaged daemon, compares workspace status in direct and server
 modes, and stops the daemon. The server status request crosses the IPC boundary;
@@ -537,11 +537,12 @@ Intel macOS is built and verified first. Only after its tarball installation,
 CLI startup, managed-rg, and daemon IPC checks pass do the other four native
 builds start. The final artifact is collected after all five targets pass.
 
-Linux candidates are built and smoke-tested on Ubuntu 24.04. Linux x64 uses the
-pinned CUDA builder image to produce the default CPU/CUDA bundle; Linux ARM64
-uses the native runner. Windows x64 installs pinned CUDA 13.1 and 12.4 toolchains on the
-standard Windows runner and produces the corresponding CPU/CUDA bundle without
-requiring a GPU. The current ONNX Runtime prebuilt libraries cannot link against
+Complete packaging/publication is manual-only; main updates do not start it.
+Linux x64 and Windows x64 compile, package and run GGUF/ONNX CUDA CLI tests on
+`gpu-linux-t4` and `gpu-windows-t4`, respectively. Linux x64 uses the pinned
+Ubuntu 24.04 CUDA builder image; Linux ARM64 uses its native runner. Windows
+installs pinned CUDA 13.1 and 12.4 toolchains on the GPU host. Ordinary PR CI
+does not compile CUDA packages. The current ONNX Runtime prebuilt libraries cannot link against
 Ubuntu 22.04's glibc and C++ runtime, so older Linux distributions are not
 covered by this release workflow.
 Intel macOS builds ONNX Runtime 1.28.0 with CoreML and the native zvec SDK from

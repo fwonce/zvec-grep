@@ -120,23 +120,3 @@ jobs:
         run: cargo test --locked --workspace --all-targets
       - name: Smoke test the CLI
         run: cargo run --locked -p zg -- --rg "zvec-grep Rust rewrite" README.md
-
-  cuda-build:
-    name: cuda build (no GPU)
-    permissions:
-      contents: read
-    uses: ./.github/workflows/rust-package-build.yml
-    with:
-      target: linux-x64-gnu
-      runner: ubuntu-latest
-      cuda_architectures: "75"
-
-  windows-cuda-build:
-    name: windows cuda package (no GPU)
-    permissions:
-      contents: read
-    uses: ./.github/workflows/rust-package-build.yml
-    with:
-      target: win32-x64-msvc
-      runner: windows-2022
-      cuda_architectures: "75"

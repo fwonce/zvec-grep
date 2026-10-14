@@ -9,6 +9,14 @@ on:
       runner:
         type: string
         required: true
+      runner_group:
+        description: Optional runner group for the GPU hosts.
+        type: string
+        default: ""
+      cuda_e2e:
+        description: Build and run CUDA CLI validation together on a GPU host.
+        type: boolean
+        default: false
       cuda_architectures:
         type: string
         required: false
@@ -30,7 +38,7 @@ env:
 jobs:
   native:
     name: Build ${{ inputs.target }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":"{0}","labels":"{1}"}}', inputs.runner_group, inputs.runner)) || inputs.runner }}
     timeout-minutes: ${{ (inputs.target == 'darwin-x64' || inputs.target == 'win32-x64-msvc') && 180 || 90 }}
     defaults:
       run:
@@ -43,11 +51,34 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+      - uses: actions/setup-python@v6
+        if: inputs.cuda_e2e || runner.os == 'Windows'
+        with:
+          python-version: "3.12"
+      - name: Prepare the Windows GPU build tools
+        if: inputs.cuda_e2e && runner.os == 'Windows'
+        shell: powershell
+        working-directory: ${{ github.workspace }}
+        run: |
+          & rust/scripts/prepare-windows-build-tools.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify the Linux GPU before building
+        if: inputs.cuda_e2e && runner.os == 'Linux'
+        run: nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
+      - name: Prepare the Windows GPU before building
+        if: inputs.cuda_e2e && runner.os == 'Windows'
+        shell: powershell
+        working-directory: ${{ github.workspace }}
+        run: |
+          & rust/scripts/prepare-windows-gpu-driver.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
       - name: Set up MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+          vsversion: "2022"
       - name: Install the pinned Windows CUDA toolkit
         if: inputs.target == 'win32-x64-msvc'
         uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
@@ -63,12 +94,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev cmake ninja-build pkg-config
-      - name: Install the pinned Rust toolchain
-        run: rustup show active-toolchain
-      - uses: actions/setup-python@v6
-        if: runner.os == 'Windows'
+      - name: Read the pinned Rust toolchain
+        id: rust-version
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - name: Install the pinned Rust toolchain, including rustup if missing
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          python-version: "3.12"
+          toolchain: ${{ steps.rust-version.outputs.channel }}
+          components: rustfmt, clippy
       - name: Restore Cargo build state
         id: cargo-cache
         uses: actions/cache/restore@v5
@@ -215,6 +249,7 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+          vsversion: "2022"
           toolset: "14.38"
       - name: Build the Windows CUDA 12.4 fallback plugin
         if: inputs.target == 'win32-x64-msvc'
@@ -263,3 +298,8 @@ jobs:
           path: rust/dist/npm/release/tarballs/zvec-zvec-grep-${{ inputs.target }}-*.tgz
           if-no-files-found: error
           retention-days: 14
+      - name: Verify GGUF and ONNX CUDA through the installed npm package
+        if: inputs.cuda_e2e
+        uses: ./.github/actions/cuda-cli-e2e
+        with:
+          target: ${{ inputs.target }}

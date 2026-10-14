@@ -56,17 +56,19 @@ Release order:
 
 `.github/workflows/rust-publish.yml` builds and installs every target on its
 native runner, checks CLI startup, managed-rg and actual daemon IPC, and collects
-the candidates into a downloadable artifact. Regular runs do not publish.
+the candidates into a downloadable artifact. The workflow is manual-only;
+main/release-branch updates do not allocate GPU runners or publish packages.
+Manual candidate runs do not publish unless explicitly requested.
 Intel macOS installation and runtime checks must pass before the other four
 platform builds start. Its ONNX Runtime with CoreML and zvec SDK are built from
 pinned sources, cached, and bundled with the native package. The Intel release
 targets macOS 14 and later.
 
-Windows installs the pinned CUDA 13.2 build components, prepares the CUDA 13 and
-DirectML ONNX Runtime distribution selected by locked `ort-sys`, verifies its
-SHA-256, and caches the complete archive and extracted runtime before compiling.
-The ONNX Runtime core remains statically linked; its CUDA provider and the
-llama.cpp CUDA backend are packaged as runtime DLL plugins.
+Linux x64 and Windows x64 compile and run CLI GPU tests on the hosted T4 runners.
+Both packages share one llama/ggml core and include CUDA 13.1 and CUDA 12.4 GGUF
+plugins. The hash-verified official ONNX Runtime CUDA 12 core/providers are
+shared-library sidecars. The Windows CUDA package supports CPU and NVIDIA CUDA,
+not DirectML; the non-CUDA Windows build retains its existing DirectML runtime.
 
 Explicit publication runs from a `rust-v<version>`-tagged commit on `main` and
 uses npm provenance with trusted publishing or `NPM_TOKEN`. Native packages are
