@@ -82,8 +82,15 @@ jobs:
         with:
           ref: ${{ needs.source.outputs.sha }}
           persist-credentials: false
-      - name: Verify the GPU and driver
-        shell: ${{ runner.os == 'Windows' && 'powershell' || 'bash' }}
+      - name: Verify the Linux GPU and driver
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          nvidia-smi
+          nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
+      - name: Verify the Windows GPU and driver
+        if: runner.os == 'Windows'
+        shell: powershell
         run: |
           nvidia-smi
           nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
