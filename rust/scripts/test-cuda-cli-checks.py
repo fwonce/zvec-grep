@@ -2,8 +2,10 @@
 """CPU-only regression tests for the GPU evidence assertions."""
 
 import importlib.util
+import os
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("cuda_cli", Path(__file__).with_name("test-cuda-cli.py"))
 cuda_cli = importlib.util.module_from_spec(spec)
@@ -11,6 +13,25 @@ spec.loader.exec_module(cuda_cli)
 
 
 class CudaEvidenceTests(unittest.TestCase):
+    def test_each_run_and_backend_has_an_absolute_isolated_registry(self):
+        registries = set()
+        for run in ("cuda12-run", "cuda13-run", "retry"):
+            for backend in ("gguf", "onnx"):
+                env = cuda_cli.case_environment(Path(run), backend)
+                registry = Path(env["ZVEC_GREP_WORKSPACE_REGISTRY"])
+                self.assertTrue(registry.is_absolute())
+                self.assertEqual(registry, Path(run).resolve() / backend / "workspaces.json")
+                registries.add(registry)
+        self.assertEqual(len(registries), 6)
+
+    def test_case_overrides_inherited_registry_without_changing_runtime_path(self):
+        original = {"ZVEC_GREP_WORKSPACE_REGISTRY": "inherited.json", "PATH": "cuda-runtime"}
+        with patch.dict(os.environ, original, clear=True):
+            env = cuda_cli.case_environment(Path("case"), "gguf")
+            self.assertNotEqual(env["ZVEC_GREP_WORKSPACE_REGISTRY"], "inherited.json")
+            self.assertEqual(env["PATH"], "cuda-runtime")
+            self.assertEqual(dict(os.environ), original)
+
     def test_requested_gguf_plugin_must_really_be_selected(self):
         selected = "llama.cpp GPU embedding backend selected backend=CUDA\noffloaded 24/24 layers to GPU\n"
         for version in ("12.4", "13.1"):

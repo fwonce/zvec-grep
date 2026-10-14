@@ -69,6 +69,21 @@ def run_zg(binary, workspace, logs, stage, args, env):
     return out, err
 
 
+def case_environment(work, backend):
+    root = work.resolve() / backend
+    env = dict(os.environ)
+    env.update({
+        # The registry is independent of ZVEC_GREP_HOME and XDG_CONFIG_HOME.
+        # Each invocation/backend must own its registry, including on Windows.
+        "ZVEC_GREP_WORKSPACE_REGISTRY": str(root / "workspaces.json"),
+        "ZVEC_GREP_HOME": str(root / "runtime"),
+        "ORT_LOG": "verbose",
+        "RUST_LOG": "warn,zg=debug,zg_engine=debug,ort=trace,llama-cpp-2=info",
+        "NO_COLOR": "1",
+    })
+    return env
+
+
 def run_case(binary, model_cache, work, logs, backend, model, expected_gguf_cuda):
     workspace = work / backend / "workspace"
     workspace.mkdir(parents=True)
@@ -77,14 +92,7 @@ def run_case(binary, model_cache, work, logs, backend, model, expected_gguf_cuda
         "# GPU validation fixture\n"
         "The heliotrope capacitor calibrates the observatory telescope.\n"
         f"{MARKER}\n", encoding="utf-8")
-    env = dict(os.environ)
-    env.update({
-        "XDG_CONFIG_HOME": str(work / backend / "config"),
-        "ZVEC_GREP_HOME": str(work / backend / "runtime"),
-        "ORT_LOG": "verbose",
-        "RUST_LOG": "warn,zg=debug,zg_engine=debug,ort=trace,llama-cpp-2=info",
-        "NO_COLOR": "1",
-    })
+    env = case_environment(work, backend)
     cuda_args = ["--device", "cuda", "--model-cache", str(model_cache), "--debug", "--no-color"]
     _, index_err = run_zg(binary, workspace, logs, "index", [
         "--index", "--name", f"cuda-e2e-{backend}", "--mode", "direct",
