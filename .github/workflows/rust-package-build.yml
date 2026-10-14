@@ -13,6 +13,11 @@ on:
         type: string
         required: false
         default: ""
+      source_ref:
+        description: Optional immutable source revision for manual GPU validation
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -33,6 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.source_ref }}
           persist-credentials: false
       - uses: actions/setup-node@v6
         with:
@@ -136,12 +142,15 @@ jobs:
       - name: Build the Linux CPU/CUDA bundle
         if: inputs.target == 'linux-x64-gnu'
         working-directory: ${{ github.workspace }}
+        env:
+          CMAKE_CUDA_ARCHITECTURES: ${{ inputs.cuda_architectures }}
         run: |
           docker run --rm --platform linux/amd64 \
             --volume "${GITHUB_WORKSPACE}:/work:ro" \
             --volume "${GITHUB_WORKSPACE}/rust/target:/work-target" \
             --env CARGO_TARGET_DIR=/work-target \
             --env CMAKE_BUILD_PARALLEL_LEVEL=2 \
+            --env CMAKE_CUDA_ARCHITECTURES \
             --env ORT_CUDA_VERSION=13 \
             zvec-grep-cuda-builder \
             bash scripts/build-cuda.sh
