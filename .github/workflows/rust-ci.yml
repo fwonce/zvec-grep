@@ -83,6 +83,7 @@ jobs:
         run: python rust/scripts/test-windows-cdb.py
       - name: Prepare the fixed driver only when explicitly allowed and needed
         if: ${{ inputs.allow_driver_install }}
+        timeout-minutes: 20
         shell: powershell
         run: |
           & rust/scripts/prepare-hosted-windows-gpu-driver.ps1 -AllowInstallation

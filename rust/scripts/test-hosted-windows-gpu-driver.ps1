@@ -24,7 +24,9 @@ function Start-Process {
         throw "Missing no-reboot or component-only restriction."
     }
     $state.Installs++
-    [pscustomobject]@{ ExitCode = $case.InstallExit }
+    $mock = [pscustomobject]@{ ExitCode = $case.InstallExit }
+    $mock | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($Milliseconds) $true }
+    $mock
 }
 
 $scenarios = @(

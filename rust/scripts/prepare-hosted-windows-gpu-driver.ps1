@@ -13,6 +13,12 @@ if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
     throw "nvidia-smi is missing; refusing to modify an unrecognized GPU environment."
 }
 [IO.Directory]::CreateDirectory([IO.Path]::GetFullPath($Logs)) | Out-Null
+function Write-DriverStage([string]$Message) {
+    $line = "$(Get-Date -Format o) $Message"
+    Write-Host $line
+    Add-Content -LiteralPath (Join-Path $Logs "stages.txt") -Value $line
+}
+Write-DriverStage "Checking the existing GPU driver"
 $before = (& nvidia-smi 2>&1 | Out-String)
 $status = $LASTEXITCODE
 $before | Set-Content (Join-Path $Logs "before.txt")
@@ -32,28 +38,43 @@ $version = "591.59"
 $url = "https://download.microsoft.com/download/8920fc6c-3546-458b-99d9-647c4e8621a4/591.59-data-center-tesla-desktop-win10-win11-64bit-dch-international.exe"
 if (-not $env:RUNNER_TEMP) { throw "RUNNER_TEMP is missing." }
 $installer = Join-Path $env:RUNNER_TEMP "nvidia-$version.exe"
+Write-DriverStage "Downloading fixed driver $version"
 & curl.exe -fL --retry 3 --connect-timeout 20 --max-time 600 -o $installer $url
 if ($LASTEXITCODE -ne 0) { throw "Downloading the fixed GPU driver failed." }
+Write-DriverStage "Validating NVIDIA Authenticode signature"
 $signature = Get-AuthenticodeSignature -LiteralPath $installer
 if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "NVIDIA Corporation") {
     throw "The GPU driver does not have a valid NVIDIA signature."
 }
+Write-DriverStage "Signature verified; calculating SHA256"
 $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
 @{ version = $version; url = $url; sha256 = $hash; signer = $signature.SignerCertificate.Subject } |
     ConvertTo-Json | Set-Content (Join-Path $Logs "installer.json")
 
 $expanded = Join-Path $env:RUNNER_TEMP "nvidia-$version"
+Write-DriverStage "Extracting the signed driver installer"
 & 7z x $installer "-o$expanded" -y | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Extracting the GPU driver failed." }
 $setup = Join-Path $expanded "setup.exe"
 $logPath = [IO.Path]::GetFullPath($Logs)
 # -n prevents an installer reboot. Install the display driver component only.
-$process = Start-Process -FilePath $setup -ArgumentList @("-s", "-n", "Display.Driver", "-log:`"$logPath`"", "-loglevel:6") -Wait -PassThru
+Write-DriverStage "Starting Display.Driver setup with reboot disabled"
+$process = Start-Process -FilePath $setup -ArgumentList @("-s", "-n", "Display.Driver", "-log:`"$logPath`"", "-loglevel:6") -PassThru
+$started = Get-Date
+while (-not $process.WaitForExit(30000)) {
+    Write-DriverStage "Driver setup is running ($([int]((Get-Date) - $started).TotalSeconds)s elapsed)"
+    $setupLog = Join-Path $Logs "LOG.setup.exe.log"
+    if (Test-Path -LiteralPath $setupLog) {
+        Get-Content -LiteralPath $setupLog -Tail 3 | ForEach-Object { Write-Host $_ }
+    }
+}
+Write-DriverStage "Driver installer exited: $($process.ExitCode)"
 $process.ExitCode | Set-Content (Join-Path $Logs "installer-exit-code.txt")
 if ($process.ExitCode -in @(1, 3010, 1641)) {
     throw "Driver installation requested a reboot; this job will not reboot or continue testing."
 }
 if ($process.ExitCode -ne 0) { throw "GPU driver setup failed with exit code $($process.ExitCode)." }
+Write-DriverStage "Checking that the new driver is active"
 $after = (& nvidia-smi 2>&1 | Out-String)
 $status = $LASTEXITCODE
 $after | Set-Content (Join-Path $Logs "after.txt")
