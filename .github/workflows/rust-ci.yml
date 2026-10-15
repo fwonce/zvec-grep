@@ -1,5 +1,5 @@
 name: Rust CUDA npm artifact replay
-run-name: Windows CUDA package replay / ${{ inputs.artifact_run_id }}
+run-name: Windows CUDA isolated diagnostics / ${{ inputs.artifact_run_id }}
 
 # Temporary validation-branch entry point. Do not merge over ordinary Rust CI.
 on:
@@ -35,7 +35,7 @@ jobs:
     runs-on:
       group: gpu-runners
       labels: gpu-windows-t4
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
         with:
@@ -73,6 +73,14 @@ jobs:
         timeout-minutes: 5
         with:
           python-version: "3.12"
+      - name: Prepare standalone Microsoft native debugger (no compilation)
+        timeout-minutes: 8
+        shell: powershell
+        run: rust/scripts/prepare-windows-cdb.ps1
+      - name: Verify live native stack capture before GPU tests
+        timeout-minutes: 2
+        shell: powershell
+        run: python rust/scripts/test-windows-cdb.py
       - name: Prepare the fixed driver only when explicitly allowed and needed
         if: ${{ inputs.allow_driver_install }}
         shell: powershell
@@ -86,7 +94,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test GPU evidence and workspace isolation assertions
         shell: powershell
-        run: python rust/scripts/test-cuda-cli-checks.py
+        run: |
+          python rust/scripts/test-cuda-cli-checks.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python rust/scripts/test-windows-cuda-diagnostics.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Download the already built npm package (no compilation)
         uses: actions/download-artifact@v8
         with:
@@ -101,11 +113,20 @@ jobs:
         uses: ./.github/actions/cuda-cli-e2e
         with:
           target: win32-x64-msvc
+          windows_diagnostics: "true"
       - name: Retain driver evidence even when preflight fails
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: windows-driver-preflight
           path: gpu-logs/driver/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Retain diagnostic preflight evidence even if setup fails
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-diagnostic-preflight
+          path: gpu-logs/diagnostic-preflight/
           if-no-files-found: warn
           retention-days: 7
