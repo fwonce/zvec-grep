@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -78,6 +78,69 @@ test("includes model runtime libraries but excludes build files and other platfo
     for (const name of libraries) {
       assert.equal(await readFile(join(destination, name), "utf8"), name);
     }
+  }
+});
+
+test("materializes cached model runtime symlinks and rejects broken runtime links", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "zg-model-runtime-links-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const [platform, zvec, runtimeLinks] of [
+    ["darwin", "libzvec_c_api.dylib", {
+      "libonnxruntime.dylib": "libonnxruntime.1.28.0.dylib",
+      "libonnxruntime.1.28.0.dylib": "libonnxruntime.1.28.0.dylib",
+    }],
+    ["linux", "libzvec_c_api.so", {
+      "libonnxruntime.so": "libonnxruntime.so.1.28.0",
+      "libonnxruntime.so.1": "libonnxruntime.so.1.28.0",
+      "libonnxruntime.so.1.28.0": "libonnxruntime.so.1.28.0",
+    }],
+    ["win32", "zvec_c_api.dll", {
+      "onnxruntime.dll": "onnxruntime.dll",
+      "DirectML.dll": "DirectML.dll",
+    }],
+  ]) {
+    const source = join(root, platform, "profile");
+    const cache = join(root, platform, "ort-cache");
+    const destination = join(root, platform, "package", "lib");
+    await mkdir(join(source, "data", "jieba_dict"), { recursive: true });
+    await mkdir(cache, { recursive: true });
+    for (const name of ["jieba.dict.utf8", "hmm_model.utf8"]) {
+      await writeFile(join(source, "data", "jieba_dict", name), name);
+    }
+    await writeFile(join(source, zvec), zvec);
+    for (const name of new Set(Object.values(runtimeLinks))) {
+      await writeFile(join(cache, name), `${platform}:${name}`);
+    }
+    for (const [name, cachedName] of Object.entries(runtimeLinks)) {
+      try {
+        await symlink(join(cache, cachedName), join(source, name), "file");
+      } catch (error) {
+        if (process.platform === "win32" && ["EPERM", "EACCES"].includes(error.code)) {
+          t.skip("creating symbolic links requires Windows Developer Mode or elevated privileges; regular DLL staging is covered separately");
+          return;
+        }
+        throw error;
+      }
+      assert.equal((await lstat(join(source, name))).isSymbolicLink(), true);
+    }
+
+    const files = await stageZvecRuntime(source, destination, platform);
+    assert.deepEqual(files.sort(), [
+      `lib/${zvec}`,
+      "lib/data/jieba_dict/jieba.dict.utf8",
+      "lib/data/jieba_dict/hmm_model.utf8",
+      ...Object.keys(runtimeLinks).map((name) => `lib/${name}`),
+    ].sort());
+    await rm(cache, { recursive: true });
+    for (const [name, cachedName] of Object.entries(runtimeLinks)) {
+      const path = join(destination, name);
+      assert.equal((await lstat(path)).isFile(), true);
+      assert.equal(await readFile(path, "utf8"), `${platform}:${cachedName}`);
+    }
+    await assert.rejects(
+      stageZvecRuntime(source, join(root, platform, "broken", "lib"), platform),
+      { code: "ENOENT" },
+    );
   }
 });
 

@@ -27,6 +27,13 @@ rpath. Windows uses a native MSVC delay-load hook to resolve DLLs from the
 executable's sibling `lib/`. The binary runs directly, without a JavaScript
 launcher or user-provided loader environment variables.
 
+Non-CUDA builds enable ORT's upstream `copy-dylibs` feature to stage runtime
+sidecars beside the Cargo executable. npm packaging copies them into `lib/`
+as regular files, including any symlinked libraries. This includes Intel macOS's
+dynamically linked ORT and Windows DirectML's DLL; it does not change the static
+ORT linkage used by the default macOS ARM64 and Linux CPU builds. CUDA bundles
+load ORT dynamically and continue to stage their pinned core/providers explicitly.
+
 The default `linux-x64-gnu` and `win32-x64-msvc` native packages are CPU/CUDA
 bundles. CUDA libraries remain runtime plugins: compatible NVIDIA libraries
 enable GPU use, while hosts without them continue on CPU. Release maintainers
