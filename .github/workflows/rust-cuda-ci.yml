@@ -1,5 +1,5 @@
 name: Rust CUDA CI
-run-name: Rust CUDA CI / ${{ inputs.ref }}
+run-name: Rust CUDA CI / ${{ inputs.platform }} / ${{ inputs.ref }}
 
 # CUDA runners remain opt-in; publishing has its own package/GPU validation.
 on:
@@ -10,6 +10,12 @@ on:
         required: true
         default: main
         type: string
+      platform:
+        description: CUDA platform to validate
+        required: true
+        default: all
+        type: choice
+        options: [all, linux, windows]
       confirm_reviewed:
         description: I reviewed and trust this ref to execute on the hosted GPU runners
         required: true
@@ -19,7 +25,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: rust-cuda-ci
+  group: rust-cuda-ci-${{ inputs.platform || 'all' }}
   cancel-in-progress: false
 
 env:
@@ -60,11 +66,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: linux-x64-gnu
-            runner: gpu-linux-t4
-          - target: win32-x64-msvc
-            runner: gpu-windows-t4
+        include: >-
+          ${{ fromJSON(
+            inputs.platform == 'linux' && '[{"target":"linux-x64-gnu","runner":"gpu-linux-t4"}]' ||
+            inputs.platform == 'windows' && '[{"target":"win32-x64-msvc","runner":"gpu-windows-t4"}]' ||
+            '[{"target":"linux-x64-gnu","runner":"gpu-linux-t4"},{"target":"win32-x64-msvc","runner":"gpu-windows-t4"}]'
+          ) }}
     defaults:
       run:
         working-directory: rust
@@ -88,10 +95,10 @@ jobs:
         shell: powershell
         working-directory: ${{ github.workspace }}
         run: |
+          nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+          if ($LASTEXITCODE -ne 0) { throw "nvidia-smi GPU query failed (exit code $LASTEXITCODE)" }
           & rust/scripts/cuda/prepare-windows.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
-          if ($LASTEXITCODE -ne 0) { throw "The GPU runner has no working NVIDIA driver" }
       - name: Set up MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -124,6 +131,20 @@ jobs:
           method: network
           sub-packages: '["nvcc", "nvvm", "crt", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
           use-local-cache: true
+      - name: Verify and select the Windows CUDA compiler
+        if: runner.os == 'Windows'
+        shell: python
+        run: |
+          import os, pathlib, re, subprocess
+          compiler = pathlib.Path(os.environ["CUDA_PATH"]) / "bin" / "nvcc.exe"
+          result = subprocess.run([str(compiler), "--version"], capture_output=True, text=True)
+          print(result.stdout + result.stderr, flush=True)
+          result.check_returncode()
+          if not re.search(r"\brelease 13\.1,", result.stdout):
+              raise RuntimeError("Rust CUDA CI requires the CUDA 13.1 compiler")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as environment:
+              environment.write(f"CUDACXX={compiler.as_posix()}\n")
+              environment.write(f"CMAKE_CUDA_COMPILER={compiler.as_posix()}\n")
       - name: Read the pinned Rust toolchain
         if: runner.os == 'Windows'
         id: rust-version
@@ -142,9 +163,9 @@ jobs:
             ~/.cargo/registry/
             ~/.cargo/git/
             rust/target/
-          key: rust-cuda-ci-v1-${{ matrix.target }}-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml', 'rust/scripts/cuda/cuda-builder.Dockerfile') }}-${{ needs.source.outputs.sha }}
+          key: rust-cuda-ci-v2-${{ matrix.target }}-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml', 'rust/scripts/cuda/cuda-builder.Dockerfile') }}-${{ needs.source.outputs.sha }}
           restore-keys: |
-            rust-cuda-ci-v1-${{ matrix.target }}-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml', 'rust/scripts/cuda/cuda-builder.Dockerfile') }}-
+            rust-cuda-ci-v2-${{ matrix.target }}-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml', 'rust/scripts/cuda/cuda-builder.Dockerfile') }}-
       - name: Restore both real models
         uses: actions/cache@v5
         with:
@@ -157,7 +178,7 @@ jobs:
         shell: bash
         working-directory: ${{ github.workspace }}
         run: |
-          nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
+          nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
           mkdir -p rust/target "$HOME/.cargo/registry" "$HOME/.cargo/git"
           docker build --platform linux/amd64 --file rust/scripts/cuda/cuda-builder.Dockerfile \
             --build-arg RUST_VERSION="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust/rust-toolchain.toml)" \
@@ -171,6 +192,11 @@ jobs:
             --env RUST_BACKTRACE --env CARGO_TERM_COLOR \
             --env ORT_DYLIB_PATH=/work/rust/target/debug/libonnxruntime.so.1 \
             zvec-grep-cuda-ci bash -euo pipefail -c '
+              cuda_ci_nvcc_version="$(nvcc --version)"
+              echo "$cuda_ci_nvcc_version"
+              grep -Eq "release 13\.1," <<< "$cuda_ci_nvcc_version"
+              export CUDACXX="$(command -v nvcc)"
+              export CMAKE_CUDA_COMPILER="$CUDACXX"
               cargo fmt --all --check
               cargo check --locked --workspace --all-targets --features zg/cuda
               cargo clippy --locked --workspace --all-targets --features zg/cuda -- -D warnings

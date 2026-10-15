@@ -523,6 +523,8 @@ installs pinned CUDA 13.1 and 12.4 toolchains on the selected build runner. Ordi
 does not compile CUDA packages. The independent manual `rust-cuda-ci.yml` runs
 CUDA-enabled workspace checks, Clippy and tests, then reuses the compiled test
 binary for real ORT and llama.cpp CUDA model tests in the same platform job.
+Its `platform` input defaults to `all` (Linux and Windows); select `linux` or
+`windows` to run only that platform's GPU job against the reviewed ref.
 It verifies actual GPU execution without CPU fallback, does no npm packaging,
 and leaves Model2Vec in the non-CUDA model workflow.
 The current ONNX Runtime prebuilt libraries cannot link against
