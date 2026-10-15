@@ -9,28 +9,18 @@ on:
       runner:
         type: string
         required: true
-      runner_group:
-        description: Optional runner group for the GPU hosts.
-        type: string
-        default: ""
-      cuda_e2e:
-        description: Build and run CUDA CLI validation together on a GPU host.
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_BUILD_JOBS: 2
-  CMAKE_BUILD_PARALLEL_LEVEL: 2
 
 jobs:
   native:
     name: Build ${{ inputs.target }}
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":"{0}","labels":"{1}"}}', inputs.runner_group, inputs.runner)) || inputs.runner }}
-    timeout-minutes: ${{ (inputs.target == 'darwin-x64' || inputs.target == 'win32-x64-msvc') && 180 || 90 }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ (inputs.target == 'darwin-x64' || inputs.target == 'linux-x64-gnu' || inputs.target == 'win32-x64-msvc') && 180 || 90 }}
     defaults:
       run:
         working-directory: rust
@@ -41,28 +31,48 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+      - name: Configure native build parallelism
+        shell: node {0}
+        run: |
+          const os = require("node:os");
+          const fs = require("node:fs");
+          const cores = os.availableParallelism();
+          const memoryGiB = os.totalmem() / (1024 ** 3);
+          // A conservative per-job memory budget, not a guarantee against OOM.
+          const jobs = Math.max(1, Math.min(cores, Math.floor(memoryGiB / 3), 8));
+          fs.appendFileSync(process.env.GITHUB_ENV,
+            `CARGO_BUILD_JOBS=${jobs}\nCMAKE_BUILD_PARALLEL_LEVEL=${jobs}\n`);
+          console.log(`Native build resources: cores=${cores}, RAM=${memoryGiB.toFixed(1)} GiB, jobs=${jobs} (3 GiB/job, cap 8)`);
       - uses: actions/setup-python@v6
-        if: inputs.cuda_e2e || runner.os == 'Windows'
+        if: runner.os == 'Windows'
         with:
           python-version: "3.12"
-      - name: Prepare the Windows GPU build tools
-        if: inputs.cuda_e2e && runner.os == 'Windows'
+      - name: Install the CUDA 12.4 compatible MSVC toolset before compiling
+        if: inputs.target == 'win32-x64-msvc'
         shell: powershell
-        working-directory: ${{ github.workspace }}
         run: |
-          & rust/scripts/cuda/prepare-windows.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Verify the Linux GPU before building
-        if: inputs.cuda_e2e && runner.os == 'Linux'
-        run: nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
-      - name: Verify the Windows GPU before building
-        if: inputs.cuda_e2e && runner.os == 'Windows'
-        shell: powershell
-        working-directory: ${{ github.workspace }}
-        run: |
-          nvidia-smi
-          if ($LASTEXITCODE -ne 0) { throw "The GPU runner image has no working NVIDIA driver" }
-          nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "vswhere.exe is missing; Visual Studio 2022 C++ build tools must be installed first"
+          }
+          $vs = & $vswhere -latest -products '*' -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vs)) {
+            throw "Unable to locate a Visual Studio 2022 installation with the x64 C++ tools"
+          }
+          $vs = $vs.Trim()
+          $compiler = "$vs/VC/Tools/MSVC/14.38.*/bin/Hostx64/x64/cl.exe"
+          if (-not (Test-Path -Path $compiler -PathType Leaf)) {
+            $installer = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/setup.exe"
+            if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+              throw "Visual Studio Installer is missing; cannot install MSVC 14.38"
+            }
+            $result = Start-Process $installer -ArgumentList @('modify', '--installPath', "`"$vs`"", '--add', 'Microsoft.VisualStudio.Component.VC.14.38.17.8.x86.x64', '--quiet', '--norestart') -Wait -PassThru
+            if ($result.ExitCode -notin @(0, 3010)) { throw "MSVC 14.38 installation failed: $($result.ExitCode)" }
+          }
+          if (-not (Test-Path -Path $compiler -PathType Leaf)) {
+            throw "MSVC 14.38 x64 compiler is still missing after installation: $compiler"
+          }
+          Write-Host "MSVC 14.38 is ready for the later CUDA 12.4 fallback build: $vs"
       - name: Set up MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -168,7 +178,7 @@ jobs:
             --volume "${GITHUB_WORKSPACE}:/work:ro" \
             --volume "${GITHUB_WORKSPACE}/rust/target:/work-target" \
             --env CARGO_TARGET_DIR=/work-target \
-            --env CMAKE_BUILD_PARALLEL_LEVEL=2 \
+            --env CARGO_BUILD_JOBS --env CMAKE_BUILD_PARALLEL_LEVEL \
             zvec-grep-cuda-builder \
             bash scripts/cuda/build.sh --primary-only
       - name: Build the Linux CUDA 12.4 fallback plugin
@@ -182,7 +192,7 @@ jobs:
             --volume "${GITHUB_WORKSPACE}:/work:ro" \
             --volume "${GITHUB_WORKSPACE}/rust/target:/work-target" \
             --env CARGO_TARGET_DIR=/work-target \
-            --env CMAKE_BUILD_PARALLEL_LEVEL=2 \
+            --env CARGO_BUILD_JOBS --env CMAKE_BUILD_PARALLEL_LEVEL \
             zvec-grep-cuda12-builder bash -euo pipefail -c '
               python3 scripts/cuda/build-fallback.py --bundle /work-target/release/zg-cuda
               bash scripts/cuda/check.sh /work-target/release/zg-cuda
@@ -217,16 +227,6 @@ jobs:
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
           use-local-cache: true
-      - name: Install the CUDA 12.4 compatible MSVC toolset
-        if: inputs.target == 'win32-x64-msvc'
-        shell: powershell
-        run: |
-          $vs = & "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe" -latest -products '*' -property installationPath
-          if (-not (Test-Path "$vs/VC/Tools/MSVC/14.38.*")) {
-            $installer = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/setup.exe"
-            $result = Start-Process $installer -ArgumentList @('modify', '--installPath', "`"$vs`"", '--add', 'Microsoft.VisualStudio.Component.VC.14.38.17.8.x86.x64', '--quiet', '--norestart') -Wait -PassThru
-            if ($result.ExitCode -notin @(0, 3010)) { throw "MSVC 14.38 installation failed: $($result.ExitCode)" }
-          }
       - name: Use the CUDA 12.4 compatible MSVC toolset
         if: inputs.target == 'win32-x64-msvc'
         uses: ilammy/msvc-dev-cmd@v1
@@ -279,8 +279,3 @@ jobs:
           path: rust/dist/npm/release/tarballs/zvec-zvec-grep-${{ inputs.target }}-*.tgz
           if-no-files-found: error
           retention-days: 14
-      - name: Verify GGUF and ONNX CUDA through the installed npm package
-        if: inputs.cuda_e2e
-        uses: ./.github/actions/cuda-cli-e2e
-        with:
-          target: ${{ inputs.target }}

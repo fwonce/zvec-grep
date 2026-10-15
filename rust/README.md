@@ -497,8 +497,8 @@ Bundle mode accepts only regular files under `bin/` and `lib/`; `bin/`
 contains exactly the target executable. It cannot be combined with
 `--binary`, `--lib-dir`, or `--cpu-only`. All payload files are checksummed.
 
-The `Publish Rust packages` workflow builds all five published native targets on matching
-GitHub runners. Manual runs produce downloadable candidates without publishing
+The `Publish Rust packages` workflow builds the selected published native targets
+(all five by default) on matching CPU runners. Manual runs produce downloadable candidates without publishing
 to npm unless publication is explicitly selected. Each runner installs
 its platform and meta tarballs, then runs `zg --version`, checks managed-rg,
 starts the packaged daemon, compares workspace status in direct and server
@@ -507,17 +507,37 @@ managed-rg intentionally stays local. macOS binaries receive ad hoc signatures;
 Developer ID, notarization, and Windows certificate signing are not required for
 candidate builds.
 
-Intel macOS is built and verified first. Only after its tarball installation,
-CLI startup, managed-rg, and daemon IPC checks pass do the other four native
-builds start. The final artifact is collected after all five targets pass.
+The selected platforms build in parallel after source validation; Intel macOS
+does not gate Linux or Windows. Each platform runs tarball installation, CLI
+startup, managed-rg, and daemon IPC checks before uploading its native artifact.
+The final artifact is collected after all selected targets pass.
+
+The packaging workflow's manual `platform` input defaults to `all`. Select any
+of `darwin-arm64`, `darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`, or
+`win32-x64-msvc` for an individual build. For example, to validate Linux x64:
+
+```sh
+gh workflow run rust-publish.yml --ref <branch> \
+  -f publish=false -f cuda=false -f platform=linux-x64-gnu
+```
+
+Partial selections produce validation-only candidates and cannot be published;
+`publish=true` requires `platform=all`. Push-triggered runs still build all five
+platforms on ordinary CPU runners.
 
 Pushes to `main` and `release/rust-*` start candidate packaging on CPU runners,
 as do manual runs with both `publish=false` and `cuda=false`; they do not publish
-to npm. Set `cuda=true, publish=false` to build and validate GPU candidates without
-publishing. Either `cuda=true` or `publish=true` switches Linux/Windows x64 to
-`gpu-linux-t4` and `gpu-windows-t4`, respectively, and runs the packaged GGUF/ONNX
-GPU validation. Publishing always requires GPU validation regardless of `cuda`.
-CPU runners still compile the default CUDA-capable bundles. Linux x64 uses the pinned
+to npm. Packaging always compiles on CPU runners, including when `cuda=true` or
+`publish=true`. Set `cuda=true, publish=false` to add GPU validation without
+publishing. Separate jobs on `gpu-linux-t4` and `gpu-windows-t4` download the
+selected Linux/Windows x64 native packages from the same run, verify their
+payload checksums, and run the packaged GGUF/ONNX GPU tests without compiling or
+repacking. These jobs install only the required runtime libraries, not build
+toolchains, and exercise the CUDA 12 fallback and CUDA 13 primary paths.
+Publishing always requires GPU validation regardless of `cuda`. When requested,
+GPU validation must pass before artifact collection and npm publication; the
+per-platform artifacts are retained even if GPU validation fails.
+CPU runners compile the default CUDA-capable bundles. Linux x64 uses the pinned
 Ubuntu 24.04 CUDA builder image; Linux ARM64 uses its native runner. Windows
 installs pinned CUDA 13.1 and 12.4 toolchains on the selected build runner. Ordinary PR CI
 does not compile CUDA packages. `rust-ci.yml` is the single entry point for
@@ -537,12 +557,20 @@ check out the same resolved SHA. This workflow does no npm packaging or publishi
 The current ONNX Runtime prebuilt libraries cannot link against
 Ubuntu 22.04's glibc and C++ runtime, so older Linux distributions are not
 covered by this release workflow.
+Packaging selects Cargo/CMake parallelism from available CPUs and total memory
+with a conservative 3 GiB per-job budget, a minimum of 1 and a maximum of 8.
+The same limits are passed into both Linux CUDA containers. This is a resource
+heuristic, not a guarantee against OOM. Linux x64 and Windows x64 allow up to
+180 minutes for both CUDA builds. Windows installs the CUDA 12.4-compatible
+MSVC 14.38 toolset before compilation begins; the primary build still uses the
+default toolset and the fallback switches to 14.38.
 Intel macOS builds ONNX Runtime 1.28.0 with CoreML and the native zvec SDK from
 pinned source revisions because neither dependency supplies prebuilt Intel
 macOS libraries. Both SDKs are cached and their shared libraries are included
 in the npm payload. The Intel release targets macOS 14 and later.
 
-Download the `rust-release-<version>` artifact from the successful workflow run
+For a complete all-platform run, download the `rust-release-<version>` artifact
+from the successful workflow run
 and unzip it. It contains all five platform tarballs, the meta tarball,
 `SHA256SUMS`, `release.json` with the source commit, and platform-specific install
 commands. For example, on an ARM64 Mac:
@@ -557,7 +585,12 @@ Use the filenames from the downloaded artifact when the version changes. On
 Windows, use `zg.cmd` if PowerShell blocks the generated `zg.ps1` shim. Artifacts
 are retained for 14 days.
 
-Every candidate also goes through separate Linux/Windows x64 CPU artifact jobs.
+Subset runs instead upload `rust-candidate-<version>`, containing the selected
+native tarballs, the unchanged exact-version meta tarball, checksums and install
+instructions. Its `release.json` records the selected targets and `partial: true`;
+it cannot be published or promoted as a complete release.
+
+Selected Linux/Windows x64 candidates also go through separate CPU artifact jobs.
 These download the collected `.tgz` files, verify their hashes and default CUDA
 variant, install them offline without rebuilding, and exercise CLI/daemon IPC.
 With CUDA host libraries unavailable, the installed meta package must also pass
@@ -582,7 +615,11 @@ exercise update and rollback with a distinct previously published version.
 Selecting `latest` requests a separate promotion job that changes the default
 installation only after all registry checks pass.
 
-`release:collect` requires all platform tarballs and packs the meta package last.
+`release:collect` requires all platform tarballs by default and packs the meta
+package last. `release:collect -- --targets linux-x64-gnu,win32-x64-msvc` collects
+only the explicitly selected platform tarballs as a validation-only partial
+candidate; missing or extra tarballs are rejected. The meta package still locks
+all five platform versions, so its installation behavior is unchanged.
 `release:artifact-smoke` installs the current platform's exact collected native
 and meta tarballs from `dist/npm/release/tarballs`, verifies the installation and
 CLI/daemon operation, and does not compile, repack or publish anything.

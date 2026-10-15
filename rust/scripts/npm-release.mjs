@@ -59,6 +59,7 @@ function parseOptions(args) {
     cpuOnly: false,
     libDir: undefined,
     target: undefined,
+    targets: undefined,
   };
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -75,6 +76,7 @@ function parseOptions(args) {
       ["--bundle-dir", "bundleDir"],
       ["--lib-dir", "libDir"],
       ["--target", "target"],
+      ["--targets", "targets"],
     ]);
     const field = fields.get(argument);
     if (field) {
@@ -82,7 +84,12 @@ function parseOptions(args) {
       if (!value) {
         throw new Error(`${argument} requires a value`);
       }
-      options[field] = field === "target" ? value : resolve(value);
+      options[field] =
+        field === "targets"
+          ? value.split(",").map((target) => target.trim())
+          : field === "target"
+            ? value
+            : resolve(value);
       index += 1;
       continue;
     }
@@ -339,6 +346,9 @@ async function smokeCurrent(options) {
 async function main() {
   const command = process.argv[2];
   const options = parseOptions(process.argv.slice(3));
+  if (options.targets !== undefined && command !== "collect") {
+    throw new Error("--targets is only supported by collect");
+  }
   if (command === "build") {
     await buildNative(currentPlatform(loadReleaseManifest()), options);
     return;
@@ -386,6 +396,7 @@ async function main() {
       manifest: loadReleaseManifest(),
       version: cargoPackageVersion(),
       tarballRoot,
+      targets: options.targets,
     });
     return;
   }
@@ -419,7 +430,7 @@ async function main() {
     return;
   }
   throw new Error(
-    "usage: npm-release.mjs <build|verify|verify-publication|pack-platform|pack-meta|pack-current|smoke-current|smoke-artifacts|collect|publish|promote|rollback-version|smoke-registry> [--target TARGET] [--binary PATH] [--lib-dir PATH] [--bundle-dir PATH] [--cpu-only] [--no-build]",
+    "usage: npm-release.mjs <build|verify|verify-publication|pack-platform|pack-meta|pack-current|smoke-current|smoke-artifacts|collect|publish|promote|rollback-version|smoke-registry> [--target TARGET] [--targets TARGET,... (collect only)] [--binary PATH] [--lib-dir PATH] [--bundle-dir PATH] [--cpu-only] [--no-build]",
   );
 }
 

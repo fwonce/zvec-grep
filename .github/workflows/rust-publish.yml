@@ -15,9 +15,20 @@ on:
         type: boolean
         default: false
       cuda:
-        description: Build and validate on GPU runners without publishing (publishing always enables this).
+        description: Validate CPU-built packages on GPU runners (publishing always enables this).
         type: boolean
         default: false
+      platform:
+        description: Build all platforms or one target; publishing requires all.
+        type: choice
+        default: all
+        options:
+          - all
+          - linux-x64-gnu
+          - win32-x64-msvc
+          - linux-arm64-gnu
+          - darwin-arm64
+          - darwin-x64
       dist_tag:
         description: Promote to latest only after registry install/update/rollback checks pass.
         type: choice
@@ -32,8 +43,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_BUILD_JOBS: 2
-  CMAKE_BUILD_PARALLEL_LEVEL: 2
 
 jobs:
   source:
@@ -43,6 +52,13 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      matrix: ${{ steps.platforms.outputs.matrix }}
+      cpu_matrix: ${{ steps.platforms.outputs.cpu_matrix }}
+      has_cpu: ${{ steps.platforms.outputs.has_cpu }}
+      gpu_matrix: ${{ steps.platforms.outputs.gpu_matrix }}
+      run_cuda: ${{ steps.platforms.outputs.run_cuda }}
+      targets: ${{ steps.platforms.outputs.targets }}
+      artifact_name: ${{ steps.platforms.outputs.partial == 'true' && 'rust-candidate' || 'rust-release' }}-${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -51,6 +67,45 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+      - name: Select build and artifact validation platforms
+        id: platforms
+        env:
+          BUILD_PLATFORM: ${{ github.event_name == 'workflow_dispatch' && inputs.platform || 'all' }}
+          PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+          CUDA_VERIFY: ${{ github.event_name == 'workflow_dispatch' && (inputs.cuda || inputs.publish) }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs';
+          const platform = process.env.BUILD_PLATFORM;
+          const platforms = [
+            { target: 'darwin-arm64', runner: 'macos-14', gpu_runner: '' },
+            { target: 'darwin-x64', runner: 'macos-15-intel', gpu_runner: '' },
+            { target: 'linux-x64-gnu', runner: 'ubuntu-24.04', gpu_runner: 'gpu-linux-t4' },
+            { target: 'linux-arm64-gnu', runner: 'ubuntu-24.04-arm', gpu_runner: '' },
+            { target: 'win32-x64-msvc', runner: 'windows-2022', gpu_runner: 'gpu-windows-t4' },
+          ];
+          if (!['all', ...platforms.map(p => p.target)].includes(platform)) {
+            throw new Error(`Unknown build platform: ${platform}`);
+          }
+          if (process.env.PUBLISH === 'true' && platform !== 'all') {
+            throw new Error('npm publishing requires platform=all; subsets are validation-only candidates');
+          }
+          const selected = platforms.filter(p => platform === 'all' || p.target === platform);
+          const cpu = selected.filter(p => p.gpu_runner).map(({ target, runner }) => ({ target, runner }));
+          const gpu = selected.filter(p => p.gpu_runner).map(({ target, gpu_runner }) => ({ target, runner: gpu_runner }));
+          const outputs = {
+            matrix: JSON.stringify({ include: selected }),
+            cpu_matrix: JSON.stringify({ include: cpu }),
+            has_cpu: String(cpu.length > 0),
+            gpu_matrix: JSON.stringify({ include: gpu }),
+            run_cuda: String(process.env.CUDA_VERIFY === 'true' && gpu.length > 0),
+            targets: selected.map(p => p.target).join(','),
+            partial: String(platform !== 'all'),
+          };
+          appendFileSync(process.env.GITHUB_OUTPUT,
+            Object.entries(outputs).map(([key, value]) => `${key}=${value}\n`).join(''));
+          console.log(`CPU build targets: ${outputs.targets}; CPU artifact checks: ${cpu.map(p => p.target).join(',') || 'none'}; GPU artifact checks: ${outputs.run_cuda}`);
+          NODE
       - name: Validate the manifest and release ref
         id: version
         working-directory: rust
@@ -78,45 +133,69 @@ jobs:
         working-directory: rust
         run: node --test scripts/npm-*.test.mjs npm/meta/install.test.cjs
 
-  intel:
-    name: Verify Intel macOS first
-    needs: source
-    permissions:
-      contents: read
-    uses: ./.github/workflows/rust-package-build.yml
-    with:
-      target: darwin-x64
-      runner: macos-15-intel
-
   build:
     name: Build ${{ matrix.target }}
-    needs: [source, intel]
+    needs: source
     permissions:
       contents: read
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: darwin-arm64
-            runner: macos-14
-          - target: linux-x64-gnu
-            runner: ubuntu-24.04
-            gpu_runner: gpu-linux-t4
-          - target: linux-arm64-gnu
-            runner: ubuntu-24.04-arm
-          - target: win32-x64-msvc
-            runner: windows-2022
-            gpu_runner: gpu-windows-t4
+      matrix: ${{ fromJSON(needs.source.outputs.matrix) }}
     uses: ./.github/workflows/rust-package-build.yml
     with:
       target: ${{ matrix.target }}
-      runner: ${{ github.event_name == 'workflow_dispatch' && (inputs.cuda || inputs.publish) && matrix.gpu_runner || matrix.runner }}
-      runner_group: ${{ github.event_name == 'workflow_dispatch' && (inputs.cuda || inputs.publish) && matrix.gpu_runner && 'gpu-runners' || '' }}
-      cuda_e2e: ${{ github.event_name == 'workflow_dispatch' && (inputs.cuda || inputs.publish) && matrix.gpu_runner != '' && matrix.gpu_runner != null }}
+      runner: ${{ matrix.runner }}
+
+  artifact-gpu-smoke:
+    name: Verify CPU-built CUDA package on GPU (${{ matrix.target }})
+    if: needs.source.outputs.run_cuda == 'true'
+    needs: [source, build]
+    runs-on:
+      group: gpu-runners
+      labels: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.source.outputs.gpu_matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Verify the Linux GPU
+        if: runner.os == 'Linux'
+        run: nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
+      - name: Verify the Windows GPU
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
+          if ($LASTEXITCODE -ne 0) { throw "The GPU runner image has no working NVIDIA driver" }
+      - name: Download the native package built by this run
+        uses: actions/download-artifact@v8
+        with:
+          name: rust-native-${{ matrix.target }}
+          path: rust/dist/npm/release/tarballs
+      - name: Verify GGUF and ONNX CUDA without rebuilding
+        uses: ./.github/actions/cuda-cli-e2e
+        with:
+          target: ${{ matrix.target }}
 
   collect:
-    name: Collect downloadable release packages
-    needs: [source, intel, build]
+    name: Collect selected downloadable packages
+    # A deliberately skipped GPU job is allowed only when GPU validation was not requested.
+    if: >-
+      ${{ !cancelled() && needs.source.result == 'success' && needs.build.result == 'success' &&
+          ((needs.source.outputs.run_cuda == 'true' && needs.artifact-gpu-smoke.result == 'success') ||
+           (needs.source.outputs.run_cuda == 'false' && needs.artifact-gpu-smoke.result == 'skipped')) }}
+    needs: [source, build, artifact-gpu-smoke]
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -135,20 +214,25 @@ jobs:
           pattern: rust-native-*
           merge-multiple: true
           path: rust/dist/npm/release/tarballs
-      - name: Pack the exact-version meta package and verify the complete release
+      - name: Pack the exact-version meta package and verify selected artifacts
+        env:
+          BUILD_TARGETS: ${{ needs.source.outputs.targets }}
         run: |
           rustup show active-toolchain
-          npm run release:collect
-      - name: Upload all packages and download instructions
+          npm run release:collect -- --targets "$BUILD_TARGETS"
+      - name: Upload selected packages and download instructions
         uses: actions/upload-artifact@v7
         with:
-          name: rust-release-${{ needs.source.outputs.version }}
+          name: ${{ needs.source.outputs.artifact_name }}
           path: rust/dist/npm/release/tarballs/
           if-no-files-found: error
           retention-days: 14
 
   artifact-cpu-smoke:
     name: Verify CUDA artifacts on CPU (${{ matrix.target }})
+    if: >-
+      ${{ !cancelled() && needs.source.result == 'success' && needs.collect.result == 'success' &&
+          needs.source.outputs.has_cpu == 'true' }}
     needs: [source, collect]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -156,12 +240,7 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: linux-x64-gnu
-            runner: ubuntu-24.04
-          - target: win32-x64-msvc
-            runner: windows-2022
+      matrix: ${{ fromJSON(needs.source.outputs.cpu_matrix) }}
     defaults:
       run:
         working-directory: rust
@@ -180,7 +259,7 @@ jobs:
         run: npm install --global npm@11.21.0
       - uses: actions/download-artifact@v8
         with:
-          name: rust-release-${{ needs.source.outputs.version }}
+          name: ${{ needs.source.outputs.artifact_name }}
           path: rust/dist/npm/release/tarballs
       - name: Restore the real model cache
         uses: actions/cache@v5
@@ -240,7 +319,7 @@ jobs:
   publish:
     name: Publish verified candidates to rust-canary
     if: github.event_name == 'workflow_dispatch' && inputs.publish
-    needs: [source, collect, artifact-cpu-smoke]
+    needs: [source, collect, artifact-cpu-smoke, artifact-gpu-smoke]
     runs-on: ubuntu-22.04
     permissions:
       contents: read

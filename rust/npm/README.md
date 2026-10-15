@@ -95,29 +95,50 @@ Release order:
 6. Promote native `latest` tags and then the meta `latest` tag in a separate job,
    only after all five registry install/update/rollback jobs pass.
 
-`.github/workflows/rust-publish.yml` builds and installs every target on its
-native runner, checks CLI startup, managed-rg and actual daemon IPC, and collects
-the candidates into a downloadable artifact. Pushes to `main` and
+`.github/workflows/rust-publish.yml` builds and installs the selected targets on
+their native runners in parallel, checks CLI startup, managed-rg and actual
+daemon IPC, and collects the candidates into a downloadable artifact. The manual
+`platform` input defaults to `all`; each of the five target names can be selected
+individually.
+`publish=true` requires `platform=all`; a subset is a validation-only candidate,
+not a complete release. Pushes to `main` and
 `release/rust-*`, and manual runs with `publish=false, cuda=false`, use ordinary CPU runners;
 they do not allocate GPUs or publish packages. CUDA compilation still runs
 for the default Linux/Windows x64 bundles and does not require GPU hardware.
-Manual `cuda=true` runs switch these two targets to GPU runners and enable
-package-level GPU end-to-end validation even with `publish=false`. Publishing
-also enables GPU validation unconditionally, even if `cuda` was not selected.
-Intel macOS installation and runtime checks must pass before the other four
-platform builds start. Its ONNX Runtime with CoreML and zvec SDK are built from
+All packaging builds stay on ordinary CPU runners, including when `cuda=true`
+or `publish=true`. Manual `cuda=true` runs add separate Linux/Windows x64 GPU
+jobs that download the exact native npm artifacts from the same workflow run
+and perform package-level GPU end-to-end validation, without rebuilding or
+repacking. Publishing also enables GPU validation unconditionally, even if
+`cuda` was not selected. GPU validation must pass before candidate collection
+and npm publication; a failure leaves the per-platform build artifacts available.
+Intel macOS no longer gates the other platform builds. Its ONNX Runtime with
+CoreML and zvec SDK are built from
 pinned sources, cached, and bundled with the native package. The Intel release
 targets macOS 14 and later.
 
-After collection, independent Linux/Windows CPU jobs download and install the
+Build jobs select Cargo/CMake parallelism from the runner's available CPUs and
+total memory, budgeting 3 GiB per job and capping concurrency at 8. Both Linux
+CUDA containers receive the same limits. This is a conservative memory heuristic,
+not an OOM guarantee. Linux x64 and Windows x64 have a 180-minute timeout for the
+primary CUDA 13.1 build plus CUDA 12.4 fallback. Windows installs MSVC 14.38 before
+any compilation, then switches to that toolset only for the fallback build.
+
+All-platform runs produce `rust-release-<version>`; subset runs produce
+`rust-candidate-<version>` with only the selected native tarballs, the same
+exact-version meta tarball, checksums and a `release.json` marked `partial`.
+Publication and promotion reject partial candidates. After collection,
+independent CPU jobs for the selected Linux/Windows x64 targets download and install the
 exact native/meta tarballs offline, without rebuilding. They verify checksums,
 CLI startup, daemon IPC, and real GGUF/ONNX indexing and vector queries with
 explicit CPU selection and default CPU fallback, without CUDA host libraries.
 These checks also run for unpublished candidates and must pass before npm
 publication; failures retain the candidate and `cpu-artifact-evidence-*` logs.
 
-During publication, Linux x64 and Windows x64 compile and run CLI GPU tests on
-the hosted T4 runners. `rust-ci.yml` separately verifies the workspace and all
+The package GPU jobs use the hosted T4 runners with CUDA runtime libraries,
+not Rust/C++/CUDA compiler setup. They verify the downloaded native package's
+payload checksums and exercise both CUDA 12 fallback and CUDA 13 primary paths.
+`rust-ci.yml` separately verifies the workspace and all
 three real models using each platform's already-compiled test binary. Its manual
 `cuda_verify` input defaults to `false`. When enabled, Linux/Windows test jobs
 use GPU runners and compile with `zg/cuda` from the outset, then reuse those

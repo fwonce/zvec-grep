@@ -1,11 +1,11 @@
 name: Validate CUDA CLI package
-description: Install the just-built npm tarball and prove GGUF/ONNX CUDA execution.
+description: Install a downloaded npm artifact and prove GGUF/ONNX CUDA execution without rebuilding.
 inputs:
   target:
-    description: Native npm target built by this job.
+    description: Native npm target downloaded from the current workflow run.
     required: true
   package_directory:
-    description: Workspace-relative directory containing the platform tarball.
+    description: Workspace-relative directory containing the downloaded platform tarball.
     default: rust/dist/npm/release/tarballs
 runs:
   using: composite
@@ -17,17 +17,38 @@ runs:
         PACKAGE_DIRECTORY: ${{ inputs.package_directory }}
       working-directory: ${{ github.workspace }}
       run: |
-        import json, os, pathlib, subprocess
+        import os, pathlib, subprocess
         pattern = "zvec-zvec-grep-" + os.environ["TARGET"] + "-*.tgz"
         packages = list(pathlib.Path(os.environ["PACKAGE_DIRECTORY"]).glob(pattern))
         assert len(packages) == 1, "Expected exactly one platform tarball"
         subprocess.run(["npm.cmd" if os.name == "nt" else "npm", "install", "--prefix",
-                        "gpu-install", "--no-audit", "--no-fund", "--ignore-scripts",
+                        "gpu-install", "--offline", "--no-audit", "--no-fund", "--ignore-scripts",
                         str(packages[0].resolve())], check=True)
         package = pathlib.Path("gpu-install/node_modules/@zvec") / ("zvec-grep-" + os.environ["TARGET"])
-        metadata = json.loads((package / "package.json").read_text())
-        assert metadata["zvecGrep"]["variant"] == "cuda", "Expected CUDA npm package"
-        print(metadata["name"], metadata["version"], metadata["zvecGrep"])
+        subprocess.run(["node", "-e", """
+        const assert = require('node:assert/strict');
+        const { lstatSync, readFileSync } = require('node:fs');
+        const { basename, join } = require('node:path');
+        const { verifyPayload } = require('./rust/npm/meta/install.cjs');
+        const manifest = require('./rust/npm/platforms.json');
+        const entry = manifest.platforms.find(entry => entry.target === process.env.TARGET);
+        assert(entry && entry.defaultVariant === 'cuda', 'Expected a supported CUDA target');
+        const packageRoot = process.argv[1];
+        const metadata = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
+        assert.equal(metadata.name, entry.package);
+        assert.deepEqual(metadata.os, [entry.os]);
+        assert.deepEqual(metadata.cpu, [entry.cpu]);
+        assert.equal(metadata.zvecGrep?.variant, 'cuda', 'Expected CUDA npm package');
+        assert.deepEqual(metadata.zvecGrep.accelerators, ['cpu', 'cuda']);
+        assert.equal(basename(process.argv[2]),
+          `${entry.package.replace(/^@/, '').replaceAll('/', '-')}-${metadata.version}.tgz`);
+        for (const directory of ['bin', 'lib']) {
+          assert(lstatSync(join(packageRoot, directory)).isDirectory(),
+            `${directory} must be a real directory, not a symlink`);
+        }
+        verifyPayload(packageRoot, entry, metadata.version);
+        console.log('Verified native payload:', metadata.name, metadata.version, metadata.zvecGrep);
+        """, str(package), str(packages[0])], check=True)
     - name: Cache the two public test models
       uses: actions/cache@v5
       with:
@@ -58,13 +79,12 @@ runs:
       shell: powershell
       working-directory: ${{ github.workspace }}
       run: |
-        # Compilation installed both toolkits. Hide CUDA 13 for this test.
-        $cuda13 = $env:CUDA_PATH_V13_1
-        if ($cuda13) {
-          $env:PATH = (($env:PATH -split ';') | Where-Object {
-            -not $_.Trim('"').StartsWith($cuda13.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
-          }) -join ';'
-        }
+        # The runner image may already expose CUDA 13. Hide only its DLL search
+        # directories in this process; do not change the machine environment.
+        $env:PATH = (($env:PATH -split ';') | Where-Object {
+          $directory = $_.Trim().Trim('"')
+          $directory -and -not (Test-Path -LiteralPath (Join-Path $directory 'cublas64_13.dll') -PathType Leaf)
+        }) -join ';'
         python -c "import os,pathlib; assert not any((pathlib.Path(p)/'cublas64_13.dll').is_file() for p in os.environ['PATH'].split(os.pathsep) if p), 'CUDA 13 must be hidden for the fallback test'"
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         python rust/scripts/cuda/e2e.py --bundle gpu-install/node_modules/@zvec/zvec-grep-win32-x64-msvc --model-cache "$env:RUNNER_TEMP/zvec-grep-model-cache" --logs gpu-logs/cuda12 --expected-gguf-cuda 12.4
