@@ -3,8 +3,6 @@ run-name: Rust CUDA CI / ${{ inputs.ref }}
 
 # CUDA runners remain opt-in; publishing has its own package/GPU validation.
 on:
-  push:
-    branches: [codex/cuda-static-linking]
   workflow_dispatch:
     inputs:
       ref:
