@@ -520,13 +520,20 @@ GPU validation. Publishing always requires GPU validation regardless of `cuda`.
 CPU runners still compile the default CUDA-capable bundles. Linux x64 uses the pinned
 Ubuntu 24.04 CUDA builder image; Linux ARM64 uses its native runner. Windows
 installs pinned CUDA 13.1 and 12.4 toolchains on the selected build runner. Ordinary PR CI
-does not compile CUDA packages. The independent manual `rust-cuda-ci.yml` runs
-CUDA-enabled workspace checks, Clippy and tests, then reuses the compiled test
-binary for real ORT and llama.cpp CUDA model tests in the same platform job.
-Its `platform` input defaults to `all` (Linux and Windows); select `linux` or
-`windows` to run only that platform's GPU job against the reviewed ref.
-It verifies actual GPU execution without CPU fallback, does no npm packaging,
-and leaves Model2Vec in the non-CUDA model workflow.
+does not compile CUDA packages. `rust-ci.yml` is the single entry point for
+workspace and real-model verification. Push/PR runs use ordinary runners on
+Linux, macOS and Windows. Each test job compiles the workspace tests once and
+reuses the CLI and test binary for smoke checks and all three real models
+(Model2Vec, ORT and llama.cpp), without a separate build per model.
+For manual runs, `cuda_verify=true` switches Linux/Windows test jobs to GPU
+runners and enables `zg/cuda` from the first compilation. The same binaries
+then run the ordinary tests and real models, plus ORT/llama.cpp CUDA inference
+with actual GPU execution evidence and no CPU fallback. Model2Vec stays on CPU;
+macOS and the separate non-CUDA quality job remain unchanged. Quality, default
+tests and CUDA tests have separate build caches. `platform` defaults to `all`;
+select `linux` or `windows` to limit test platforms. Optional `ref` selects the
+reviewed source; otherwise the workflow's selected commit is used. All jobs
+check out the same resolved SHA. This workflow does no npm packaging or publishing.
 The current ONNX Runtime prebuilt libraries cannot link against
 Ubuntu 22.04's glibc and C++ runtime, so older Linux distributions are not
 covered by this release workflow.

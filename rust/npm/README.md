@@ -117,9 +117,14 @@ These checks also run for unpublished candidates and must pass before npm
 publication; failures retain the candidate and `cpu-artifact-evidence-*` logs.
 
 During publication, Linux x64 and Windows x64 compile and run CLI GPU tests on
-the hosted T4 runners. The separate manual `rust-cuda-ci.yml` checks and tests
-the CUDA-enabled workspace, then reuses its compiled test binary for real ORT
-and llama.cpp GPU model tests without packaging or publishing.
+the hosted T4 runners. `rust-ci.yml` separately verifies the workspace and all
+three real models using each platform's already-compiled test binary. Its manual
+`cuda_verify` input defaults to `false`. When enabled, Linux/Windows test jobs
+use GPU runners and compile with `zg/cuda` from the outset, then reuse those
+artifacts for the normal tests and additional ORT/llama.cpp CUDA verification.
+Model2Vec remains CPU-only and macOS remains non-CUDA. The ordinary quality job
+stays separate. `platform=linux` or `windows` limits test platforms; optional
+`ref` selects the reviewed source commit. These CI checks do not package or publish.
 Both packages share one llama/ggml core and include CUDA 13.1 and CUDA 12.4 GGUF
 plugins. The hash-verified official ONNX Runtime CUDA 12 core/providers are
 shared-library sidecars. The Windows CUDA package supports CPU and NVIDIA CUDA,
