@@ -14,6 +14,24 @@ spec.loader.exec_module(diagnostics)
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_existing_case_log_directory_can_run_the_complete_cli_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            logs = root / "logs"
+            logs.mkdir()
+            (logs / "runtime-path.txt").write_text("runtime")
+            selected = ('llama.cpp CUDA backend library selected cuda_version="13.1"\n'
+                        'llama.cpp GPU embedding backend selected backend=CUDA\n'
+                        'offloaded 25/25 layers to GPU\nIndex complete')
+            calls = [("", selected), ("Workspace index is ready local/embeddinggemma-300m", ""),
+                     ("gpu-fixture.md cuda_cli_e2e_marker", selected)]
+            with patch.object(diagnostics.cli, "run_zg", side_effect=calls) as run:
+                evidence = diagnostics.cli.run_case(root / "zg.exe", root / "models", root / "work",
+                                                    logs, "gguf", "local/embeddinggemma-300m", "13.1")
+                self.assertEqual(run.call_count, 3)
+                self.assertEqual(evidence["gguf_cuda"], "13.1")
+                self.assertEqual((logs / "runtime-path.txt").read_text(), "runtime")
+
     def test_timeout_inspects_live_child_before_termination(self):
         observed = []
         def inspect(process, *args):

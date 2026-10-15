@@ -87,7 +87,7 @@ def case_environment(work, backend):
 def run_case(binary, model_cache, work, logs, backend, model, expected_gguf_cuda):
     workspace = work / backend / "workspace"
     workspace.mkdir(parents=True)
-    logs.mkdir(parents=True)
+    logs.mkdir(parents=True, exist_ok=True)
     (workspace / "gpu-fixture.md").write_text(
         "# GPU validation fixture\n"
         "The heliotrope capacitor calibrates the observatory telescope.\n"
