@@ -201,7 +201,7 @@ def main():
         verify_cpu_host(logs)
     else:
         gpu = subprocess.check_output([
-            "nvidia-smi", "--query-gpu=name,compute_cap,driver_version", "--format=csv,noheader",
+            "nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader",
         ], encoding="utf-8")
         (logs / "gpu.txt").write_text(gpu, encoding="utf-8")
         print(gpu, flush=True)

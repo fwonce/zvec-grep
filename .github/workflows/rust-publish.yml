@@ -171,13 +171,13 @@ jobs:
           python-version: "3.12"
       - name: Verify the Linux GPU
         if: runner.os == 'Linux'
-        run: nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
+        run: nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
       - name: Verify the Windows GPU
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
-          if ($LASTEXITCODE -ne 0) { throw "The GPU runner image has no working NVIDIA driver" }
+          nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+          if ($LASTEXITCODE -ne 0) { throw "nvidia-smi GPU query failed (exit code $LASTEXITCODE)" }
       - name: Download the native package built by this run
         uses: actions/download-artifact@v8
         with:
