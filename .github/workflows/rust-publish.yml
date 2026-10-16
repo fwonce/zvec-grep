@@ -38,7 +38,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: rust-release-${{ github.ref }}
+  group: rust-release-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.platform || 'all' }}
   cancel-in-progress: false
 
 env:
@@ -172,12 +172,12 @@ jobs:
       - name: Verify the Linux GPU
         if: runner.os == 'Linux'
         run: nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
-      - name: Verify the Windows GPU
+      - name: Prepare and verify the Windows GPU driver without rebooting
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
-          if ($LASTEXITCODE -ne 0) { throw "nvidia-smi GPU query failed (exit code $LASTEXITCODE)" }
+          & rust/scripts/cuda/prepare-windows.ps1 -DriverOnly
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Download the native package built by this run
         uses: actions/download-artifact@v8
         with:

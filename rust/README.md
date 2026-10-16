@@ -534,6 +534,12 @@ selected Linux/Windows x64 native packages from the same run, verify their
 payload checksums, and run the packaged GGUF/ONNX GPU tests without compiling or
 repacking. These jobs install only the required runtime libraries, not build
 toolchains, and exercise the CUDA 12 fallback and CUDA 13 primary paths.
+Both Windows GPU workflows share `scripts/cuda/prepare-windows.ps1`: on the
+ephemeral runner it upgrades older drivers to the pinned NVIDIA Data Center
+591.59 driver, authenticates the installer signature, and verifies the active
+driver version plus CUDA Driver API initialization and device enumeration.
+A driver installer reboot requirement, an inactive upgrade, or failed CUDA
+initialization stops the job; the helper never reboots the runner.
 Publishing always requires GPU validation regardless of `cuda`. When requested,
 GPU validation must pass before artifact collection and npm publication; the
 per-platform artifacts are retained even if GPU validation fails.

@@ -165,13 +165,11 @@ jobs:
               environment.write(f"ZVEC_GREP_MODEL_CACHE={cache}\n")
               if os.environ["CUDA_VERIFY"] == "true":
                   environment.write("CARGO_BUILD_JOBS=2\nCMAKE_BUILD_PARALLEL_LEVEL=2\nCMAKE_CUDA_ARCHITECTURES=75\n")
-      - name: Prepare Windows CUDA build tools and inspect the GPU
+      - name: Prepare Windows GPU driver and CUDA build tools without rebooting
         if: matrix.cuda && runner.os == 'Windows'
         shell: powershell
         working-directory: ${{ github.workspace }}
         run: |
-          nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
-          if ($LASTEXITCODE -ne 0) { throw "nvidia-smi GPU query failed (exit code $LASTEXITCODE)" }
           & rust/scripts/cuda/prepare-windows.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Set up MSVC for CUDA
