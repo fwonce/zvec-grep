@@ -207,7 +207,11 @@ def main():
         print(gpu, flush=True)
     results, failures = {}, []
     devices = ("cpu", "default") if args.cpu_only else ("cuda",)
-    with tempfile.TemporaryDirectory(prefix="zg-cuda-e2e-") as temporary:
+    # Windows runners have a short RUNNER_TEMP; the user-profile temp directory
+    # leaves too little room for zvec's nested index paths. Keep Linux unchanged.
+    temporary_parent = (os.environ.get("RUNNER_TEMP") or None) if os.name == "nt" else None
+    temporary_prefix = "zg-" if os.name == "nt" else "zg-cuda-e2e-"
+    with tempfile.TemporaryDirectory(prefix=temporary_prefix, dir=temporary_parent) as temporary:
         for device in devices:
             for backend, model in MODELS:
                 if args.backend not in ("all", backend):
