@@ -89,6 +89,14 @@ jobs:
           # Keep each installer in a version-specific directory: the action's
           # uncached download directory cannot contain two CUDA versions.
           use-local-cache: true
+      - name: Configure Windows CUDA 13 runtime lookup
+        if: inputs.target == 'win32-x64-msvc'
+        shell: python
+        run: |
+          import os, pathlib, sys
+          sys.path.insert(0, "scripts/cuda")
+          from e2e import configure_windows_cuda_paths
+          configure_windows_cuda_paths(pathlib.Path(os.environ["CUDA_PATH"]))
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -227,6 +235,14 @@ jobs:
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
           use-local-cache: true
+      - name: Configure Windows CUDA 12 runtime lookup
+        if: inputs.target == 'win32-x64-msvc'
+        shell: python
+        run: |
+          import os, pathlib, sys
+          sys.path.insert(0, "scripts/cuda")
+          from e2e import configure_windows_cuda_paths
+          configure_windows_cuda_paths(pathlib.Path(os.environ["CUDA_PATH"]))
       - name: Use the CUDA 12.4 compatible MSVC toolset
         if: inputs.target == 'win32-x64-msvc'
         uses: ilammy/msvc-dev-cmd@v1

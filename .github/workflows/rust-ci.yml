@@ -186,6 +186,14 @@ jobs:
           method: network
           sub-packages: '["cudart", "cublas", "curand", "cufft", "nvrtc"]'
           use-local-cache: true
+      - name: Configure Windows CUDA 12 runtime lookup
+        if: matrix.cuda && runner.os == 'Windows'
+        shell: python
+        run: |
+          import os, pathlib, sys
+          sys.path.insert(0, "scripts/cuda")
+          from e2e import configure_windows_cuda_paths
+          configure_windows_cuda_paths(pathlib.Path(os.environ["CUDA_PATH"]))
       - name: Install pinned Windows cuDNN
         if: matrix.cuda && runner.os == 'Windows'
         shell: powershell
@@ -208,7 +216,10 @@ jobs:
         if: matrix.cuda && runner.os == 'Windows'
         shell: python
         run: |
-          import os, pathlib, re, subprocess
+          import os, pathlib, re, subprocess, sys
+          sys.path.insert(0, "scripts/cuda")
+          from e2e import configure_windows_cuda_paths
+          configure_windows_cuda_paths(pathlib.Path(os.environ["CUDA_PATH"]))
           compiler = pathlib.Path(os.environ["CUDA_PATH"]) / "bin" / "nvcc.exe"
           result = subprocess.run([str(compiler), "--version"], capture_output=True, text=True)
           print(result.stdout + result.stderr, flush=True)
@@ -320,6 +331,19 @@ jobs:
           if os.name == "nt":
               with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as search_path:
                   search_path.write("\n".join(directories) + "\n")
+      - name: Load the compiled Windows CUDA plugin and its dependencies
+        if: matrix.cuda && runner.os == 'Windows'
+        shell: python
+        run: |
+          import json, pathlib, sys
+          sys.path.insert(0, "scripts/cuda")
+          from e2e import verify_windows_cuda_plugin
+          records = [json.loads(line) for line in pathlib.Path("target/ci-tests.json").read_text(encoding="utf-8").splitlines()]
+          plugins = {pathlib.Path(record["out_dir"]) / "backends" / "ggml-cuda.dll" for record in records
+                     if record.get("reason") == "build-script-executed"
+                     and "llama-cpp-sys-2" in record.get("package_id", "")}
+          assert len(plugins) == 1, f"Expected one active llama.cpp CUDA plugin from Cargo: {plugins}"
+          verify_windows_cuda_plugin(plugins.pop(), 13, pathlib.Path("model-logs/windows-loader"))
       - name: Run workspace tests
         if: ${{ !matrix.cuda || runner.os != 'Linux' }}
         shell: python

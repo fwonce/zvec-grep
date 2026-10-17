@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 
 
@@ -16,6 +17,86 @@ MODELS = (
     ("onnx", "local/all-minilm-l6-v2"),
 )
 MARKER = "cuda_cli_e2e_marker"
+
+
+def configure_windows_cuda_paths(root):
+    """CUDA 13 puts runtime DLLs in bin/x64; older toolkits use bin."""
+    root = Path(root).resolve(strict=True)
+    directories = [directory for directory in (root / "bin" / "x64", root / "bin")
+                   if directory.is_dir()]
+    if not directories:
+        raise RuntimeError(f"No CUDA runtime directories under {root}")
+    paths = [str(directory) for directory in directories]
+    existing = os.environ.get("PATH", "").split(os.pathsep)
+    added = {path.casefold() for path in paths}
+    os.environ["PATH"] = os.pathsep.join(paths + [path for path in existing
+                                                if path and path.casefold() not in added])
+    # The current Python process and subsequent Actions steps both need the fix.
+    if os.environ.get("GITHUB_PATH"):
+        with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as output:
+            output.write("\n".join(paths) + "\n")
+    print(f"CUDA DLL search directories: {paths}", flush=True)
+
+
+def verify_windows_cuda_plugin(plugin, cuda_major, logs, library_directories=()):
+    """Load each dependency and the plugin in separate processes, without inference."""
+    if os.name != "nt":
+        raise RuntimeError("Windows CUDA DLL validation requires Windows")
+    plugin = Path(plugin).resolve()
+    logs = Path(logs)
+    logs.mkdir(parents=True, exist_ok=True)
+    environment = dict(os.environ)
+    # Packaged zg adds its sibling lib directory through its Windows DLL hook.
+    # Rust test executables instead inherit the directories prepared by Rust CI.
+    paths = [str(Path(directory).resolve()) for directory in library_directories]
+    environment["PATH"] = os.pathsep.join([*paths, environment.get("PATH", "")])
+    evidence = {"plugin": str(plugin), "cuda_major": cuda_major,
+                "path": environment["PATH"], "checks": []}
+    probe = """
+import ctypes, sys
+library = ctypes.CDLL(sys.argv[1], winmode=0)
+if sys.argv[2] == 'plugin':
+    getattr(library, 'ggml_backend_init')
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+get_path = kernel32.GetModuleFileNameW
+get_path.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint]
+get_path.restype = ctypes.c_uint
+path = ctypes.create_unicode_buffer(32768)
+if not get_path(library._handle, path, len(path)):
+    raise ctypes.WinError(ctypes.get_last_error())
+print(path.value)
+"""
+    failures = []
+    try:
+        if not plugin.is_file():
+            raise RuntimeError(f"CUDA plugin was not built or packaged: {plugin}")
+        libraries = ["nvcuda.dll", f"cudart64_{cuda_major}.dll",
+                     f"cublasLt64_{cuda_major}.dll", f"cublas64_{cuda_major}.dll", str(plugin)]
+        for library in libraries:
+            # Never preload dependencies in the plugin's process: that could mask
+            # a broken search path. winmode=0 matches llama.cpp's LoadLibraryW.
+            try:
+                result = subprocess.run([sys.executable, "-c", probe, library,
+                                         "plugin" if library == str(plugin) else "runtime"],
+                                        env=environment, capture_output=True, text=True,
+                                        timeout=60, check=False)
+                check = {"library": library, "returncode": result.returncode,
+                         "stdout": result.stdout, "stderr": result.stderr}
+            except subprocess.TimeoutExpired:
+                check = {"library": library, "returncode": None,
+                         "stdout": "", "stderr": "DLL loading timed out after 60 seconds"}
+            evidence["checks"].append(check)
+            print(json.dumps(check, ensure_ascii=False), flush=True)
+            if check["returncode"] != 0:
+                failures.append(library)
+        if failures:
+            raise RuntimeError(f"Windows CUDA DLL loading failed: {', '.join(failures)}")
+    except (OSError, RuntimeError) as error:
+        evidence["error"] = str(error)
+        raise
+    finally:
+        (logs / "windows-cuda-load.json").write_text(
+            json.dumps(evidence, indent=2), encoding="utf-8")
 
 
 def cuda_evidence(stderr, backend, expected_gguf_cuda=None):
@@ -205,6 +286,11 @@ def main():
         ], encoding="utf-8")
         (logs / "gpu.txt").write_text(gpu, encoding="utf-8")
         print(gpu, flush=True)
+        if os.name == "nt":
+            plugin_dir = lib_dir / "cuda12" if args.expected_gguf_cuda == "12.4" else lib_dir
+            verify_windows_cuda_plugin(plugin_dir / "ggml-cuda.dll",
+                                       args.expected_gguf_cuda.split(".")[0], logs,
+                                       library_directories=(lib_dir,))
     results, failures = {}, []
     devices = ("cpu", "default") if args.cpu_only else ("cuda",)
     # Windows runners have a short RUNNER_TEMP; the user-profile temp directory
