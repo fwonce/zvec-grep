@@ -11,7 +11,8 @@ import shutil
 import subprocess
 
 WORKSPACE = Path(__file__).resolve().parents[2]
-DEFAULT_ARCHITECTURES = "75-real;80-real;86-real;89-real;90-real;90-virtual"
+# Keep the CUDA 12 compatibility plugin small: PTX plus native code for sm_86.
+DEFAULT_ARCHITECTURES = "50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real"
 
 
 def configure(source, build, cuda_root, architectures):
@@ -42,7 +43,9 @@ def build_plugin(bundle, cuda_root, target):
         ["cargo", "metadata", "--locked", "--format-version", "1"], cwd=WORKSPACE, encoding="utf-8"))
     package = next(p for p in metadata["packages"] if p["name"] == "llama-cpp-sys-2")
     source = Path(package["manifest_path"]).parent / "llama.cpp"
-    architectures = os.environ.get("CMAKE_CUDA_ARCHITECTURES") or DEFAULT_ARCHITECTURES
+    # The primary build exports CMAKE_CUDA_ARCHITECTURES; do not inherit it.
+    architectures = os.environ.get("CUDA12_ARCHITECTURES") or DEFAULT_ARCHITECTURES
+    print(f"CUDA 12.4 fallback architectures: {architectures}", flush=True)
     configuration = configure(source, target, cuda_root, architectures)
     key = hashlib.sha256((package["id"] + version + repr(configuration)).encode()).hexdigest()[:16]
     build = target / "ggml-cuda12" / key

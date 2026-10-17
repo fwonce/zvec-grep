@@ -378,9 +378,13 @@ toolsets before running `scripts/cuda/build-fallback.py`.
 
 For reproducibility, CI uses the pinned CUDA 13.1.1/Ubuntu 24.04 builder in
 `scripts/cuda/cuda-builder.Dockerfile`, then the CUDA 12.4.1/Ubuntu 22.04 builder for
-the fallback plugin only. Distribution builds use
-`75-real;80-real;86-real;89-real;90-real;90-virtual`. Override
-`CMAKE_CUDA_ARCHITECTURES` only for a deliberately narrower test build.
+the fallback plugin only. CUDA 13.1 distribution builds use
+`75-real;80-real;86-real;89-real;90-real;90-virtual`. The CUDA 12.4 fallback uses
+`50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real` to reduce its
+size, retaining PTX for driver JIT compilation where compatible native code is
+unavailable. Override `CMAKE_CUDA_ARCHITECTURES` for the primary backend or
+`CUDA12_ARCHITECTURES` for the fallback only when deliberately customizing a
+build. The fallback does not inherit the primary backend's architecture list.
 
 The package contains `bin/zg[.exe]`, with all shared libraries, plugins and
 dictionaries under `lib/`. GGUF loads the CUDA 13.1 plugin first, then the
