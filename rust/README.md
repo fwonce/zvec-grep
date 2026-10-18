@@ -433,9 +433,11 @@ npm run test:package
 The build uses the published `zvec-rust` and `zvec-rust-build` 0.7.2 crates,
 without a local wrapper patch. Their bundled native library tracks upstream zvec
 at [`1ab7975`](https://github.com/alibaba/zvec/commit/1ab7975dfc2d2160054bafff614831b7099cd930)
-(53 commits after v0.7.0). The build stages the shared library and
-`data/jieba_dict` resources beside the executable. Both local and release
-packages include these SDK assets; the engine uses the bundled dictionary.
+(53 commits after v0.7.0). The Cargo build stages the shared library and
+`data/jieba_dict` resources beside the executable in the build output directory.
+Local and release npm packages place the executable in `bin/` and these SDK
+assets in `lib/`; the engine resolves the bundled dictionary from
+`lib/data/jieba_dict`, including with Windows delay-loaded DLLs.
 
 Pass `--no-build` after `--` to reuse the last successful npm build (or a plain
 Cargo `target/release/zg` when no build record exists), or pass
@@ -527,7 +529,9 @@ gh workflow run rust-publish.yml --ref <branch> \
 
 Partial selections produce validation-only candidates and cannot be published;
 `publish=true` requires `platform=all`. Push-triggered runs still build all five
-platforms on ordinary CPU runners.
+platforms on ordinary CPU runners. Runs use branch-plus-platform concurrency
+groups: different platform selections can run concurrently, while an in-progress
+run in the same group is not cancelled by a newer run.
 
 Pushes to `main` and `release/rust-*` start candidate packaging on CPU runners,
 as do manual runs with both `publish=false` and `cuda=false`; they do not publish
@@ -536,7 +540,7 @@ to npm. Packaging always compiles on CPU runners, including when `cuda=true` or
 publishing. Separate jobs on `gpu-linux-t4` and `gpu-windows-t4` download the
 selected Linux/Windows x64 native packages from the same run, verify their
 payload checksums, and run the packaged GGUF/ONNX GPU tests without compiling or
-repacking. These jobs install only the required runtime libraries, not build
+repacking. These jobs install the required runtime libraries, not build
 toolchains, and exercise the CUDA 12 fallback and CUDA 13 primary paths.
 Both Windows GPU workflows share `scripts/cuda/prepare-windows.ps1`: on the
 ephemeral runner it upgrades older drivers to the pinned NVIDIA Data Center
@@ -544,6 +548,10 @@ ephemeral runner it upgrades older drivers to the pinned NVIDIA Data Center
 driver version plus CUDA Driver API initialization and device enumeration.
 A driver installer reboot requirement, an inactive upgrade, or failed CUDA
 initialization stops the job; the helper never reboots the runner.
+Windows CUDA library lookup includes both toolkit `bin` and CUDA 13 `bin/x64`
+directories. Workspace and package GPU checks independently load the selected
+GGUF plugin and its dependencies before inference; this CI setup does not change
+the package's host CUDA runtime requirements.
 Publishing always requires GPU validation regardless of `cuda`. When requested,
 GPU validation must pass before artifact collection and npm publication; the
 per-platform artifacts are retained even if GPU validation fails.

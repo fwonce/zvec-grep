@@ -21,11 +21,15 @@ LICENSES/
 SBOM.spdx.json
 ```
 
+`LICENSES/` and `SBOM.spdx.json` require reviewed per-target compliance inputs;
+validation candidates may omit them, but publication and promotion may not.
+
 `bin/` contains only the native executable. All runtime libraries, providers,
 plugins, and dictionaries live under `lib/`. Unix binaries use a `../lib`
 rpath. Windows uses a native MSVC delay-load hook to resolve DLLs from the
 executable's sibling `lib/`. The binary runs directly, without a JavaScript
-launcher or user-provided loader environment variables.
+launcher or custom loader environment variables for bundled libraries. Host
+NVIDIA libraries must still be discoverable by the system loader.
 
 Non-CUDA builds enable ORT's upstream `copy-dylibs` feature to stage runtime
 sidecars beside the Cargo executable. npm packaging copies them into `lib/`
@@ -68,8 +72,21 @@ when GGUF uses CUDA 13; the two runtime families can coexist. NVIDIA driver,
 CUDA runtime, cuBLAS and cuDNN remain host dependencies, not bundled libraries.
 macOS keeps its existing ONNX CPU routing because of CoreML regressions.
 Linux musl, Windows ARM64, CUDA on ARM64/macOS and Vulkan packages are not in
-the release matrix. CUDA builds target SM 75/80/86/89/90 plus compute_90 PTX;
-this is not a claim that every newer GPU has been tested.
+the release matrix.
+
+The CUDA 13.1 primary GGUF plugin uses
+`75-real;80-real;86-real;89-real;90-real;90-virtual`. The CUDA 12.4 fallback uses
+`50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real`: PTX plus native
+SM86 code, reducing installed size while retaining driver JIT compilation where
+compatible native code is unavailable. `CMAKE_CUDA_ARCHITECTURES` overrides the
+primary build; `CUDA12_ARCHITECTURES` overrides only the fallback, which does not
+inherit the primary list. These build targets do not imply hardware validation
+on every GPU generation.
+
+On Windows, CUDA 13 runtime DLLs reside under the toolkit's `bin/x64`, while
+older toolkits use `bin`. The required host runtime directories must be visible
+to the loader (for example, through PATH); the package's sibling `lib/` lookup
+does not install or locate missing NVIDIA runtime dependencies automatically.
 
 The meta package locks every platform package to its exact version through
 `optionalDependencies`. Its `postinstall` selects the installed package,
@@ -112,6 +129,9 @@ and perform package-level GPU end-to-end validation, without rebuilding or
 repacking. Publishing also enables GPU validation unconditionally, even if
 `cuda` was not selected. GPU validation must pass before candidate collection
 and npm publication; a failure leaves the per-platform build artifacts available.
+Runs use branch-plus-platform concurrency groups, allowing different platform
+selections on the same branch to run concurrently without cancelling an
+in-progress run in the same group.
 Intel macOS no longer gates the other platform builds. Its ONNX Runtime with
 CoreML and zvec SDK are built from
 pinned sources, cached, and bundled with the native package. The Intel release
@@ -138,6 +158,12 @@ publication; failures retain the candidate and `cpu-artifact-evidence-*` logs.
 The package GPU jobs use the hosted T4 runners with CUDA runtime libraries,
 not Rust/C++/CUDA compiler setup. They verify the downloaded native package's
 payload checksums and exercise both CUDA 12 fallback and CUDA 13 primary paths.
+Windows GPU jobs also prepare the pinned NVIDIA 591.59 driver when an older
+driver is active, verify the installer signature and CUDA initialization, and fail on a
+reboot requirement instead of rebooting. Both Rust CI and package GPU validation
+configure the CUDA DLL search paths and check plugin/dependency loading before
+inference. These steps prepare temporary CI runners, not end-user npm installs;
+see [Windows GPU runner preparation](../CONTRIBUTING.md#windows-gpu-runner-preparation).
 `rust-ci.yml` separately verifies the workspace and all
 three real models using each platform's already-compiled test binary. Its manual
 `cuda_verify` input defaults to `false`. When enabled, Linux/Windows test jobs

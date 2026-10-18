@@ -77,46 +77,71 @@ assemble the primary bundle, `build-fallback.py` adds only the CUDA 12.4 plugin,
 and the two pinned requirements files provision Windows build/runtime tools.
 `cuda-builder.Dockerfile` provides the shared Linux CUDA build environment for
 source CI and package builds.
-`e2e.py` validates installed packages on a real GPU. CUDA validation consists
-of actual compilation, linkage audits and GPU end-to-end execution; ordinary
-PR CI retains the npm packaging tests without a separate CUDA mock-test suite.
+`e2e.py` validates installed packages on a real GPU or, with `--cpu-only`, on a
+host without loadable CUDA libraries. CUDA validation consists of actual
+compilation, linkage audits and GPU end-to-end execution; ordinary PR CI retains
+the npm packaging tests without a separate CUDA mock-test suite.
 
-`Rust CUDA CI` (`.github/workflows/rust-cuda-ci.yml`) only runs through
-`workflow_dispatch`. Select a reviewed source ref and check `confirm_reviewed`.
-The workflow resolves the ref once to a SHA, then runs formatting, CUDA-enabled
-workspace checks, Clippy, test compilation, workspace tests, a CLI smoke test and
-both real model tests in one job per platform on `gpu-linux-t4` and
-`gpu-windows-t4` in `gpu-runners`.
-It targets T4 (SM 75), does not call `rust-package-build.yml`, and does not build
-or install npm packages. It is not a substitute for package-level GPU validation.
+### Workspace and real-model CI
 
-The model stage reuses the `zg-engine` test executable from the workspace build,
-without invoking Cargo or compiling again for either model. It runs the existing
-ignored real-model test with `ZVEC_GREP_SMOKE_DEVICE=cuda` for Transformers/ORT
-(`local/all-minilm-l6-v2`) and llama.cpp (`local/embeddinggemma-300m`) on Linux and
-Windows x64, sequentially within each platform job. Linux uses separate CUDA 12/
-cuDNN and CUDA 13 runtime containers for the same compiled test executable;
-Windows installs both runtimes before building. Model2Vec stays in `Rust Models CI`
-because it has no CUDA backend.
-The test downloads, loads and embeds with each model, checks vector dimensions
-and finite/nonzero output, and reuses the CLI validator to require CUDA graph
-placement or positive GGUF layer offload without CPU fallback. Logs are retained
-as `cuda-model-evidence-*`, including on failure. Either model failing fails the
-platform job; the original CPU model test coverage is unchanged.
+`Rust CI` (`.github/workflows/rust-ci.yml`) is the single entry point for
+workspace and real-model verification. Push/PR runs use ordinary Linux, macOS
+and Windows runners. The independent non-CUDA quality job runs formatting,
+per-package checks, Clippy and npm packaging tests. Each test job compiles the
+workspace tests once, runs the tests and CLI smoke check, and reuses the compiled
+`zg-engine` test binary for all three real models without a separate Cargo build
+per model.
 
-`Publish Rust packages` handles package-level validation. Pushes to `main` and
+For manual `workflow_dispatch`, set `cuda_verify=true` to move the selected
+Linux/Windows test jobs to `gpu-linux-t4` and `gpu-windows-t4` in `gpu-runners`.
+`platform` accepts `all` (the default), `linux`, or `windows`. Optional `ref`
+selects the reviewed source; otherwise the workflow's selected commit is used.
+The source job resolves it once to a SHA for all subsequent checkouts.
+CUDA test jobs enable `zg/cuda` from the first compilation and target T4 (SM 75).
+The quality job remains non-CUDA, and macOS stays non-CUDA when `platform=all`.
+This workflow does not call `rust-package-build.yml` or build/install npm packages;
+it is not a substitute for package-level GPU validation.
+
+The model stage runs the existing ignored real-model test for Model2Vec
+(`local/potion-code-16m-v2`), Transformers/ORT (`local/all-minilm-l6-v2`) and
+llama.cpp (`local/embeddinggemma-300m`). CUDA jobs additionally run ORT and GGUF
+with `ZVEC_GREP_SMOKE_DEVICE=cuda`, sequentially within each platform job;
+Model2Vec remains CPU-only. Linux uses separate CUDA 12/cuDNN and CUDA 13 runtime
+containers for these GPU cases, with the same compiled test executable. Windows
+installs both runtime families before compiling the CUDA-enabled tests.
+The test downloads, loads and embeds with each model and checks vector dimensions
+and finite/nonzero output. CUDA jobs also reuse the CLI validator to require CUDA
+graph placement or positive GGUF layer offload without CPU fallback. Logs are
+retained as `real-model-evidence-<platform>-<cuda|default>`, including on failure.
+Any failed model case or CUDA evidence assertion fails the platform job.
+
+### Package validation
+
+`Publish Rust packages` (`.github/workflows/rust-publish.yml`) handles
+package-level validation. Pushes to `main` and
 `release/rust-*`, and manual runs with both `publish=false` and `cuda=false`,
 build/audit/package on ordinary CPU runners without allocating GPUs or publishing
-to npm. Set `cuda=true` with `publish=false` to validate GPU packaging without
-publishing. Either `cuda=true` or `publish=true` switches the Linux/Windows x64
-jobs to GPU runners and enables `.github/actions/cuda-cli-e2e`; publication cannot
-bypass GPU validation by leaving `cuda` unchecked. These jobs compile, audit, pack, install and
-exercise their own CUDA npm packages with the full release architecture list.
-CPU runner selection does not change the default CUDA-capable package variant.
+to npm. Compilation always stays on CPU runners, including when `cuda=true` or
+`publish=true`; Linux/Windows x64 still build the default CUDA-capable bundles.
+Set `cuda=true,publish=false` to add GPU validation without publishing.
+Separate GPU jobs download the exact native npm artifacts from the same run and
+invoke `.github/actions/cuda-cli-e2e`, without rebuilding or repacking. Publication
+always requires these GPU checks, even when `cuda` is unchecked. Requested GPU
+validation must pass before collection; failures retain uploaded native packages
+but block collection and publication.
 
-After collection, separate Linux/Windows x64 CPU jobs download the same release
-artifact, verify tarball SHA256 values, and install native plus meta tarballs
-offline into a fresh prefix without rebuilding or repacking. They verify CLI and
+The manual `platform` input selects `all` (the default) or one of `darwin-arm64`,
+`darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`, and `win32-x64-msvc`.
+Selected platforms compile in parallel; Intel macOS does not gate the others.
+All-platform runs collect `rust-release-<version>`; a single-platform run collects
+`rust-candidate-<version>` with `partial: true` in `release.json`. The latter is
+validation-only and cannot be published or promoted; `publish=true` requires
+`platform=all`. Each collected artifact includes the selected native tarballs,
+the exact-version meta tarball, checksums and installation instructions.
+
+After collection, separate CPU jobs for the selected Linux/Windows x64 targets
+download that artifact, verify tarball SHA256 values, and install native plus
+meta tarballs offline into a fresh prefix without rebuilding or repacking. They verify CLI and
 daemon IPC, then run `scripts/cuda/e2e.py --cpu-only` against the installed meta
 package. This checks both explicit `--device cpu` and default automatic CPU
 fallback for real GGUF/ONNX indexing and vector queries. Linux uses a plain
@@ -136,10 +161,11 @@ not claim every ONNX operator runs on GPU.
 
 Per-command stdout/stderr, GPU/driver details and a machine-readable result are
 retained as `cuda-cli-evidence-*` artifacts, including when a model fails. Model
-caches are reused, and concurrent runs of the same CUDA CI workflow are queued.
-Ordinary `Rust CI` runs non-CUDA builds/tests. Release builds can compile CUDA
-packages on CPU runners. Package-level GPU execution requires `cuda=true` or
-`publish=true`; npm publication still requires an explicit `publish=true` run.
+caches are reused. Package runs share a concurrency group only for the same
+branch and platform selection; different platform selections can run concurrently.
+An in-progress run is not cancelled by a newer run in its group. npm publication
+still requires an explicit `publish=true` run and the release gates documented
+in [npm distribution](npm/README.md).
 
 To reproduce against an unpacked/installed CUDA bundle (Python 3.12 recommended):
 
@@ -147,15 +173,33 @@ To reproduce against an unpacked/installed CUDA bundle (Python 3.12 recommended)
 python scripts/cuda/e2e.py --bundle /path/to/package --model-cache /path/to/models --logs /path/to/logs --expected-gguf-cuda 13.1
 ```
 
-Both platforms first run GGUF and ONNX with only CUDA 12/cuDNN 9 visible,
-requiring GGUF to select the CUDA 12.4 fallback. Linux then runs GGUF in a separate
-CUDA 13.1 container. Windows hides the compiler toolkit's CUDA 13 DLL directory
-from PATH for the fallback test, then restores CUDA 13.1 and reruns both models,
-requiring the GGUF primary plugin and ONNX CUDA 12 provider to coexist. Logs must
-prove the expected GGUF plugin as well as actual GPU/provider selection.
-The Windows job provisions VS 2022 C++ tools (including MSVC 14.38), a pinned
-libclang wheel and the repository-pinned Rust toolchain on the Data Science VM.
-The job only inspects the runner's existing NVIDIA driver; CI never downloads,
-upgrades or reboots a driver. Fix an incompatible runner image outside the job.
-The Linux image must supply a compatible driver and NVIDIA container support.
-Driver/runtime failures never count as successful CPU execution.
+Package GPU jobs first run GGUF and ONNX with CUDA 12.8.1/cuDNN 9 visible,
+requiring GGUF to select the plugin built with CUDA 12.4. Linux then runs GGUF in
+a separate CUDA 13.1 runtime container. Windows hides any CUDA 13 cuBLAS DLL
+directories from PATH for the fallback test, then installs CUDA 13.1 runtime
+libraries and reruns both models, requiring the GGUF primary plugin and ONNX
+CUDA 12 provider to coexist. Logs must prove the expected GGUF plugin and actual
+GPU/provider selection. See [Native and CUDA builds](README.md#native-and-cuda-builds)
+for the distinct primary and fallback distribution architecture lists.
+
+### Windows GPU runner preparation
+
+Both GPU workflows use `scripts/cuda/prepare-windows.ps1` on the ephemeral Windows
+runner. It upgrades older NVIDIA drivers to the pinned Data Center 591.59 driver,
+authenticates the installer signature, and verifies the active driver version,
+CUDA Driver API initialization and device enumeration. A reboot requirement, an
+inactive upgrade or failed CUDA initialization fails the job explicitly; the
+helper never reboots the runner.
+
+The Rust CI CUDA test job also provisions VS 2022 C++ tools (including MSVC 14.38),
+a pinned libclang wheel and the repository-pinned Rust toolchain. Package GPU
+jobs call the helper with `-DriverOnly` and install only runtime libraries, not
+Rust/C++/CUDA build toolchains. This provisioning is not part of npm installation.
+Both paths configure CUDA DLL lookup, including CUDA 13's `bin/x64` as well as
+`bin`, and independently load the selected GGUF CUDA plugin and its dependencies
+before real inference. DLL-load evidence is saved in `windows-cuda-load.json`
+inside the corresponding model/package evidence artifact. Windows package E2E
+uses a short `RUNNER_TEMP` workspace; it does not alter zg/zvec long-path handling.
+Linux GPU runners must supply a compatible driver and NVIDIA container support.
+CPU fallback after a driver/runtime failure does not count as successful GPU
+validation.
