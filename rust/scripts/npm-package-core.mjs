@@ -1,13 +1,58 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { createReadStream, createWriteStream, readFileSync } from "node:fs";
 import { copyFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { pipeline } from "node:stream/promises";
 
 const scriptPath = fileURLToPath(import.meta.url);
 export const workspaceDir = resolve(dirname(scriptPath), "..");
 export const npmManifestPath = join(workspaceDir, "npm", "platforms.json");
+// npm embeds tarballs as base64 in a JSON string. Stay comfortably below the
+// ~384 MiB tarball ceiling imposed by 64-bit Node's ~512 MiB string limit.
+export const MAX_NPM_TARBALL_BYTES = 350 * 1024 * 1024;
+
+export async function verifyTarballSize(path) {
+  const { size } = await stat(path);
+  if (size > MAX_NPM_TARBALL_BYTES) {
+    throw new Error(`npm tarball exceeds 350 MiB publication budget: ${path} (${size} bytes); split the payload before publishing`);
+  }
+  return size;
+}
+
+// Dependencies must be published before their platform package; meta is last.
+export function nativePackageEntries(entry) {
+  return [
+    ...(entry.components ?? []).map((component) => ({
+      name: component.package, target: entry.target, component: component.package,
+    })),
+    { name: entry.package, target: entry.target },
+  ];
+}
+
+export function componentDependencies(entry, version) {
+  return Object.fromEntries((entry.components ?? []).map((component) => [component.package, version]));
+}
+
+// Split by byte range, not by loading a potentially >512 MiB ORT library into
+// memory. Reassembly is byte-for-byte and verified against the original hash.
+export async function stageComponentPayload(sourceRoot, destinationRoot, entry, component) {
+  const siblings = entry.components.filter((candidate) => candidate.file === component.file);
+  const index = siblings.indexOf(component);
+  if (index < 0) throw new Error("unknown native component");
+  const source = join(sourceRoot, component.file);
+  const metadata = await stat(source);
+  if (!metadata.isFile() || metadata.size < siblings.length) {
+    throw new Error(`invalid component source: ${source}`);
+  }
+  const start = Math.floor(metadata.size * index / siblings.length);
+  const end = Math.floor(metadata.size * (index + 1) / siblings.length) - 1;
+  const destination = join(destinationRoot, component.payload);
+  await mkdir(dirname(destination), { recursive: true });
+  await pipeline(createReadStream(source, { start, end }), createWriteStream(destination, { mode: metadata.mode }));
+  return { bytes: end - start + 1, sha256: await sha256File(destination) };
+}
 
 export function loadReleaseManifest() {
   const manifest = JSON.parse(readFileSync(npmManifestPath, "utf8"));
@@ -44,6 +89,19 @@ export function loadReleaseManifest() {
     }
     targets.add(entry.target);
     packages.add(entry.package);
+    if (entry.components !== undefined && (!Array.isArray(entry.components) || entry.defaultVariant !== "cuda")) {
+      throw new Error(`invalid native components for ${entry.target}`);
+    }
+    for (const component of entry.components ?? []) {
+      if (typeof component.package !== "string" || !component.package.startsWith(`${entry.package}-`) ||
+          !/^@[a-z0-9-]+\/[a-z0-9-]+$/.test(component.package) || packages.has(component.package) ||
+          !/^lib\/[a-zA-Z0-9_./-]+$/.test(component.file) ||
+          !/^(lib|parts)\/[a-zA-Z0-9_./-]+$/.test(component.payload) ||
+          [component.file, component.payload].some((path) => path.split("/").some((part) => !part || part === "." || part === ".."))) {
+        throw new Error(`invalid or duplicate native component for ${entry.target}`);
+      }
+      packages.add(component.package);
+    }
   }
   return manifest;
 }
@@ -195,9 +253,14 @@ export function npmEnvironment(cacheDir) {
   };
 }
 
+export async function hashFile(path, algorithm = "sha256", encoding = "hex") {
+  const hash = createHash(algorithm);
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest(encoding);
+}
+
 export async function sha256File(path) {
-  const contents = await readFile(path);
-  return createHash("sha256").update(contents).digest("hex");
+  return hashFile(path);
 }
 
 // Keep every runtime library and its data below lib/. Windows uses the native

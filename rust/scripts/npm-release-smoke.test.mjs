@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { defaultReleaseVariant, loadReleaseManifest, selectPlatform, sha256File } from "./npm-package-core.mjs";
+import { defaultReleaseVariant, loadReleaseManifest, nativePackageEntries, selectPlatform, sha256File } from "./npm-package-core.mjs";
 import { installedPackageRoot, rollbackVersion, smokeArtifactRelease, smokeRegistryRelease } from "./npm-release-smoke.mjs";
 
 const manifest = loadReleaseManifest();
@@ -18,19 +18,27 @@ const release = {
   ],
 };
 
-async function artifactFixture(t) {
+async function artifactFixture(t, withComponents = false) {
   const root = await mkdtemp(join(tmpdir(), "zg-artifact-smoke-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const entry = selectPlatform(manifest, process.platform, process.arch,
-    process.report?.getReport().header ?? {});
+  const entry = { ...selectPlatform(manifest, process.platform, process.arch,
+    process.report?.getReport().header ?? {}) };
+  if (withComponents) {
+    const linux = manifest.platforms.find((platform) => platform.target === "linux-x64-gnu");
+    entry.components = linux.components.map((component) => ({
+      ...component, package: component.package.replace(linux.package, entry.package),
+    }));
+  }
+  const fixtureManifest = { ...manifest, platforms: manifest.platforms.map((platform) =>
+    platform.target === entry.target ? entry : platform) };
   const candidate = { schemaVersion: 1, version: "0.0.1", packages: [] };
-  for (const [name, target] of [[entry.package, entry.target], [manifest.metaPackage, "meta"]]) {
+  for (const { name, target } of [...nativePackageEntries(entry), { name: manifest.metaPackage, target: "meta" }]) {
     const file = `${name.replace(/^@/, "").replaceAll("/", "-")}-${candidate.version}.tgz`;
     await writeFile(join(root, file), `candidate artifact for ${name}`);
     candidate.packages.push({ name, target, version: candidate.version, file,
       sha256: await sha256File(join(root, file)) });
   }
-  return { manifest, release: candidate, tarballRoot: root, prefixRoot: join(root, "install"), entry };
+  return { manifest: fixtureManifest, release: candidate, tarballRoot: root, prefixRoot: join(root, "install"), entry };
 }
 
 async function installedArtifact(fixture, prefix, variant = defaultReleaseVariant(fixture.entry)) {
@@ -51,7 +59,7 @@ test("artifact smoke installs the exact local tarballs offline and probes the in
       assert.equal(command, "npm");
       assert.equal(args[0], "install");
       assert.ok(args.includes("--offline"));
-      assert.deepEqual(args.slice(-2), fixture.release.packages.map((pkg) => join(fixture.tarballRoot, pkg.file)));
+      assert.deepEqual(args.slice(-fixture.release.packages.length), fixture.release.packages.map((pkg) => join(fixture.tarballRoot, pkg.file)));
       assert.ok(args.includes(`--allow-scripts=${args.at(-1)}`));
       await installedArtifact(fixture, args[args.indexOf("--prefix") + 1]);
       installs++;
@@ -76,9 +84,24 @@ test("artifact checksum failures block installation before executing any candida
   }), /artifact tarball checksum mismatch/);
 });
 
+test("artifact smoke includes all CUDA components and rejects an omitted fragment", async (t) => {
+  const fixture = await artifactFixture(t, true);
+  await smokeArtifactRelease({ ...fixture,
+    runNpm: async (_, args) => {
+      assert.equal(args.filter((arg) => arg.endsWith(".tgz") && !arg.startsWith("--")).length, 6);
+      assert.ok(args.includes(`--allow-scripts=${args.at(-1)}`));
+      await installedArtifact(fixture, args[args.indexOf("--prefix") + 1]);
+    }, probe: async () => {},
+  });
+  fixture.release.packages.splice(3, 1);
+  await assert.rejects(smokeArtifactRelease({ ...fixture,
+    runNpm: () => assert.fail("must not install an incomplete set"),
+  }), /artifact package identity mismatch/);
+});
+
 test("artifact identity failures reject substituted tarball paths before installation", async (t) => {
   const fixture = await artifactFixture(t);
-  fixture.release.packages[1].file = "../another-meta.tgz";
+  fixture.release.packages.at(-1).file = "../another-meta.tgz";
   await assert.rejects(smokeArtifactRelease({
     ...fixture, runNpm: () => assert.fail("must not install"),
   }), /artifact package identity mismatch/);

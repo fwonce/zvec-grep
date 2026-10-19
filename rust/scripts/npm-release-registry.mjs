@@ -1,7 +1,6 @@
-import { createHash } from "node:crypto";
 import { appendFile, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { run, sha256File } from "./npm-package-core.mjs";
+import { hashFile, nativePackageEntries, run, sha256File, verifyTarballSize } from "./npm-package-core.mjs";
 import { verifyTarballCompliance } from "./npm-release-compliance.mjs";
 
 function filename(name, version) {
@@ -10,10 +9,7 @@ function filename(name, version) {
 
 function expectedPackages(manifest, version) {
   return [
-    ...manifest.platforms.map((entry) => ({
-      name: entry.package,
-      target: entry.target,
-    })),
+    ...manifest.platforms.flatMap(nativePackageEntries),
     { name: manifest.metaPackage, target: "meta" },
   ].map((entry) => ({
     ...entry,
@@ -57,6 +53,7 @@ export async function collectRelease({ manifest, version, tarballRoot, targets }
   }
   for (const entry of packages) {
     const path = join(tarballRoot, entry.file);
+    entry.bytes = await verifyTarballSize(path);
     const metadata = JSON.parse(
       run("tar", ["-xOf", path, "package/package.json"], { capture: true }),
     );
@@ -73,9 +70,25 @@ export async function collectRelease({ manifest, version, tarballRoot, targets }
       if (
         checksums.target !== entry.target ||
         !metadata.os?.includes(platform.os) ||
-        !metadata.cpu?.includes(platform.cpu)
+        !metadata.cpu?.includes(platform.cpu) ||
+        (platform.libc && !metadata.libc?.includes(platform.libc))
       ) {
         throw new Error(`release package platform mismatch: ${entry.file}`);
+      }
+      if (entry.component) {
+        const component = platform.components.find((candidate) => candidate.package === entry.component);
+        if (checksums.schemaVersion !== 1 || checksums.component !== entry.component ||
+            JSON.stringify(Object.keys(checksums.files ?? {})) !== JSON.stringify([component.payload])) {
+          throw new Error(`release component manifest mismatch: ${entry.file}`);
+        }
+      } else if (platform.components?.length) {
+        if (checksums.schemaVersion !== 2 ||
+            JSON.stringify(checksums.components) !== JSON.stringify(platform.components.map((component) => component.package)) ||
+            Object.keys(metadata.dependencies ?? {}).length !== platform.components.length ||
+            platform.components.some((component) => metadata.dependencies?.[component.package] !== version) ||
+            platform.components.some((component) => !checksums.files?.[component.file])) {
+          throw new Error(`release platform does not lock every runtime component: ${entry.file}`);
+        }
       }
     } else {
       const expected = Object.fromEntries(
@@ -91,9 +104,7 @@ export async function collectRelease({ manifest, version, tarballRoot, targets }
       }
     }
     entry.sha256 = await sha256File(path);
-    entry.integrity = `sha512-${createHash("sha512")
-      .update(await readFile(path))
-      .digest("base64")}`;
+    entry.integrity = `sha512-${await hashFile(path, "sha512", "base64")}`;
   }
   const release = {
     schemaVersion: 1,
@@ -127,18 +138,20 @@ export async function collectRelease({ manifest, version, tarballRoot, targets }
           "",
         ]
       : []),
-    "Unzip the Actions artifact, then install the meta tarball together with the native tarball for your machine:",
+    "Unzip the Actions artifact, then install the meta tarball together with ALL native/component tarballs for your machine:",
     "",
     "```sh",
     ...platforms.map(
       (platform) =>
-        `# ${platform.target}\nnpm install --global --allow-scripts=./${filename(manifest.metaPackage, version)} ./${filename(platform.package, version)} ./${filename(manifest.metaPackage, version)}`,
+        `# ${platform.target}\nnpm install --global --allow-scripts=./${filename(manifest.metaPackage, version)} ${nativePackageEntries(platform).map((entry) => `./${filename(entry.name, version)}`).join(" ")} ./${filename(manifest.metaPackage, version)}`,
     ),
     "zg --version",
     "```",
     "",
     "Use only the command for your platform. On Windows, use zg.cmd if PowerShell blocks the generated zg.ps1 shim.",
     "The native packages contain the executable, shared runtime libraries, and Jieba dictionaries.",
+    "CUDA platform packages require every exact-version component. Postinstall verifies and assembles the original bin/ and lib/ layout; Linux ORT data fragments are concatenated and checked against the complete library hash.",
+    "Every compressed npm tarball must be at most 350 MiB; this is checked at pack, collect, and publication preflight.",
     "Linux candidates are built and verified on Ubuntu 24.04; older glibc and C++ runtimes are not covered.",
     "SHA256SUMS and release.json identify the exact files and source commit.",
     "These artifacts use the regular npm package layout; no registry publication is needed to install them.",
@@ -149,7 +162,7 @@ export async function collectRelease({ manifest, version, tarballRoot, targets }
   if (process.env.GITHUB_STEP_SUMMARY) {
     await appendFile(
       process.env.GITHUB_STEP_SUMMARY,
-      `## Rust ${partial ? "validation candidate" : "release"} ${version}\n\nSource: \`${release.commit}\`\n\nDownload **rust-${partial ? "candidate" : "release"}-${version}** for ${platforms.length} native packages (${selectedTargets.join(", ")}), the meta package, checksums, and installation instructions.${partial ? " This partial candidate is validation-only and cannot be published or promoted." : ""}\n`,
+      `## Rust ${partial ? "validation candidate" : "release"} ${version}\n\nSource: \`${release.commit}\`\n\nDownload **rust-${partial ? "candidate" : "release"}-${version}** for ${platforms.length} native targets (${selectedTargets.join(", ")}), all required runtime components, the meta package, checksums, and installation instructions.${partial ? " This partial candidate is validation-only and cannot be published or promoted." : ""}\n`,
     );
   }
   console.log(`collected ${packages.length} verified packages for ${version}`);
@@ -202,12 +215,13 @@ async function preflightRelease({ manifest, tarballRoot, registryFetch }) {
       entry.name !== identity.name ||
       entry.file !== identity.file ||
       entry.version !== identity.version ||
-      entry.target !== identity.target
+      entry.target !== identity.target || entry.component !== identity.component
     ) {
       throw new Error(
         "release package order or identity does not match the platform manifest",
       );
     }
+    await verifyTarballSize(join(tarballRoot, entry.file));
     if ((await sha256File(join(tarballRoot, entry.file))) !== entry.sha256) {
       throw new Error(`release tarball checksum mismatch: ${entry.file}`);
     }

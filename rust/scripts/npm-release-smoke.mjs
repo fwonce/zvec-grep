@@ -3,6 +3,7 @@ import { createServer } from "node:net";
 import { join } from "node:path";
 import {
   defaultReleaseVariant,
+  nativePackageEntries,
   npmEnvironment,
   run,
   selectPlatform,
@@ -141,9 +142,9 @@ export async function smokeArtifactRelease({
     process.report?.getReport().header ?? {},
   );
   const tarballs = [];
-  for (const [name, target] of [
-    [entry.package, entry.target],
-    [manifest.metaPackage, "meta"],
+  for (const { name, target } of [
+    ...nativePackageEntries(entry),
+    { name: manifest.metaPackage, target: "meta" },
   ]) {
     const matches = release.packages.filter((candidate) => candidate.name === name);
     const candidate = matches[0];
@@ -169,7 +170,7 @@ export async function smokeArtifactRelease({
     [
       "install", "--global", "--prefix", prefix,
       "--offline", "--no-audit", "--no-fund",
-      `--allow-scripts=${tarballs[1]}`, ...tarballs,
+      `--allow-scripts=${tarballs.at(-1)}`, ...tarballs,
     ],
     { env: npmEnvironment(join(prefixRoot, "cache")) },
   );

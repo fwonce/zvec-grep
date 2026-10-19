@@ -1,13 +1,14 @@
 # npm distribution
 
-The release layout has one small meta package and one native package for each
-published target. `platforms.json` is the single source of truth for package
+The release layout has one small meta package, one base native package for each
+published target, and exact-version CUDA component packages for Linux/Windows
+x64. `platforms.json` is the single source of truth for package
 names and npm `os`, `cpu`, and `libc` selectors.
 
 The current published targets are macOS ARM64/x64, Linux x64/ARM64 with glibc,
 and Windows x64.
 
-The platform package owns the complete runtime payload:
+After installation, the meta package contains the same complete runtime layout:
 
 ```text
 bin/zg[.exe]
@@ -16,10 +17,35 @@ lib/lib{llama,ggml}*      # CUDA variant: shared llama.cpp core and CPU backend
 lib/*onnxruntime*        # ONNX Runtime core/providers, when dynamically linked
 lib/*ggml-cuda*          # primary CUDA 13.1 GGUF plugin
 lib/cuda12/*ggml-cuda*    # CUDA 12.4 GGUF fallback plugin
-checksums.json
-LICENSES/
-SBOM.spdx.json
 ```
+
+Source npm packages also carry `checksums.json` and, once reviewed inputs are
+available, `LICENSES/` and `SBOM.spdx.json`; these are package metadata rather
+than runtime files copied by the installer.
+
+The Linux x64 base package depends on `-ggml-cuda13`, `-ggml-cuda12`,
+`-ort-cuda-part1` and `-ort-cuda-part2` packages. Windows x64 depends on
+`-ggml-cuda13`, `-ggml-cuda12` and `-ort-cuda`. These suffixes extend the base
+platform package name. macOS, Linux ARM64 and deliberate CPU-only builds remain
+single native packages. A default all-platform release contains 13 tarballs:
+five base packages, seven runtime components and the meta package.
+
+The base package retains the executable, CPU/core libraries and dictionaries.
+CUDA components contain whole GGML plugins or the ORT provider. The Linux ORT
+provider is split into two ordered byte ranges under `parts/`; postinstall
+streams them back into the original `.so` and verifies the original complete
+file's SHA256. No compiler, model execution or CUDA Toolkit installation is
+performed during npm installation. OS/CPU/libc selection does not detect GPU
+hardware: CPU-only hosts still download the CUDA components of the default
+CUDA-enabled distribution. Splitting limits each upload, not total download or
+installed size; component payloads and the assembled runtime both occupy disk.
+
+Every compressed `.tgz` has a **350 MiB maximum**, enforced after `npm pack`,
+during collection, and again before publication/promotion. This leaves room
+below the approximately 384 MiB tarball ceiling caused by npm's base64/JSON
+publication path and 64-bit Node's string limit. `npm pack` succeeding alone is
+not publication validation. A component that outgrows the budget fails closed;
+it must be split further, not silently published as a reduced CPU package.
 
 `LICENSES/` and `SBOM.spdx.json` require reviewed per-target compliance inputs;
 validation candidates may omit them, but publication and promotion may not.
@@ -89,8 +115,10 @@ to the loader (for example, through PATH); the package's sibling `lib/` lookup
 does not install or locate missing NVIDIA runtime dependencies automatically.
 
 The meta package locks every platform package to its exact version through
-`optionalDependencies`. Its `postinstall` selects the installed package,
-validates package identity and every payload checksum, and materializes the
+`optionalDependencies`. CUDA base packages use required, exact-version
+`dependencies` for their runtime components. Its `postinstall` selects the installed package,
+validates every component identity and payload checksum, assembles into a
+temporary directory, verifies the complete runtime manifest, and materializes the
 native `bin/` and `lib/` payload. The npm command is always named `zg`; the meta
 package retains the cross-platform `bin/zg.exe` native entry point so npm's
 Windows shim and Unix symlink both enter the executable directly.
@@ -103,7 +131,7 @@ Release order:
 
 1. Build and package every native target; apply ad hoc signatures on macOS.
 2. Verify payload closure, checksums, licenses, and SBOMs.
-3. Publish all native packages to `rust-canary`, then publish the meta package
+3. Publish runtime components before their base native packages to `rust-canary`, then publish the meta package
    to `rust-canary` last. Candidate publication never changes `latest`.
 4. On every native runner, install the exact meta-package version from the
    registry alone, so npm must select its native optional dependency.
@@ -145,11 +173,11 @@ primary CUDA 13.1 build plus CUDA 12.4 fallback. Windows installs MSVC 14.38 bef
 any compilation, then switches to that toolset only for the fallback build.
 
 All-platform runs produce `rust-release-<version>`; subset runs produce
-`rust-candidate-<version>` with only the selected native tarballs, the same
+`rust-candidate-<version>` with the selected native tarballs and all their components, the same
 exact-version meta tarball, checksums and a `release.json` marked `partial`.
 Publication and promotion reject partial candidates. After collection,
 independent CPU jobs for the selected Linux/Windows x64 targets download and install the
-exact native/meta tarballs offline, without rebuilding. They verify checksums,
+exact native/component/meta tarballs offline, without rebuilding. They verify checksums,
 CLI startup, daemon IPC, and real GGUF/ONNX indexing and vector queries with
 explicit CPU selection and default CPU fallback, without CUDA host libraries.
 These checks also run for unpublished candidates and must pass before npm
@@ -157,7 +185,8 @@ publication; failures retain the candidate and `cpu-artifact-evidence-*` logs.
 
 The package GPU jobs use the hosted T4 runners with CUDA runtime libraries,
 not Rust/C++/CUDA compiler setup. They verify the downloaded native package's
-payload checksums and exercise both CUDA 12 fallback and CUDA 13 primary paths.
+payload checksums, assemble components with the same installer used by npm,
+and exercise both CUDA 12 fallback and CUDA 13 primary paths.
 Windows GPU jobs also prepare the pinned NVIDIA 591.59 driver when an older
 driver is active, verify the installer signature and CUDA initialization, and fail on a
 reboot requirement instead of rebooting. Both Rust CI and package GPU validation
@@ -190,7 +219,7 @@ while these inputs are missing. Both the initial source check and the tarball
 preflight fail before publication when compliance inputs are incomplete.
 
 Publication and promotion explicitly install npm 11.21.0, which supports OIDC
-authentication for `npm dist-tag`. Configure trusted publishing for all six
+authentication for `npm dist-tag`. Configure trusted publishing for all 13
 packages with repository `zvec-ai/zvec-grep`, workflow filename
 `rust-publish.yml`, and both **Allow npm publish** and **Allow npm dist-tag**.
 The dist-tag permission is independent and disabled by default; `id-token:

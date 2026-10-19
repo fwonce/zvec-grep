@@ -1,17 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   defaultReleaseVariant,
+  MAX_NPM_TARBALL_BYTES,
   existingNativeBuild,
   loadReleaseManifest,
   resolveBuildVariant,
   selectPlatform,
   stageRuntimeBundle,
+  stageComponentPayload,
   stageZvecRuntime,
+  verifyTarballSize,
 } from "./npm-package-core.mjs";
 
 const manifest = loadReleaseManifest();
@@ -267,6 +270,7 @@ test("maps supported native npm targets", () => {
       binary: "zg",
       defaultVariant: "cuda",
       target: "linux-x64-gnu",
+      components: manifest.platforms.find((entry) => entry.target === "linux-x64-gnu").components,
     },
   );
   assert.deepEqual(selectPlatform(manifest, "win32", "x64"), {
@@ -276,7 +280,40 @@ test("maps supported native npm targets", () => {
     binary: "zg.exe",
     defaultVariant: "cuda",
     target: "win32-x64-msvc",
+    components: manifest.platforms.find((entry) => entry.target === "win32-x64-msvc").components,
   });
+});
+
+test("splits the Linux ORT provider into ordered bounded-memory component payloads", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "zg-native-components-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const entry = manifest.platforms.find((entry) => entry.target === "linux-x64-gnu");
+  const components = entry.components.filter((component) => component.payload.startsWith("parts/"));
+  const source = Buffer.alloc(2 * 1024 * 1024 + 37);
+  for (let i = 0; i < source.length; i++) source[i] = i % 251;
+  await mkdir(join(root, "source/lib"), { recursive: true });
+  await writeFile(join(root, "source", components[0].file), source);
+  const parts = [];
+  for (const [index, component] of components.entries()) {
+    const destination = join(root, `part-${index}`);
+    const checksum = await stageComponentPayload(join(root, "source"), destination, entry, component);
+    const bytes = await readFile(join(destination, component.payload));
+    assert.equal(checksum.bytes, bytes.length);
+    assert.equal(checksum.sha256.length, 64);
+    parts.push(bytes);
+  }
+  assert.deepEqual(Buffer.concat(parts), source);
+});
+
+test("enforces the compressed npm tarball budget at the exact boundary", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "zg-npm-size-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "candidate.tgz");
+  await writeFile(path, "");
+  await truncate(path, MAX_NPM_TARBALL_BYTES);
+  assert.equal(await verifyTarballSize(path), MAX_NPM_TARBALL_BYTES);
+  await truncate(path, MAX_NPM_TARBALL_BYTES + 1);
+  await assert.rejects(verifyTarballSize(path), /exceeds 350 MiB publication budget/);
 });
 
 test("defaults Linux and Windows x64 releases to CUDA-capable bundles", () => {

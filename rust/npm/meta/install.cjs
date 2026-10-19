@@ -3,14 +3,18 @@
 const { createHash } = require("crypto");
 const {
   chmodSync,
+  closeSync,
   copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   renameSync,
   rmSync,
+  writeSync,
 } = require("fs");
 const { dirname, isAbsolute, join, normalize, relative, resolve, sep } = require("path");
 
@@ -31,10 +35,23 @@ function copyTreeSync(source, destination) {
 }
 
 function digest(path) {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
+  const hash = createHash("sha256");
+  const fd = openSync(path, "r");
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    let count;
+    while ((count = readSync(fd, buffer, 0, buffer.length, null)) > 0) hash.update(buffer.subarray(0, count));
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest("hex");
 }
 
 function checkedPayloadPath(root, payloadPath) {
+  if (!/^(bin|lib|parts)\/[a-zA-Z0-9_./-]+$/.test(payloadPath) ||
+      payloadPath.split("/").some((part) => !part || part === "." || part === "..")) {
+    throw new Error(`invalid native payload path: ${payloadPath}`);
+  }
   if (isAbsolute(payloadPath)) {
     throw new Error(`native checksum contains an absolute path: ${payloadPath}`);
   }
@@ -64,17 +81,21 @@ function listPayloadFiles(root, directory = root) {
   return files;
 }
 
-function verifyPayload(platformRoot, entry, expectedVersion) {
-  const packageJson = JSON.parse(readFileSync(join(platformRoot, "package.json"), "utf8"));
-  if (packageJson.name !== entry.package || packageJson.version !== expectedVersion) {
+function verifyPackageIdentity(root, name, expectedVersion) {
+  const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+  if (packageJson.name !== name || packageJson.version !== expectedVersion) {
     throw new Error(
-      `native package mismatch: expected ${entry.package}@${expectedVersion}, got ${packageJson.name}@${packageJson.version}`,
+      `native package mismatch: expected ${name}@${expectedVersion}, got ${packageJson.name}@${packageJson.version}`,
     );
   }
+  return packageJson;
+}
 
+function verifyPayload(platformRoot, entry, expectedVersion) {
+  const packageJson = verifyPackageIdentity(platformRoot, entry.package, expectedVersion);
   const checksumPath = join(platformRoot, "checksums.json");
   const checksums = JSON.parse(readFileSync(checksumPath, "utf8"));
-  if (checksums.schemaVersion !== 1 || checksums.target !== entry.target) {
+  if (![1, 2].includes(checksums.schemaVersion) || checksums.target !== entry.target) {
     throw new Error(`invalid native checksum manifest for ${entry.package}`);
   }
   const expectedBinary = `bin/${entry.binary}`;
@@ -82,17 +103,41 @@ function verifyPayload(platformRoot, entry, expectedVersion) {
     throw new Error(`native checksum manifest does not contain ${expectedBinary}`);
   }
 
-  const declaredFiles = Object.keys(checksums.files).sort();
-  const actualFiles = ["bin", "lib"]
-    .filter((directory) => existsSync(join(platformRoot, directory)))
-    .flatMap((directory) => listPayloadFiles(platformRoot, join(platformRoot, directory)))
+  const components = checksums.schemaVersion === 2 ? entry.components ?? [] : [];
+  if (checksums.schemaVersion === 2 && (!components.length ||
+      JSON.stringify(checksums.components) !== JSON.stringify(components.map((component) => component.package)) ||
+      Object.keys(packageJson.dependencies ?? {}).length !== components.length ||
+      components.some((component) => packageJson.dependencies?.[component.package] !== expectedVersion))) {
+    throw new Error("native component dependencies do not match the platform manifest");
+  }
+  const externalFiles = new Set(components.map((component) => component.file));
+  for (const file of externalFiles) {
+    if (!checksums.files[file]) throw new Error(`native checksum manifest does not contain ${file}`);
+  }
+  // Validate the complete installed manifest, including files reconstructed later.
+  for (const [file, expected] of Object.entries(checksums.files)) {
+    checkedPayloadPath(platformRoot, file);
+    if (!Number.isSafeInteger(expected.bytes) || expected.bytes < 0 || !/^[a-f0-9]{64}$/.test(expected.sha256)) {
+      throw new Error(`invalid native checksum: ${file}`);
+    }
+  }
+  verifyFiles(platformRoot, Object.fromEntries(
+    Object.entries(checksums.files).filter(([file]) => !externalFiles.has(file))));
+  return checksums;
+}
+
+function verifyFiles(root, files) {
+  const declaredFiles = Object.keys(files).sort();
+  const actualFiles = ["bin", "lib", "parts"]
+    .filter((directory) => existsSync(join(root, directory)))
+    .flatMap((directory) => listPayloadFiles(root, join(root, directory)))
     .sort();
   if (JSON.stringify(actualFiles) !== JSON.stringify(declaredFiles)) {
     throw new Error("native payload files do not match the checksum manifest");
   }
 
-  for (const [payloadPath, expected] of Object.entries(checksums.files)) {
-    const absolutePath = checkedPayloadPath(platformRoot, payloadPath);
+  for (const [payloadPath, expected] of Object.entries(files)) {
+    const absolutePath = checkedPayloadPath(root, payloadPath);
     const metadata = lstatSync(absolutePath);
     if (!metadata.isFile()) {
       throw new Error(`native payload is not a file: ${payloadPath}`);
@@ -101,11 +146,10 @@ function verifyPayload(platformRoot, entry, expectedVersion) {
       throw new Error(`native payload checksum mismatch: ${payloadPath}`);
     }
   }
-  return checksums;
 }
 
 function materialize({ metaRoot, platformRoot, entry, expectedVersion }) {
-  verifyPayload(platformRoot, entry, expectedVersion);
+  const checksums = verifyPayload(platformRoot, entry, expectedVersion);
 
   const temporaryRoot = join(metaRoot, `.native-${process.pid}.tmp`);
   const metaBin = join(metaRoot, "bin");
@@ -124,6 +168,47 @@ function materialize({ metaRoot, platformRoot, entry, expectedVersion }) {
     mkdirSync(stagedBin, { recursive: true });
     copyFileSync(join(sourceBin, entry.binary), join(stagedBin, entry.binary));
     copyTreeSync(sourceLib, stagedLib);
+
+    const components = checksums.schemaVersion === 2 ? entry.components : [];
+    for (const file of new Set(components.map((component) => component.file))) {
+      const sources = [];
+      for (const component of components.filter((candidate) => candidate.file === file)) {
+        const root = resolvePackageRoot(metaRoot, component.package, platformRoot);
+        verifyPackageIdentity(root, component.package, expectedVersion);
+        const part = JSON.parse(readFileSync(join(root, "checksums.json"), "utf8"));
+        if (part.schemaVersion !== 1 || part.target !== entry.target || part.component !== component.package ||
+            JSON.stringify(Object.keys(part.files ?? {})) !== JSON.stringify([component.payload])) {
+          throw new Error(`invalid native component manifest: ${component.package}`);
+        }
+        verifyFiles(root, part.files);
+        sources.push(checkedPayloadPath(root, component.payload));
+      }
+      const destination = checkedPayloadPath(temporaryRoot, file);
+      mkdirSync(dirname(destination), { recursive: true });
+      // Concatenate in manifest order with bounded memory. Even the complete
+      // Linux ORT provider can exceed Node's maximum string/buffer sizes.
+      const output = openSync(destination, "wx", lstatSync(sources[0]).mode);
+      const buffer = Buffer.allocUnsafe(1024 * 1024);
+      try {
+        for (const source of sources) {
+          const input = openSync(source, "r");
+          try {
+            let count;
+            while ((count = readSync(input, buffer, 0, buffer.length, null)) > 0) {
+              let offset = 0;
+              while (offset < count) offset += writeSync(output, buffer, offset, count - offset);
+            }
+          } finally {
+            closeSync(input);
+          }
+        }
+      } finally {
+        closeSync(output);
+      }
+    }
+    // Verify the original full runtime manifest before touching the previous
+    // installation. Missing/swapped/truncated parts cannot become loadable DLLs.
+    verifyFiles(temporaryRoot, checksums.files);
 
     mkdirSync(metaBin, { recursive: true });
     const metaLib = join(metaRoot, "lib");
@@ -145,15 +230,19 @@ function materialize({ metaRoot, platformRoot, entry, expectedVersion }) {
   }
 }
 
-function resolvePlatformRoot(metaRoot, entry) {
+function resolvePackageRoot(metaRoot, packageName, platformRoot = metaRoot) {
   try {
-    return dirname(require.resolve(`${entry.package}/package.json`, { paths: [metaRoot] }));
+    return dirname(require.resolve(`${packageName}/package.json`, { paths: [resolve(platformRoot), resolve(metaRoot)] }));
   } catch (error) {
     const detail = error && error.code === "MODULE_NOT_FOUND" ? "" : ` (${error.message})`;
     throw new Error(
-      `missing ${entry.package}; reinstall without --omit=optional or install that exact platform package${detail}`,
+      `missing ${packageName}; reinstall without --omit=optional or install all exact-version platform component tarballs${detail}`,
     );
   }
+}
+
+function resolvePlatformRoot(metaRoot, entry) {
+  return resolvePackageRoot(metaRoot, entry.package);
 }
 
 function selectPlatform(platforms, platform, arch, reportHeader = {}) {

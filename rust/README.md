@@ -463,13 +463,16 @@ npm run release:pack
 ```
 
 The default published Linux x64 and Windows x64 artifacts are complete CPU/CUDA
-bundles, so installation requires no CUDA compiler. Local packaging follows the
+bundles assembled from a base package and exact-version CUDA component packages,
+so installation requires no CUDA compiler. Linux ORT is transported as two
+fragments and reconstructed with a full-library SHA256 check. The installed
+`bin/`, `lib/` and `lib/cuda12/` layout is unchanged. Local packaging follows the
 build policy above: no toolkit produces a CPU-only package. Use
 `npm run release:cpu` to explicitly produce a CPU-only package; CI supplies and
 audits a complete CUDA bundle before packaging the default x64 releases.
 
 The release tarballs are written under `dist/npm/release/tarballs/`. Run a real
-two-tarball install in an isolated npm prefix and verify the materialized binary
+meta/base/component tarball install in an isolated npm prefix and verify the materialized binary
 with:
 
 ```sh
@@ -589,7 +592,8 @@ in the npm payload. The Intel release targets macOS 14 and later.
 
 For a complete all-platform run, download the `rust-release-<version>` artifact
 from the successful workflow run
-and unzip it. It contains all five platform tarballs, the meta tarball,
+and unzip it. It contains five base platform tarballs, seven CUDA component
+tarballs, the meta tarball,
 `SHA256SUMS`, `release.json` with the source commit, and platform-specific install
 commands. For example, on an ARM64 Mac:
 
@@ -604,7 +608,7 @@ Windows, use `zg.cmd` if PowerShell blocks the generated `zg.ps1` shim. Artifact
 are retained for 14 days.
 
 Subset runs instead upload `rust-candidate-<version>`, containing the selected
-native tarballs, the unchanged exact-version meta tarball, checksums and install
+native tarballs and all required components, the unchanged exact-version meta tarball, checksums and install
 instructions. Its `release.json` records the selected targets and `partial: true`;
 it cannot be published or promoted as a complete release.
 
@@ -618,13 +622,13 @@ Failure blocks npm publication; the candidate artifact is kept for diagnosis.
 
 To publish, update the Rust workspace version, tag the release commit on `main`
 as `rust-v<version>`, and manually run the workflow with `publish` enabled. The
-publishing repository must have an npm trusted publisher configured for all six
+publishing repository must have an npm trusted publisher configured for all 13
 packages with both **Allow npm publish** and the independent **Allow npm
 dist-tag** permission enabled, or provide an eligible `NPM_TOKEN` secret.
 Publishing and promotion install npm 11.21.0 explicitly for OIDC dist-tag support.
 
 Registry publication is currently blocked until reviewed license texts and
-SPDX SBOMs are supplied for every target in [`npm/compliance/`](npm/compliance/README.md).
+SPDX SBOMs are supplied for every target and CUDA component in [`npm/compliance/`](npm/compliance/README.md).
 Candidate downloads remain available while these inputs are prepared.
 Every publication uses `rust-canary`, letting users opt into Rust with
 `npm install --global @zvec/zvec-grep@rust-canary`. Five native runners then
@@ -633,13 +637,18 @@ exercise update and rollback with a distinct previously published version.
 Selecting `latest` requests a separate promotion job that changes the default
 installation only after all registry checks pass.
 
-`release:collect` requires all platform tarballs by default and packs the meta
+Each compressed tarball must be at most 350 MiB. Packing, collection and
+publication preflight all enforce this budget before any npm publication.
+Use `--output-dir <path>` with release commands to keep inspection artifacts
+separate from `dist/npm/release/`.
+
+`release:collect` requires all platform/component tarballs by default and packs the meta
 package last. `release:collect -- --targets linux-x64-gnu,win32-x64-msvc` collects
-only the explicitly selected platform tarballs as a validation-only partial
+only the explicitly selected platform tarballs and their components as a validation-only partial
 candidate; missing or extra tarballs are rejected. The meta package still locks
 all five platform versions, so its installation behavior is unchanged.
 `release:artifact-smoke` installs the current platform's exact collected native
-and meta tarballs from `dist/npm/release/tarballs`, verifies the installation and
+component and meta tarballs from `dist/npm/release/tarballs`, verifies the installation and
 CLI/daemon operation, and does not compile, repack or publish anything.
 `release:publish` validates the collected files before publishing native packages
 and then the meta package under `rust-canary` with npm provenance. An already published version is

@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadReleaseManifest, run, sha256File } from "./npm-package-core.mjs";
+import { componentDependencies, loadReleaseManifest, MAX_NPM_TARBALL_BYTES, nativePackageEntries, run, sha256File } from "./npm-package-core.mjs";
 import {
   checkPublishedPackage,
   collectRelease,
@@ -62,10 +62,12 @@ async function releaseFixture(
   for (const platform of [
     ...manifest.platforms.filter(
       (platform) => targets === undefined || targets.includes(platform.target),
-    ),
+    ).flatMap((platform) => nativePackageEntries(platform).map((pkg) => ({
+      ...platform, package: pkg.name, component: pkg.component,
+    }))),
     { package: manifest.metaPackage, target: "meta" },
   ]) {
-    const directory = join(root, platform.target, "package");
+    const directory = join(root, platform.package.replaceAll("/", "-"), "package");
     await mkdir(directory, { recursive: true });
     const metadata = {
       name: platform.package,
@@ -79,12 +81,22 @@ async function releaseFixture(
               ]),
             ),
           }
-        : { os: [platform.os], cpu: [platform.cpu] }),
+        : { os: [platform.os], cpu: [platform.cpu], ...(platform.libc ? { libc: [platform.libc] } : {}),
+            ...(!platform.component && platform.components?.length
+              ? { dependencies: componentDependencies(platform, entry.version) } : {}) }),
     };
     mutateMetadata?.(platform.target, metadata);
     await writeFile(join(directory, "package.json"), JSON.stringify(metadata));
     if (platform.target !== "meta") {
-      const checksums = { target: platform.target };
+      const component = platform.components?.find((candidate) => candidate.package === platform.component);
+      const checksums = { schemaVersion: !component && platform.components?.length ? 2 : 1,
+        target: platform.target,
+        ...(component ? { component: component.package, files: { [component.payload]: {} } }
+          : platform.components?.length ? {
+              components: platform.components.map((candidate) => candidate.package),
+              files: Object.fromEntries(platform.components.map((candidate) => [candidate.file, {}])),
+            } : {}),
+      };
       mutateChecksums?.(platform.target, checksums);
       await writeFile(
         join(directory, "checksums.json"),
@@ -120,10 +132,11 @@ async function releaseFixture(
     }
     const file = `${platform.package.replace(/^@/, "").replaceAll("/", "-")}-${entry.version}.tgz`;
     const path = join(root, file);
-    run("tar", ["-czf", path, "-C", join(root, platform.target), "package"]);
+    run("tar", ["-czf", path, "-C", join(directory, ".."), "package"]);
     packages.push({
       name: platform.package,
       target: platform.target,
+      ...(platform.component ? { component: platform.component } : {}),
       version: entry.version,
       file,
       sha256: await sha256File(path),
@@ -157,7 +170,7 @@ test("collects selected platforms in manifest order as a validation-only candida
   assert.equal(release.partial, true);
   assert.deepEqual(release.targets, ["linux-x64-gnu", "win32-x64-msvc"]);
   assert.deepEqual(
-    release.packages.map((pkg) => pkg.target),
+    release.packages.filter((pkg) => !pkg.component).map((pkg) => pkg.target),
     [...release.targets, "meta"],
   );
   assert.deepEqual(
@@ -213,7 +226,7 @@ test("default collection still requires every platform and treats all targets as
     });
     assert.equal(release.partial, false);
     assert.deepEqual(release.targets, allTargets);
-    assert.equal(release.packages.length, fixture.manifest.platforms.length + 1);
+    assert.equal(release.packages.length, fixture.manifest.platforms.flatMap(nativePackageEntries).length + 1);
   }
   await rm(join(fixture.tarballRoot, fixture.packages[0].file));
   await assert.rejects(
@@ -455,4 +468,44 @@ test("an incomplete registry release cannot be promoted or published by the prom
     }),
     /incomplete registry release/,
   );
+});
+
+test("oversized candidates fail collection and publication before any npm mutation", async (t) => {
+  const fixture = await releaseFixture(t);
+  // Inflate the final tarball as a sparse file: no hundreds-of-MiB fixture data.
+  await truncate(join(fixture.tarballRoot, fixture.packages.at(-1).file), MAX_NPM_TARBALL_BYTES + 1);
+  await assert.rejects(collectRelease({ ...fixture, version: entry.version }), /exceeds 350 MiB/);
+  for (const action of [publishRelease, promoteRelease]) {
+    await assert.rejects(action({ ...fixture,
+      registryFetch: publishedRegistry(fixture.packages),
+      runNpm: () => assert.fail("must not mutate npm"),
+    }), /exceeds 350 MiB/);
+  }
+});
+
+test("collection requires every component and exact dependency versions", async (t) => {
+  const targets = ["linux-x64-gnu"];
+  const missing = await releaseFixture(t, { targets });
+  const component = missing.packages.find((pkg) => pkg.component?.endsWith("ort-cuda-part2"));
+  await rm(join(missing.tarballRoot, component.file));
+  await assert.rejects(collectRelease({ ...missing, version: entry.version, targets }), /do not cover exactly/);
+  const wrongVersion = await releaseFixture(t, { targets, mutateMetadata: (_, metadata) => {
+    if (metadata.dependencies) metadata.dependencies[Object.keys(metadata.dependencies)[0]] = "0.0.2";
+  } });
+  await assert.rejects(collectRelease({ ...wrongVersion, version: entry.version, targets }), /does not lock every runtime component/);
+});
+
+test("components publish before the base package that depends on them", async (t) => {
+  const fixture = await releaseFixture(t);
+  const commands = [];
+  await publishRelease({ ...fixture, registryFetch: async () => ({ status: 404 }), runNpm: (_, args) => commands.push(args) });
+  const published = commands.map((args) => args[1]);
+  for (const platform of fixture.manifest.platforms) {
+    const baseIndex = fixture.packages.findIndex((pkg) => pkg.name === platform.package);
+    for (const component of platform.components ?? []) {
+      const index = fixture.packages.findIndex((pkg) => pkg.name === component.package);
+      assert.ok(index < baseIndex);
+      assert.ok(published[index].endsWith(fixture.packages[index].file));
+    }
+  }
 });

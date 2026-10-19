@@ -17,6 +17,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   cargoPackageVersion,
+  componentDependencies,
   buildNative,
   existingNativeBuild,
   loadReleaseManifest,
@@ -26,8 +27,10 @@ import {
   selectPlatform,
   sha256File,
   stageRuntimeBundle,
+  stageComponentPayload,
   stageZvecRuntime,
   workspaceDir,
+  verifyTarballSize,
 } from "./npm-package-core.mjs";
 import {
   collectRelease,
@@ -46,10 +49,10 @@ import {
 } from "./npm-release-smoke.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
-const releaseRoot = join(workspaceDir, "dist", "npm", "release");
-const stagingRoot = join(releaseRoot, "staging");
-const tarballRoot = join(releaseRoot, "tarballs");
-const cacheRoot = join(releaseRoot, "cache");
+let releaseRoot = join(workspaceDir, "dist", "npm", "release");
+let stagingRoot = join(releaseRoot, "staging");
+let tarballRoot = join(releaseRoot, "tarballs");
+let cacheRoot = join(releaseRoot, "cache");
 
 function parseOptions(args) {
   const options = {
@@ -77,6 +80,7 @@ function parseOptions(args) {
       ["--lib-dir", "libDir"],
       ["--target", "target"],
       ["--targets", "targets"],
+      ["--output-dir", "outputDir"],
     ]);
     const field = fields.get(argument);
     if (field) {
@@ -172,7 +176,9 @@ async function packDirectory(packageDirectory) {
       `npm pack did not report a tarball for ${packageDirectory}`,
     );
   }
-  return join(tarballRoot, result[0].filename);
+  const tarball = join(tarballRoot, result[0].filename);
+  await verifyTarballSize(tarball);
+  return tarball;
 }
 
 async function packPlatform(options) {
@@ -199,6 +205,8 @@ async function packPlatform(options) {
   });
   const version = cargoPackageVersion();
   const destination = join(stagingRoot, entry.target);
+  const components = bundleDir ? entry.components ?? [] : [];
+  const componentDirectories = [];
   await replaceDirectory(destination, async (temporary) => {
     const binDir = join(temporary, "bin");
     const libDir = join(temporary, "lib");
@@ -216,6 +224,42 @@ async function packPlatform(options) {
     }
 
     const checksums = await checksumManifest(temporary, entry.target);
+    for (const component of components) {
+      const directory = join(stagingRoot, component.package.replace(/^@/, "").replaceAll("/", "-"));
+      await replaceDirectory(directory, async (staged) => {
+        const payload = await stageComponentPayload(temporary, staged, entry, component);
+        await stageCompliance(join(workspaceDir, "npm", "compliance", entry.target,
+          component.package.slice(entry.package.length + 1)), staged);
+        // Preserve the upstream ORT notices in each redistributed provider or
+        // fragment, independently of the reviewed publication-only SBOM inputs.
+        const notices = join(temporary, "lib", "licenses");
+        if (component.file.includes("onnxruntime") && (await stat(notices).catch((error) => {
+          if (error.code === "ENOENT") return undefined;
+          throw error;
+        }))) await cp(notices, join(staged, "UPSTREAM_NOTICES"), { recursive: true });
+        await writeFile(join(staged, "checksums.json"), `${JSON.stringify({
+          schemaVersion: 1, target: entry.target, component: component.package,
+          files: { [component.payload]: payload },
+        }, null, 2)}\n`);
+        await writeFile(join(staged, "package.json"), `${JSON.stringify({
+          name: component.package, version,
+          description: `Native runtime component for ${entry.package}; install @zvec/zvec-grep`,
+          license: "Apache-2.0", repository: "https://github.com/zvec-ai/zvec-grep",
+          os: [entry.os], cpu: [entry.cpu], ...(entry.libc ? { libc: [entry.libc] } : {}),
+          files: ["lib", "parts", "checksums.json", "README.md", "UPSTREAM_NOTICES", "LICENSES", "SBOM.spdx.json"],
+          publishConfig: { access: "public", provenance: true },
+        }, null, 2)}\n`);
+        await writeFile(join(staged, "README.md"), `# ${component.package}\n\nExact-version runtime component. Install @zvec/zvec-grep to assemble and verify the complete runtime; do not load a data fragment directly.\n`);
+      });
+      componentDirectories.push(directory);
+    }
+    if (components.length) {
+      checksums.schemaVersion = 2;
+      checksums.components = components.map((component) => component.package);
+      for (const file of new Set(components.map((component) => component.file))) {
+        await rm(join(temporary, file));
+      }
+    }
     await stageCompliance(
       join(workspaceDir, "npm", "compliance", entry.target),
       temporary,
@@ -231,6 +275,7 @@ async function packPlatform(options) {
       cpu: [entry.cpu],
       files: ["bin", "lib", "checksums.json", "README.md", "LICENSES", "SBOM.spdx.json"],
       publishConfig: { access: "public", provenance: true },
+      ...(components.length ? { dependencies: componentDependencies(entry, version) } : {}),
       zvecGrep: {
         variant: bundleDir ? "cuda" : "cpu",
         accelerators: bundleDir ? ["cpu", "cuda"]
@@ -254,9 +299,12 @@ async function packPlatform(options) {
       `# ${entry.package}\n\nNative ${bundleDir ? "CPU/CUDA" : "CPU"} zvec-grep payload for ${entry.target}. Install @zvec/zvec-grep instead.\n`,
     );
   });
+  const tarballs = [];
+  for (const directory of componentDirectories) tarballs.push(await packDirectory(directory));
   const tarball = await packDirectory(destination);
+  tarballs.push(tarball);
   console.log(`packed ${entry.package}@${version}: ${tarball}`);
-  return { entry, version, destination, tarball };
+  return { entry, version, destination, tarball, tarballs };
 }
 
 async function packMeta() {
@@ -309,7 +357,7 @@ async function verifyManifest() {
     throw new Error("npm platform package names must be unique");
   }
   console.log(
-    `verified ${manifest.platforms.length} npm platform packages at version ${version}`,
+    `verified ${manifest.platforms.length} npm platform packages and ${manifest.platforms.reduce((count, entry) => count + (entry.components?.length ?? 0), 0)} runtime components at version ${version}`,
   );
 }
 
@@ -328,7 +376,7 @@ async function smokeCurrent(options) {
       "--no-audit",
       "--no-fund",
       `--allow-scripts=${meta.tarball}`,
-      platform.tarball,
+      ...platform.tarballs,
       meta.tarball,
     ],
     { env: npmEnvironment(cacheRoot) },
@@ -346,6 +394,12 @@ async function smokeCurrent(options) {
 async function main() {
   const command = process.argv[2];
   const options = parseOptions(process.argv.slice(3));
+  if (options.outputDir) {
+    releaseRoot = options.outputDir;
+    stagingRoot = join(releaseRoot, "staging");
+    tarballRoot = join(releaseRoot, "tarballs");
+    cacheRoot = join(releaseRoot, "cache");
+  }
   if (options.targets !== undefined && command !== "collect") {
     throw new Error("--targets is only supported by collect");
   }
@@ -430,7 +484,7 @@ async function main() {
     return;
   }
   throw new Error(
-    "usage: npm-release.mjs <build|verify|verify-publication|pack-platform|pack-meta|pack-current|smoke-current|smoke-artifacts|collect|publish|promote|rollback-version|smoke-registry> [--target TARGET] [--targets TARGET,... (collect only)] [--binary PATH] [--lib-dir PATH] [--bundle-dir PATH] [--cpu-only] [--no-build]",
+    "usage: npm-release.mjs <build|verify|verify-publication|pack-platform|pack-meta|pack-current|smoke-current|smoke-artifacts|collect|publish|promote|rollback-version|smoke-registry> [--target TARGET] [--targets TARGET,... (collect only)] [--binary PATH] [--lib-dir PATH] [--bundle-dir PATH] [--output-dir PATH] [--cpu-only] [--no-build]",
   );
 }
 
