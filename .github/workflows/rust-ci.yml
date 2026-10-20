@@ -249,6 +249,16 @@ jobs:
           prefix-key: rust-ci-v3-test
           workspaces: rust -> target
           save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Verify PowerShell for the Windows nextest installer
+        if: matrix.cuda && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7) {
+            throw 'The nextest installer requires PowerShell 7'
+          }
+          Get-Command pwsh, bash -ErrorAction Stop | Format-Table Name, Source
+          $PSVersionTable.PSVersion.ToString()
       - name: Install cargo-nextest
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:

@@ -211,7 +211,10 @@ inactive upgrade or failed CUDA initialization fails the job explicitly; the
 helper never reboots the runner.
 
 The Rust CI CUDA test job also provisions VS 2022 C++ tools (including MSVC 14.38),
-a pinned libclang wheel and the repository-pinned Rust toolchain. Package GPU
+a pinned libclang wheel and the repository-pinned Rust toolchain. The GPU image
+may lack `pwsh`, so the helper downloads a SHA256-pinned portable
+PowerShell 7.6.7 into `RUNNER_TEMP` for the nextest installer. A separate `pwsh`
+step verifies shell lookup before installing nextest. Package GPU
 jobs call the helper with `-DriverOnly` and install only runtime libraries, not
 Rust/C++/CUDA build toolchains. This provisioning is not part of npm installation.
 Both paths configure CUDA DLL lookup, including CUDA 13's `bin/x64` as well as

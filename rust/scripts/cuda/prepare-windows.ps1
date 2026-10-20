@@ -107,6 +107,30 @@ print(f"Verified NVIDIA driver: CUDA API {version.value}, {count.value} GPU devi
 if ($LASTEXITCODE -ne 0) { throw "Windows CUDA driver verification failed; this job will not reboot the runner" }
 if ($DriverOnly) { return }
 
+# The nextest install action explicitly uses pwsh, not Windows PowerShell 5.
+# Provision a pinned portable runtime for this job without changing the VM image.
+# SHA256: https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/hashes.sha256
+$powerShellVersion = "7.6.7"
+$powerShellSha256 = "d2f952ebdbf24386cb8923553aa58e41a846db35a6155ea04c58142a4b16dbb7"
+$powerShellDirectory = Join-Path $env:RUNNER_TEMP "zg-pwsh-$powerShellVersion"
+$powerShellArchive = "$powerShellDirectory.zip"
+& curl.exe --fail --location --proto '=https' --retry 3 --max-time 300 `
+    "https://github.com/PowerShell/PowerShell/releases/download/v$powerShellVersion/PowerShell-$powerShellVersion-win-x64.zip" `
+    --output $powerShellArchive
+if ($LASTEXITCODE -ne 0) { throw "Downloading PowerShell $powerShellVersion failed" }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $powerShellArchive).Hash -ne $powerShellSha256) {
+    throw "PowerShell archive SHA256 mismatch"
+}
+Expand-Archive -LiteralPath $powerShellArchive -DestinationPath $powerShellDirectory -Force
+$powerShellExecutable = Join-Path $powerShellDirectory "pwsh.exe"
+$activePowerShellVersion = & $powerShellExecutable -NoLogo -NoProfile -NonInteractive `
+    -Command '$PSVersionTable.PSVersion.ToString()'
+if ($LASTEXITCODE -ne 0 -or "$activePowerShellVersion".Trim() -ne $powerShellVersion) {
+    throw "The pinned PowerShell $powerShellVersion runtime could not start"
+}
+$powerShellDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+Write-Host "Verified PowerShell $activePowerShellVersion for subsequent Actions steps"
+
 # System32/bash.exe is the WSL launcher on this image, with no distro installed.
 # Prefer Git Bash for the Rust setup action and other cross-platform steps.
 $gitBash = Join-Path $env:ProgramFiles "Git/bin"
