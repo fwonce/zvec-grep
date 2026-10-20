@@ -416,6 +416,7 @@ Result options:
   --refresh <background|wait|off>   Refresh policy (defaults: server=background, direct=off)
                                     In direct mode, background warns and falls back to off
   --mode <direct|server|auto>       Select indexed query transport (default: auto)
+  --index-dir <path>                Select the complete workspace index directory
 
 Indexed results are shown by query group, preserving each group's own rank.
 A result that matches more than one group is shown in each matching group.
@@ -454,6 +455,7 @@ and options that replace rg's output format are not supported.
 
 Environment:
   ZVEC_GREP_MODE         Default client mode: direct, server, or auto
+  ZVEC_GREP_INDEX_DIR    Workspace index directory (default: <root>/.zvec-grep)
   ZVEC_GREP_API_KEY      Embedding provider credential fallback
   ZVEC_GREP_ENDPOINT     Remote Embedding endpoint fallback
   ZVEC_GREP_MODEL_CACHE  Local embedding model cache directory
@@ -467,7 +469,8 @@ const INDEX_HELP: &str = r"Usage:
   zg --index [root] --drop [--yes]
 
 Index options:
-  --name <NAME>                     Set or rename the unique workspace name
+  --name <NAME>                     Set or rename the workspace label
+  --index-dir <path>                Store the workspace index in this directory
   --rebuild                         Rebuild the existing index
   --drop                            Permanently remove the workspace index
   --yes                             Confirm --drop without prompting
@@ -514,9 +517,10 @@ Scan rules:
 Interactive remote indexing asks to allow once, allow for this workspace, or
 cancel. Non-interactive indexing requires --allow-remote or a workspace grant.
 
-A new workspace name defaults to root directory name; use --name if it is taken.
-Names are case-sensitive and unique within the per-user registry. Naming an
-existing workspace renames it while preserving file IDs and active storage.
+A new workspace name defaults to the root directory name. Names are labels and
+may repeat. Source files and their index can move together without rebuilding
+when their relative layout stays the same. Use an explicit source and --index-dir
+to repair the binding after moving the source separately.
 
 This version indexes text only with one embedding model per workspace.
 Explicit zg --index requires --embedding, ZVEC_GREP_EMBEDDING, or a configured
@@ -534,6 +538,7 @@ provide desired scan rules again.
 
 Environment:
   ZVEC_GREP_MODE         Default client mode: direct, server, or auto
+  ZVEC_GREP_INDEX_DIR    Workspace index directory (default: <root>/.zvec-grep)
   ZVEC_GREP_EMBEDDING    Default model for new indexes and auth grant
   ZVEC_GREP_API_KEY      Embedding provider credential fallback
   ZVEC_GREP_ENDPOINT     Remote Embedding endpoint fallback
@@ -582,8 +587,10 @@ const AUTH_HELP: &str = r"Usage:
   zg --auth status [root]
   zg --auth revoke [root]
 
-Manage the signed Remote Embedding grant stored in the Workspace under
-.zvec-grep/authorization.json. Workspace grants are shared by zg CLI and zg MCP.
+Manage the signed Remote Embedding grant in the selected index directory.
+Use --index-dir <path> or ZVEC_GREP_INDEX_DIR to override <root>/.zvec-grep.
+Workspace grants are shared by zg CLI and zg MCP on the same machine; moving
+the source or using another machine requires renewed authorization.
 
 --embedding selects the Remote Embedding model to authorize; it does not run
 embedding. If omitted, auth grant uses the existing Workspace index model, then
