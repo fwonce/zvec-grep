@@ -377,7 +377,7 @@ bash scripts/check.sh
 ## Native and CUDA builds
 
 The safe llama API and the C5 FFI boundary share the same pinned
-`zvec-ai/llama-cpp-rs` revision (`5cdbe2b7d1b24174a1151f80b6e6bc44ff8f80c4`).
+`zvec-ai/llama-cpp-rs` revision (`6077c595d91a147fc86f0eb8be8da34bf3a3c606`).
 Its sys crate automatically selects the SHA256-pinned `zvec-0.1.154-r1` SDK
 when target, features and native options match. Matching builds reuse native
 libraries and bindings without executing bindgen, CMake, C++ or CUDA compilation;
@@ -385,6 +385,13 @@ Rust application code still compiles normally. The SDK covers the five release
 targets, including both x64 CUDA plugins. CPU-only Linux/Windows x64 and custom
 native configurations use source builds in default `auto` mode. A download or
 integrity failure is an error, not a silent source fallback.
+
+The fork no longer registers llama.cpp as a Git submodule. Cargo fetches only
+the Rust bindings; matching SDK builds never fetch native source. Only explicit
+`source` builds or a configuration mismatch in `auto` acquire the hash-verified,
+fixed-revision source archive, cached under `$CARGO_HOME/llama-cpp-sources`
+(override with `LLAMA_CPP_SOURCE_CACHE`). The native revision, SDK and ABI are
+unchanged by this source-acquisition optimization.
 
 `LLAMA_CPP_BUILD_MODE=prebuilt` requires a matching SDK; `source` explicitly
 rebuilds llama.cpp. `LLAMA_CPP_RUNTIME_CACHE` controls the verified SDK cache
@@ -648,15 +655,23 @@ Linux, macOS and Windows. Each test job compiles the workspace tests once, runs
 them with pinned cargo-nextest, and reuses the CLI and test binary for smoke
 checks and all three real models (Model2Vec, ORT and llama.cpp), without a separate
 build per model.
-For manual runs, `cuda_verify=true` switches Linux/Windows test jobs to GPU
-runners and enables `zg/cuda` from the first compilation, requiring the matching
-prebuilt SDK. The same binaries
-then run the ordinary tests and real models, plus ORT/llama.cpp CUDA inference
-with actual GPU execution evidence and no CPU fallback. Both GPU jobs also run
-the C5 CPU-to-CUDA same-process and CPU-plugin override isolation tests from
-existing binaries, retaining `c5-*.log` evidence. Model2Vec stays on CPU; macOS
-and the separate non-CUDA quality job remain unchanged. Quality, default tests
-and CUDA tests have separate build caches. `platform` defaults to `all`;
+For manual runs, `cuda_verify=true` enables `zg/cuda` from the first compilation,
+requiring the matching prebuilt SDK, but compilation, workspace tests, all three
+CPU model checks and build-cache uploads still run on ordinary CPU runners.
+Linux uses the Ubuntu 24.04 builder without GPU access or CUDA runtime libraries;
+Windows uses `windows-2022`, matching the GPU image's OS generation.
+After the CPU gates pass, separate GPU jobs download a `rust-cuda-tests-<platform>`
+artifact containing only two test executables and their runtime libraries.
+The bundle is checked against the resolved source SHA and per-file hashes, then
+run from a new path with explicit native-library lookup. GPU jobs install no Rust
+toolchain/MSVC, compile nothing and neither restore nor save Cargo build caches.
+They retain DLL loading checks, real ORT/llama.cpp CUDA inference with actual GPU
+evidence and no CPU fallback, plus the C5 CPU-to-CUDA same-process and CPU-plugin
+override isolation tests (`c5-*.log`). CUDA 12 GGUF fallback coverage remains in
+publish CI; Rust CUDA CI tests the CUDA 13 GGUF primary and CUDA 12 ORT.
+Model2Vec stays on CPU; macOS and the separate non-CUDA quality job remain
+unchanged. Quality, default tests and CUDA builds have separate build caches.
+`platform` defaults to `all`;
 select `linux` or `windows` to limit test platforms. Optional `ref` selects the
 reviewed source; otherwise the workflow's selected commit is used. All jobs
 check out the same resolved SHA. This workflow does no npm packaging or publishing.

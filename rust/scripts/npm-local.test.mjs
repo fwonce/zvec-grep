@@ -4,6 +4,7 @@ import test from "node:test";
 import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   buildNative,
@@ -346,6 +347,88 @@ test("explicit prebuilt mode selects CUDA without probing nvcc and still honors 
     assert.equal(resolveBuildVariant(entry, false, noCompiler, "prebuilt"), defaultReleaseVariant(entry));
     assert.equal(resolveBuildVariant(entry, true, noCompiler, "prebuilt"), "cpu");
   }
+});
+
+test("GPU test bundle packaging selects current files and verifies relocated payloads", () => {
+  // File-transport coverage only; real CPU/CUDA inference remains in the workflow.
+  const result = spawnSync(process.platform === "win32" ? "python" : "python3", ["-c", String.raw`
+import json, os, pathlib, sys, tarfile, tempfile, types
+sys.path.insert(0, sys.argv[1])
+import runtime
+with tempfile.TemporaryDirectory(prefix="zg-test-bundle-") as temporary:
+    root = pathlib.Path(temporary)
+    backend = root / "SDK 中文/lib"
+    profile = root / "build/debug"
+    for directory in (backend / "cuda12", profile / "deps", root / "zvec", root / "stale"):
+        directory.mkdir(parents=True)
+    for name in ("llama.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll", "ggml-cuda.dll",
+                 "cuda12/ggml-cuda.dll", "llama.lib"):
+        (backend / name).write_bytes(name.encode())
+    (backend.parent / "manifest.json").write_text(json.dumps({
+        "files": {p.relative_to(backend.parent).as_posix(): runtime.digest(p)
+                  for p in backend.rglob("*") if p.is_file()}}))
+    for name in ("onnxruntime.dll", "onnxruntime_providers_shared.dll", "onnxruntime_providers_cuda.dll"):
+        (profile / name).write_bytes(name.encode())
+    (root / "zvec/zvec_c_api.dll").write_bytes(b"current zvec")
+    (root / "stale/zvec_c_api.dll").write_bytes(b"must not be selected")
+    records = [
+        {"reason": "build-script-executed", "package_id": "llama-cpp-2",
+         "env": [["GGML_BACKENDS_DIR", str(backend)]]},
+        {"reason": "build-script-executed", "package_id": "zvec-rust-sys",
+         "linked_paths": ["native=" + str(root / "zvec")]},
+    ]
+    for name in ("zg_engine", "zg_llama_native"):
+        binary = profile / "deps" / (name + ".exe")
+        binary.write_bytes(name.encode())
+        binary.chmod(0o755)
+        records.append({"reason": "compiler-artifact", "target": {"name": name},
+                        "profile": {"test": True}, "features": ["cuda"], "executable": str(binary)})
+    messages = root / "messages.json"
+    def save():
+        messages.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+    save()
+    os.environ["SOURCE_SHA"] = "a" * 40
+    runtime.stage_test_bundle(messages, root / "tests.tgz")
+    relocated = root / "different path"
+    with tarfile.open(root / "tests.tgz") as archive:
+        # This archive was generated above, not downloaded. CI uses Python 3.12's
+        # data filter; the local packaging test also supports older macOS Python.
+        assert all(not m.issym() and not m.islnk() and
+                   pathlib.PurePosixPath(m.name).parts[0] == "cuda-tests" and
+                   ".." not in pathlib.PurePosixPath(m.name).parts for m in archive.getmembers())
+        archive.extractall(relocated)
+    bundle = relocated / "cuda-tests"
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    assert not any("cuda12" in p or p.endswith(".lib") for p in manifest["files"])
+    assert (bundle / "lib/zvec_c_api.dll").read_bytes() == b"current zvec"
+    if os.name != "nt":
+        assert (bundle / "bin/zg_engine.exe").stat().st_mode & 0o111
+    assert str(root) not in json.dumps(manifest)
+    runtime.os = types.SimpleNamespace(name="nt", environ=os.environ)
+    runtime.verify_test_bundle(bundle)
+    def rejected(action, message):
+        try:
+            action()
+        except (RuntimeError, FileNotFoundError) as error:
+            assert message in str(error), str(error)
+        else:
+            raise AssertionError("invalid bundle was accepted")
+    os.environ["SOURCE_SHA"] = "b" * 40
+    rejected(lambda: runtime.verify_test_bundle(bundle), "source commit")
+    os.environ["SOURCE_SHA"] = "a" * 40
+    (bundle / "bin/zg_engine.exe").write_bytes(b"changed")
+    rejected(lambda: runtime.verify_test_bundle(bundle), "SHA-256")
+    runtime.os = os
+    records[-2]["features"] = []
+    save()
+    rejected(lambda: runtime.stage_test_bundle(messages, root / "invalid.tgz"), "CUDA-enabled")
+    records[-2]["features"] = ["cuda"]
+    save()
+    (profile / "onnxruntime_providers_cuda.dll").unlink()
+    rejected(lambda: runtime.stage_test_bundle(messages, root / "missing.tgz"), "onnxruntime_providers_cuda")
+`, fileURLToPath(new URL("./cuda", import.meta.url))], { encoding: "utf8", timeout: 30_000 });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
 });
 
 test("Windows CUDA Cargo capture works with Legacy arguments, UTF-8 paths and build failures", async (t) => {

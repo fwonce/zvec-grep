@@ -14,6 +14,8 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tarfile
+import tempfile
 
 
 def digest(path):
@@ -38,10 +40,10 @@ def backend_directory(records):
                    for name, value in record.get("env", []) if name == "GGML_BACKENDS_DIR"}
     if len(directories) != 1:
         raise RuntimeError(f"Expected one active llama backend directory from Cargo: {directories}")
-    return directories.pop()
+    return directories.pop().resolve()
 
 
-def stage_runtime(messages, destination):
+def stage_runtime(messages, destination, *, include_fallback=True):
     records = cargo_records(messages)
     backend = backend_directory(records)
     windows = (backend / "ggml-cuda.dll").is_file()
@@ -95,7 +97,7 @@ def stage_runtime(messages, destination):
             files[source.name] = source
     if not any("ggml-cpu" in name for name in files):
         raise RuntimeError("Selected runtime has no CPU backend")
-    if manifest:
+    if manifest and include_fallback:
         fallback = backend / "cuda12" / plugin
         if not fallback.is_file():
             raise RuntimeError(f"SDK is missing its CUDA 12 fallback: {fallback}")
@@ -112,9 +114,93 @@ def stage_runtime(messages, destination):
     print(f"Staged {len(files)} llama runtime files from {'verified SDK' if manifest else 'source build'}: {backend}")
 
 
+def stage_test_bundle(messages, archive):
+    """Transfer only the two GPU test executables and their runtime dependencies.
+
+    GPU jobs do not need Cargo, SDK import archives, build output or the CUDA 12
+    GGUF fallback (covered by publish CI). The bundle layout uses relative paths;
+    the consumer selects lib/ explicitly instead of the compiled-in SDK path.
+    """
+    records = cargo_records(messages)
+    binaries = {}
+    for name in ("zg_engine", "zg_llama_native"):
+        matches = [record for record in records
+                   if record.get("reason") == "compiler-artifact"
+                   and record["target"]["name"] == name
+                   and record["profile"]["test"] and record.get("executable")]
+        if len(matches) != 1:
+            raise RuntimeError(f"Expected one current {name} test executable")
+        if name == "zg_engine" and "cuda" not in matches[0]["features"]:
+            raise RuntimeError("GPU test bundle requires CUDA-enabled engine tests")
+        binaries[name] = Path(matches[0]["executable"])
+    windows = binaries["zg_engine"].suffix == ".exe"
+    profile = binaries["zg_engine"].parent.parent
+    zvec = "zvec_c_api.dll" if windows else "libzvec_c_api.so"
+    # Only the active zvec build script's link directories, never stale OUT_DIRs.
+    zvec_dirs = {Path(value.removeprefix("native=")) for record in records
+                 if record.get("reason") == "build-script-executed"
+                 and "zvec-rust-sys" in record.get("package_id", "")
+                 for value in record.get("linked_paths", [])
+                 if value.startswith("native=")}
+    zvec_files = {directory / zvec for directory in zvec_dirs if (directory / zvec).is_file()}
+    if not zvec_files or len({digest(path) for path in zvec_files}) != 1:
+        raise RuntimeError(f"Missing or conflicting current zvec library: {zvec_files}")
+    ort = (["onnxruntime.dll", "onnxruntime_providers_shared.dll", "onnxruntime_providers_cuda.dll"]
+           if windows else
+           ["libonnxruntime.so.1", "libonnxruntime_providers_shared.so", "libonnxruntime_providers_cuda.so"])
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=archive.parent) as temporary:
+        bundle = Path(temporary) / "cuda-tests"
+        (bundle / "bin").mkdir(parents=True)
+        stage_runtime(messages, bundle / "lib", include_fallback=False)
+        for name, binary in binaries.items():
+            shutil.copy2(binary, bundle / "bin" / (name + (".exe" if windows else "")))
+        shutil.copy2(sorted(zvec_files)[0], bundle / "lib" / zvec)
+        for name in ort:
+            shutil.copy2(profile / name, bundle / "lib" / name)
+        # Record identity and transport integrity without leaking builder paths.
+        manifest = {
+            "source_sha": os.environ["SOURCE_SHA"],
+            "platform": "windows" if windows else "linux",
+            "files": {path.relative_to(bundle).as_posix(): digest(path)
+                      for path in sorted(bundle.rglob("*")) if path.is_file()},
+        }
+        (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        with tarfile.open(archive, "w:gz", compresslevel=3) as package:
+            package.add(bundle, arcname="cuda-tests")
+    print(f"GPU test bundle: {archive} ({archive.stat().st_size} bytes; no compiler or build cache)")
+
+
+def verify_test_bundle(bundle):
+    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    if manifest["source_sha"] != os.environ["SOURCE_SHA"]:
+        raise RuntimeError("GPU test bundle does not match the reviewed source commit")
+    platform = "windows" if os.name == "nt" else "linux"
+    if manifest["platform"] != platform:
+        raise RuntimeError("GPU test bundle platform mismatch")
+    actual = {path.relative_to(bundle).as_posix(): digest(path)
+              for path in bundle.rglob("*") if path.is_file() and path != bundle / "manifest.json"}
+    if actual != manifest["files"]:
+        raise RuntimeError("GPU test bundle file inventory or SHA-256 mismatch")
+    for name in ("zg_engine", "zg_llama_native"):
+        binary = bundle / "bin" / (name + (".exe" if platform == "windows" else ""))
+        if not binary.is_file():
+            raise RuntimeError(f"GPU test executable missing: {binary}")
+    print(f"Verified {len(actual)} GPU test payloads for {manifest['source_sha']}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cargo-messages", type=Path, required=True)
-    parser.add_argument("--destination", type=Path, required=True)
+    parser.add_argument("--cargo-messages", type=Path)
+    parser.add_argument("--destination", type=Path)
+    parser.add_argument("--test-archive", type=Path)
+    parser.add_argument("--verify-test-bundle", type=Path)
     args = parser.parse_args()
-    stage_runtime(args.cargo_messages, args.destination)
+    if args.verify_test_bundle:
+        verify_test_bundle(args.verify_test_bundle)
+    elif args.cargo_messages and args.test_archive:
+        stage_test_bundle(args.cargo_messages, args.test_archive)
+    elif args.cargo_messages and args.destination:
+        stage_runtime(args.cargo_messages, args.destination)
+    else:
+        parser.error("provide --verify-test-bundle or --cargo-messages with --destination/--test-archive")

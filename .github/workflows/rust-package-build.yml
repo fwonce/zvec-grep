@@ -54,8 +54,7 @@ jobs:
         shell: python
         run: |
           import os, pathlib
-          # Cargo checks out Git submodules before build.rs, even in prebuilt mode.
-          # Keep the pinned llama.cpp source tree below Windows MAX_PATH.
+          # Keep dependency/cache paths short, including on-demand source builds.
           cargo_home = pathlib.Path(pathlib.Path(os.environ["GITHUB_WORKSPACE"]).anchor) / "zg-cargo"
           (cargo_home / "bin").mkdir(parents=True, exist_ok=True)
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as environment:
