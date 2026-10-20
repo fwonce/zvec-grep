@@ -134,10 +134,27 @@ SM86 code, reducing installed size while retaining driver JIT compilation where
 compatible native code is unavailable. `CMAKE_CUDA_ARCHITECTURES` overrides the
 primary source build; `CUDA12_ARCHITECTURES` overrides only the fallback, which does not
 inherit the primary list. These build targets do not imply hardware validation
-on every GPU generation. The current runtime device-enumeration check is not
-a PTX/driver compatibility check: this release does not add PTX-version rejection
-or subprocess crash isolation, and does not claim support for every older
-CUDA 12 driver. CPU/GPU CI validates its specific driver/runtime environments.
+on every GPU generation.
+
+Before loading the 12.4 fallback, GGUF queries the active CUDA Driver API.
+Paths requiring the distribution's PTX 8.4 require `cuDriverGetVersion >= 12040`
+(driver capability for CUDA 12.4, not the installed Toolkit). Older CUDA 12
+drivers are allowed only when every visible device can use the native SM86
+cubin (SM86/89) and PTX JIT is not forced. A mixed set containing a PTX-only GPU
+therefore cannot use the old-driver exception. Failed queries or insufficient
+capability skip the fallback, log the reason, and preserve CPU execution; the
+process does not rewrite `CUDA_VISIBLE_DEVICES`.
+`GGML_BACKEND_PATH` overrides require `12040` before the directory loader runs,
+without a native-code exception for unknown custom architectures.
+Build-time custom `CUDA12_ARCHITECTURES` or an external `LLAMA_CPP_RUNTIME_DIR`
+likewise disable the exception; replacing plugins after a build is outside
+the distribution contract.
+The ordinary CUDA 13.1 primary path and independent ORT selection are unchanged.
+This preflight is not a PTX execution test or subprocess crash isolation: native
+driver aborts and later inference failures are not guaranteed to recover.
+CPU/GPU CI validates its specific driver/runtime environments, not every older
+driver. See NVIDIA's [minor-version compatibility caveats](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
+and [cubin compatibility rules](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/cuda-platform.html#binary-compatibility).
 
 The primary GGUF CUDA plugin remains directly under `lib/`; there is no new
 `lib/cuda13/` directory. Explicit CPU execution uses a selective CPU-plugin

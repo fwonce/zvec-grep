@@ -349,6 +349,99 @@ test("explicit prebuilt mode selects CUDA without probing nvcc and still honors 
   }
 });
 
+test("CUDA fallback uses the primary Cargo source record, including cached builds and overrides", async (t) => {
+  // Exercise real Cargo build-script metadata without compiling CUDA or
+  // downloading llama.cpp. Kernel compilation/inference stays in native CI.
+  const root = await mkdtemp(join(tmpdir(), "zg-fallback-source-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const project = join(root, "bindings");
+  const target = join(root, "target");
+  const cached = join(root, "source cache 中文");
+  const override = join(root, "source override 中文");
+  const revision = "5f55650a78f92aff4d48d671423e888fac0469ff";
+  for (const directory of [cached, override, join(project, "llama.cpp")]) {
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, "CMakeLists.txt"), "# source path fixture\n");
+  }
+  await mkdir(join(project, "src"));
+  await writeFile(join(project, "Cargo.toml"),
+    '[package]\nname = "llama-cpp-sys-2"\nversion = "0.0.0"\nedition = "2021"\nlinks = "llama"\n');
+  await writeFile(join(project, "Cargo.lock"),
+    'version = 4\n[[package]]\nname = "llama-cpp-sys-2"\nversion = "0.0.0"\n');
+  await writeFile(join(project, "src/lib.rs"), "");
+  await writeFile(join(project, "build.rs"), [
+    "fn main() {",
+    'println!("cargo:rerun-if-env-changed=ZG_TEST_SOURCE_DIR");',
+    'println!("cargo:source_dir={}", std::env::var("ZG_TEST_SOURCE_DIR").unwrap());',
+    `println!("cargo:source_revision=${revision}");`,
+    "}",
+  ].join("\n"));
+  const messages = join(root, "cargo-build.json");
+  const python = process.platform === "win32" ? "python" : "python3";
+  const scripts = fileURLToPath(new URL("./cuda", import.meta.url));
+  const inspect = (code, ...args) => {
+    const result = spawnSync(python, ["-c", String.raw`
+import importlib.util, json, pathlib, sys
+sys.path.insert(0, sys.argv[1])
+spec = importlib.util.spec_from_file_location("fallback", pathlib.Path(sys.argv[1]) / "build-fallback.py")
+fallback = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fallback)
+messages = pathlib.Path(sys.argv[2])
+` + code, scripts, messages, ...args], { encoding: "utf8", timeout: 30_000 });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+  };
+  for (const [index, source] of [cached, cached, override].entries()) {
+    const result = spawnSync("cargo", ["build", "--locked", "--offline", "--message-format=json"], {
+      cwd: project, env: { ...process.env, CARGO_TARGET_DIR: target, ZG_TEST_SOURCE_DIR: source },
+      encoding: "utf8", timeout: 120_000,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    await writeFile(messages, result.stdout);
+    const records = result.stdout.trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    if (index === 1) assert.ok(records.some((r) => r.reason === "compiler-artifact" && r.fresh));
+    inspect(String.raw`
+source, revision = fallback.source_build(messages)
+assert source == pathlib.Path(sys.argv[3]), (source, sys.argv[3])
+assert revision == sys.argv[4]
+command = fallback.configure(source, source / "build", source / "cuda", fallback.DEFAULT_ARCHITECTURES)
+assert command[command.index("-S") + 1] == str(source)
+`, source, revision);
+  }
+  inspect(String.raw`
+records = fallback.cargo_records(messages)
+build = next(r for r in records if r.get("reason") == "build-script-executed")
+output = pathlib.Path(build["out_dir"]).parent / "output"
+original = output.read_text(encoding="utf-8")
+def reject(expected):
+    try:
+        fallback.source_build(messages)
+    except RuntimeError as error:
+        assert expected in str(error), str(error)
+    else:
+        raise AssertionError("invalid primary source accepted")
+for text, error in [
+    ("cargo:source_revision=" + "a" * 40, "source_dir"),
+    (original + "\ncargo:source_dir=/stale\n", "source_dir"),
+    (original.replace(sys.argv[3], "relative/source"), "source is unavailable"),
+    (original.replace(sys.argv[3], str(output.parent / "missing")), "source is unavailable"),
+    (original.replace(sys.argv[4], "not-a-revision"), "source_revision"),
+]:
+    output.write_text(text, encoding="utf-8")
+    reject(error)
+output.write_text(original, encoding="utf-8")
+for changed, error in [
+    (records[:-1], "finish successfully"),
+    ([*records[:-1], {"reason": "build-finished", "success": False}], "finish successfully"),
+    ([r for r in records if r is not build], "one active"),
+    ([build, *records], "one active"),
+]:
+    messages.write_text("\n".join(json.dumps(r) for r in changed), encoding="utf-8")
+    reject(error)
+`, override, revision);
+});
+
 test("GPU test bundle packaging selects current files and verifies relocated payloads", () => {
   // File-transport coverage only; real CPU/CUDA inference remains in the workflow.
   const result = spawnSync(process.platform === "win32" ? "python" : "python3", ["-c", String.raw`

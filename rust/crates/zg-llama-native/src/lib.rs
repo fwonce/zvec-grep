@@ -1,12 +1,16 @@
 //! Selective CPU plugin loading, without ggml's all-backend directory scan or
-//! `GGML_BACKEND_PATH` override. Registry access is coordinated by the engine
-//! with its model/context initialization; plugins stay registered for process life.
+//! `GGML_BACKEND_PATH` override, plus an optional CUDA driver preflight used only
+//! for GPU requests. Registry access is coordinated by the engine with its
+//! model/context initialization; plugins stay registered for process life.
 
 use std::{
     ffi::CString,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard, PoisonError},
 };
+
+mod cuda;
+pub use cuda::check_cuda12_driver;
 
 static REGISTRY: Mutex<()> = Mutex::new(());
 

@@ -3,16 +3,48 @@
 
 import argparse
 import hashlib
-import json
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 
-WORKSPACE = Path(__file__).resolve().parents[2]
+from runtime import cargo_records
+
 # Keep the CUDA 12 compatibility plugin small: PTX plus native code for sm_86.
 DEFAULT_ARCHITECTURES = "50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real"
+
+
+def source_build(messages):
+    records = cargo_records(messages)
+    if not records or records[-1].get("reason") != "build-finished" or not records[-1].get("success"):
+        raise RuntimeError("The primary Cargo build must finish successfully before building the fallback")
+    builds = [record for record in records
+              if record.get("reason") == "build-script-executed"
+              and "llama-cpp-sys-2" in record.get("package_id", "")]
+    if len(builds) != 1:
+        raise RuntimeError("Expected one active llama sys build script in the primary Cargo messages")
+    # Cargo retains build-script stdout beside this invocation's OUT_DIR, also
+    # on cache hits. The pinned sys crate records its verified source here;
+    # custom metadata is not included in Cargo's JSON build-script record.
+    output = Path(builds[0]["out_dir"]).parent / "output"
+    lines = output.read_text(encoding="utf-8").splitlines()
+    metadata = {}
+    for key in ("source_dir", "source_revision"):
+        values = [line.removeprefix(f"cargo:{key}=") for line in lines
+                  if line.startswith(f"cargo:{key}=")]
+        if len(values) != 1 or not values[0]:
+            raise RuntimeError(f"Missing or ambiguous {key} in primary build output: {output}")
+        metadata[key] = values[0]
+    source = Path(metadata["source_dir"])
+    if not source.is_absolute() or not (source / "CMakeLists.txt").is_file():
+        raise RuntimeError(f"The primary build's verified llama.cpp source is unavailable: {source}")
+    revision = metadata["source_revision"]
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise RuntimeError(f"Invalid source_revision in primary build output: {output}")
+    # Preserve the compiler-compatible Windows spelling emitted by the sys
+    # crate; do not canonicalize it back to a verbatim \\?\ path.
+    return source, revision
 
 
 def configure(source, build, cuda_root, architectures):
@@ -32,22 +64,20 @@ def configure(source, build, cuda_root, architectures):
     return args
 
 
-def build_plugin(bundle, cuda_root, target):
+def build_plugin(bundle, cuda_root, target, messages):
+    source, revision = source_build(messages)
     nvcc = cuda_root / "bin" / ("nvcc.exe" if os.name == "nt" else "nvcc")
     version = subprocess.check_output([str(nvcc), "--version"], encoding="utf-8")
     if not re.search(r"release 12\.4,", version):
         raise RuntimeError("The fallback plugin must be compiled with CUDA 12.4")
     if not (bundle / "bin" / ("zg.exe" if os.name == "nt" else "zg")).is_file():
         raise RuntimeError("Build the shared primary bundle before the fallback plugin")
-    metadata = json.loads(subprocess.check_output(
-        ["cargo", "metadata", "--locked", "--format-version", "1"], cwd=WORKSPACE, encoding="utf-8"))
-    package = next(p for p in metadata["packages"] if p["name"] == "llama-cpp-sys-2")
-    source = Path(package["manifest_path"]).parent / "llama.cpp"
     # The primary build exports CMAKE_CUDA_ARCHITECTURES; do not inherit it.
     architectures = os.environ.get("CUDA12_ARCHITECTURES") or DEFAULT_ARCHITECTURES
+    print(f"CUDA 12.4 fallback source: {source} ({revision})", flush=True)
     print(f"CUDA 12.4 fallback architectures: {architectures}", flush=True)
     configuration = configure(source, target, cuda_root, architectures)
-    key = hashlib.sha256((package["id"] + version + repr(configuration)).encode()).hexdigest()[:16]
+    key = hashlib.sha256((revision + version + repr(configuration)).encode()).hexdigest()[:16]
     build = target / "ggml-cuda12" / key
     subprocess.run(configure(source, build, cuda_root, architectures), check=True)
     subprocess.run(["cmake", "--build", str(build), "--config", "Release", "--target", "ggml-cuda",
@@ -68,7 +98,9 @@ def build_plugin(bundle, cuda_root, target):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--cargo-messages", type=Path, required=True,
+                        help="JSON messages from the successful primary CUDA Cargo build")
     parser.add_argument("--cuda-root", type=Path, default=Path("/usr/local/cuda"))
     parser.add_argument("--target-dir", type=Path, default=Path(os.environ.get("CARGO_TARGET_DIR", "target")))
     args = parser.parse_args()
-    build_plugin(args.bundle.resolve(), args.cuda_root.resolve(), args.target_dir.resolve())
+    build_plugin(args.bundle.resolve(), args.cuda_root.resolve(), args.target_dir.resolve(), args.cargo_messages)

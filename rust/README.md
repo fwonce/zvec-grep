@@ -461,7 +461,22 @@ to CPU when a GPU/backend is unavailable. `--device cpu` or
 explicit CPU execution loads only CPU plugins, ignores `GGML_BACKEND_PATH`,
 and supplies an empty GPU device list. Optional GPU registration is separate:
 a later GPU request in the same process can still use preinstalled plugins.
-GPU requests retain the upstream `GGML_BACKEND_PATH` override behavior.
+Before opening the CUDA 12.4 fallback, GGUF checks the active CUDA Driver API
+capability, not the installed Toolkit version. PTX 8.4 paths require a reported
+capability of at least `12040` (CUDA 12.4). Older CUDA 12 drivers remain eligible
+when every visible GPU can use the distribution's native SM86 code (SM86/89)
+and PTX JIT is not forced. On those older drivers, any visible PTX-only device
+rejects the whole fallback. Failed probes or insufficient capability likewise
+skip it with a diagnostic and retain CPU execution.
+Explicit CPU requests do not run this probe; ORT selection is independent.
+GPU requests retain the upstream `GGML_BACKEND_PATH` override behavior, but an
+override requires `12040` before any GPU plugin scan: its architecture list is
+unknown, so it cannot use the SM86 exception or bypass the fallback guard.
+Build-time custom `CUDA12_ARCHITECTURES` or an external `LLAMA_CPP_RUNTIME_DIR`
+also disable the exception. Replacing plugins after a build is outside this
+distribution contract.
+This is a compatibility preflight, not subprocess isolation or a guarantee that
+every driver/runtime failure can be caught and retried on CPU.
 
 See [npm distribution](npm/README.md) for the complete layout, OS/backend
 support matrix, runtime dependencies, and publication policy.

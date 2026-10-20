@@ -92,6 +92,7 @@ chmod 0755 "${staging_dir}"
 if [[ "${1:-}" != "--primary-only" ]]; then
   if [[ ! -f "${staging_dir}/lib/cuda12/libggml-cuda.so" ]]; then
     python3 scripts/cuda/build-fallback.py --bundle "${staging_dir}" \
+      --cargo-messages "${target_dir}/cuda-build.json" \
       --cuda-root "${CUDA12_ROOT:-/usr/local/cuda-12.4}"
   fi
   bash scripts/cuda/check.sh "${staging_dir}"

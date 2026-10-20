@@ -109,7 +109,8 @@ try {
         if (-not (Test-Path -LiteralPath (Join-Path $libDirectory "cuda12/ggml-cuda.dll"))) {
             $cuda12Root = if ($env:CUDA12_ROOT) { $env:CUDA12_ROOT } else { $env:CUDA_PATH_V12_4 }
             if (-not $cuda12Root) { throw "Set CUDA12_ROOT to the CUDA 12.4 toolkit directory" }
-            & python scripts/cuda/build-fallback.py --bundle $stagingDirectory --cuda-root $cuda12Root
+            & python scripts/cuda/build-fallback.py --bundle $stagingDirectory `
+                --cargo-messages $messages --cuda-root $cuda12Root
             if ($LASTEXITCODE -ne 0) { throw "Building the CUDA 12.4 fallback failed" }
         }
         if (-not $SkipAudit) {

@@ -890,7 +890,8 @@ fn embed_error(entry: LlamaCppConfig, cause: ModelError) -> ModelError {
 
 // Called only while the registry guard is held. Explicit CPU ignores
 // GGML_BACKEND_PATH: it must not load an arbitrary out-of-tree GPU plugin.
-// GPU requests retain the upstream loader's override behavior.
+// GPU requests retain the upstream loader's override behavior subject to the
+// driver preflight in backend_loading (custom architectures get no SM86 waiver).
 fn initialize_llama_backend(
     wants_gpu: bool,
     registry: &BackendRegistryGuard,

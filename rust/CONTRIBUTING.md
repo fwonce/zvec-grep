@@ -73,12 +73,18 @@ RUSTDOCFLAGS="-D warnings" cargo doc -p zg-engine --no-deps
 CUDA-specific helpers live only in `scripts/cuda/`: `build.sh`/`build.ps1`
 assemble the bundle; `runtime.py` stages the exact native runtime selected by
 Cargo, including the SDK's CUDA 12 fallback. In explicit source mode,
-`build-fallback.py` builds only the CUDA 12.4 plugin.
+`build-fallback.py` builds only the CUDA 12.4 plugin, using `--cargo-messages`
+from the successful primary build to locate that build's verified source
+directory and revision. This supports the fork's source cache and
+`LLAMA_CPP_SOURCE_DIR` override without assuming a submodule directory or
+selecting a stale build tree. Prebuilt bundles copy the SDK's fallback instead.
 `prepare-onnxruntime.py` verifies and stages official ORT archives, and
 `check.sh`/`check.ps1` audit the resulting runtime linkage. `prepare-windows.ps1`
-and the pinned runtime requirements provision Windows linker/runtime tools.
+with `-DriverOnly` and the pinned runtime requirements prepare Windows GPU
+drivers/runtime libraries; compiler tools stay on CPU runners.
 `cuda-builder.Dockerfile` provides Linux Rust build dependencies; CI selects a
-compiler-free base image for packaging or a CUDA runtime image for GPU tests.
+base image without a CUDA compiler for packaging and uses separate CUDA runtime
+images for GPU tests.
 `e2e.py` validates installed packages on a real GPU or, with `--cpu-only`, on a
 host without loadable CUDA libraries. CUDA validation consists of actual
 Rust compilation/linking against the prebuilt SDK, linkage audits and GPU
@@ -96,28 +102,34 @@ workspace tests once, runs them with pinned cargo-nextest 0.9.148 and checks the
 CLI. It reuses the compiled `zg-engine` test binary for all three real models
 without a separate Cargo build per model.
 
-For manual `workflow_dispatch`, set `cuda_verify=true` to move the selected
-Linux/Windows test jobs to `gpu-linux-t4` and `gpu-windows-t4` in `gpu-runners`.
+For manual `workflow_dispatch`, set `cuda_verify=true` to build CUDA-enabled
+tests on ordinary CPU runners and add separate validation jobs on
+`gpu-linux-t4` and `gpu-windows-t4` in `gpu-runners`.
 `platform` accepts `all` (the default), `linux`, or `windows`. Optional `ref`
 selects the reviewed source; otherwise the workflow's selected commit is used.
 The source job resolves it once to a SHA for all subsequent checkouts.
-CUDA test jobs enable `zg/cuda` from the first Rust compilation and require the
-pinned multi-architecture SDK; real execution uses T4 (SM 75).
+CPU build/test jobs enable `zg/cuda` from the first Rust compilation and require
+the pinned multi-architecture SDK. They run workspace/CPU model tests and upload
+`rust-cuda-tests-<platform>`: the two selected test executables, runtime libraries
+and a source-SHA/file-hash manifest, not the compiler or build cache. GPU jobs
+verify and execute that relocated bundle on T4 (SM 75), without Cargo or native
+compilation.
 The quality job remains non-CUDA, and macOS stays non-CUDA when `platform=all`.
 This workflow does not call `rust-package-build.yml` or build/install npm packages;
 it is not a substitute for package-level GPU validation.
 
-The model stage runs the existing ignored real-model test for Model2Vec
+The CPU model stage runs the existing ignored real-model test for Model2Vec
 (`local/potion-code-16m-v2`), Transformers/ORT (`local/all-minilm-l6-v2`) and
-llama.cpp (`local/embeddinggemma-300m`). CUDA jobs additionally run ORT and GGUF
+llama.cpp (`local/embeddinggemma-300m`). Separate GPU jobs run ORT and GGUF
 with `ZVEC_GREP_SMOKE_DEVICE=cuda`, sequentially within each platform job;
 Model2Vec remains CPU-only. Linux uses separate CUDA 12/cuDNN and CUDA 13 runtime
 containers for these GPU cases, with the same compiled test executable. Windows
-installs both runtime families before compiling the CUDA-enabled tests.
+installs both runtime families before executing the downloaded test binaries.
 The test downloads, loads and embeds with each model and checks vector dimensions
-and finite/nonzero output. CUDA jobs also reuse the CLI validator to require CUDA
+and finite/nonzero output. GPU jobs reuse the CLI validator's evidence assertions to require CUDA
 graph placement or positive GGUF layer offload without CPU fallback. Logs are
-retained as `real-model-evidence-<platform>-<cuda|default>`, including on failure.
+retained as `real-model-evidence-<platform>-<cuda|default>` for CPU build/test
+jobs and `real-model-evidence-<platform>-gpu` for GPU jobs, including on failure.
 Any failed model case or CUDA evidence assertion fails the platform job.
 
 Both GPU jobs then explicitly run the ignored C5 tests from those same compiled
@@ -125,7 +137,7 @@ test binaries, each in a fresh process: `cached_embeddinggemma_uses_cuda` verifi
 CPU inference followed by CUDA inference in one process, while
 `real_cpu_plugin_ignores_gpu_override` verifies that a real CPU plugin remains
 the only registered backend even with `GGML_BACKEND_PATH` pointing at a present
-CUDA plugin. They reuse the model cache and Cargo-reported backend directory;
+CUDA plugin. They reuse the model cache and the relocated bundle's `lib/` directory;
 no extra build is performed. Each selection must report exactly one passing
 test, and `c5-*.log` files are retained with the other real-model evidence.
 The packaged Windows CLI also exercises delayed DLL imports, unlike ordinary
@@ -231,17 +243,14 @@ CUDA Driver API initialization and device enumeration. A reboot requirement, an
 inactive upgrade or failed CUDA initialization fails the job explicitly; the
 helper never reboots the runner.
 
-The Rust CI CUDA test job also provisions VS 2022 C++ linker tools, the Windows
-SDK and the repository-pinned Rust toolchain. It no longer installs the old
-MSVC 14.38 fallback toolset or libclang. llama itself
-uses the pinned prebuilt SDK: CUDA 13/12 plugins and generated bindings are reused,
-not rebuilt. CUDA runtime libraries are still installed for actual inference.
-The GPU image
-may lack `pwsh`, so the helper downloads a SHA256-pinned portable
-PowerShell 7.6.7 into `RUNNER_TEMP` for the nextest installer. A separate `pwsh`
-step verifies shell lookup before installing nextest. Package GPU
-jobs call the helper with `-DriverOnly` and install only runtime libraries, not
-Rust/C++/CUDA build toolchains. This provisioning is not part of npm installation.
+Rust CI and package GPU jobs both call the helper with `-DriverOnly`; they do
+not provision Visual Studio, Rust, nextest or portable PowerShell on the GPU
+runner. Rust compilation, linking and nextest run on ordinary CPU runners
+using the pinned SDK. GPU jobs install only the driver/runtime prerequisites
+and execute the already-built test binaries or installed CLI. Rust CUDA CI
+transfers the CUDA 13 GGUF plugin and ORT CUDA 12 provider; package CI also
+validates the CUDA 12.4 GGUF fallback. This provisioning is not part of npm
+installation.
 Both paths configure CUDA DLL lookup, including CUDA 13's `bin/x64` as well as
 `bin`, and independently load the selected GGUF CUDA plugin and its dependencies
 before real inference. DLL-load evidence is saved in `windows-cuda-load.json`

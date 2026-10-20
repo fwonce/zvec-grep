@@ -1,6 +1,18 @@
 use super::*;
 
 #[test]
+fn only_distribution_architectures_receive_the_native_code_exception() {
+    assert!(distribution_fallback(None, None));
+    assert!(distribution_fallback(
+        Some("50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real"),
+        None
+    ));
+    assert!(!distribution_fallback(Some("86-virtual"), None));
+    assert!(!distribution_fallback(Some("native"), None));
+    assert!(!distribution_fallback(None, Some("/custom/sdk")));
+}
+
+#[test]
 fn cpu_initialization_does_not_register_gpu_plugins() {
     let state = BackendInitialization::new();
     assert_eq!(
@@ -103,10 +115,15 @@ fn working_primary_does_not_load_fallback() {
     let root = tempfile::tempdir().expect("temporary bundle");
     std::fs::create_dir(root.path().join("cuda12")).expect("fallback directory");
     let mut loaded = Vec::new();
-    let selected = load_with_fallback(root.path(), |path| {
-        loaded.push(path.to_path_buf());
-        true
-    });
+    let selected = load_with_fallback(
+        root.path(),
+        false,
+        |_| panic!("primary needs no preflight"),
+        |path| {
+            loaded.push(path.to_path_buf());
+            true
+        },
+    );
     assert_eq!(selected, Some("13.1"));
     assert_eq!(loaded, [root.path()]);
 }
@@ -117,10 +134,15 @@ fn failed_primary_uses_cuda12() {
     let fallback = root.path().join("cuda12");
     std::fs::create_dir(&fallback).expect("fallback directory");
     let mut loaded = Vec::new();
-    let selected = load_with_fallback(root.path(), |path| {
-        loaded.push(path.to_path_buf());
-        path == fallback
-    });
+    let selected = load_with_fallback(
+        root.path(),
+        false,
+        |_| Ok(()),
+        |path| {
+            loaded.push(path.to_path_buf());
+            path == fallback
+        },
+    );
     assert_eq!(selected, Some("12.4"));
     assert_eq!(loaded, [root.path(), &fallback]);
 }
@@ -131,10 +153,15 @@ fn no_cuda_keeps_the_cpu_backend_loaded() {
     std::fs::create_dir(root.path().join("cuda12")).expect("fallback directory");
     let mut attempts = 0;
     assert_eq!(
-        load_with_fallback(root.path(), |_| {
-            attempts += 1;
-            false
-        }),
+        load_with_fallback(
+            root.path(),
+            false,
+            |_| Ok(()),
+            |_| {
+                attempts += 1;
+                false
+            }
+        ),
         None
     );
     assert_eq!(attempts, 2);
@@ -145,11 +172,89 @@ fn missing_fallback_is_not_loaded() {
     let root = tempfile::tempdir().expect("temporary bundle");
     let mut attempts = 0;
     assert_eq!(
-        load_with_fallback(root.path(), |_| {
-            attempts += 1;
-            false
-        }),
+        load_with_fallback(
+            root.path(),
+            false,
+            |_| panic!("no fallback"),
+            |_| {
+                attempts += 1;
+                false
+            }
+        ),
         None
     );
     assert_eq!(attempts, 1);
+}
+
+#[test]
+fn rejected_fallback_is_never_opened_and_cpu_remains_usable() {
+    let root = tempfile::tempdir().expect("bundle");
+    std::fs::create_dir(root.path().join("cuda12")).expect("fallback");
+    let state = BackendInitialization::new();
+    let mut loaded = Vec::new();
+    state
+        .initialize(
+            true,
+            || Ok(7),
+            |_| {
+                let selected = load_with_fallback(
+                    root.path(),
+                    false,
+                    |native_sm86| {
+                        assert!(native_sm86);
+                        Err("PTX requires a newer driver".to_owned())
+                    },
+                    |path| {
+                        loaded.push(path.to_path_buf());
+                        false
+                    },
+                );
+                assert_eq!(selected, None);
+            },
+        )
+        .expect("CPU core survives GPU rejection");
+    assert_eq!(loaded, [root.path()]);
+    assert_eq!(
+        state.initialize(false, || panic!("reuse CPU"), |_| panic!("no GPU")),
+        Ok(&7)
+    );
+}
+
+#[test]
+fn custom_plugin_cannot_bypass_preflight_through_the_primary_loader() {
+    let root = tempfile::tempdir().expect("bundle");
+    assert_eq!(
+        load_with_fallback(
+            root.path(),
+            true,
+            |native_sm86| {
+                assert!(!native_sm86);
+                Err("custom architecture unknown on older driver".to_owned())
+            },
+            |_| panic!("must not load override")
+        ),
+        None
+    );
+}
+
+#[test]
+fn custom_plugin_with_compatible_driver_retains_upstream_loader_behavior() {
+    let root = tempfile::tempdir().expect("bundle");
+    let mut checks = Vec::new();
+    assert_eq!(
+        load_with_fallback(
+            root.path(),
+            true,
+            |native_sm86| {
+                checks.push(native_sm86);
+                Ok(())
+            },
+            |path| {
+                assert_eq!(path, root.path());
+                true
+            }
+        ),
+        Some("13.1")
+    );
+    assert_eq!(checks, [false]);
 }
