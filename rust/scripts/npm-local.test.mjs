@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -345,6 +346,63 @@ test("explicit prebuilt mode selects CUDA without probing nvcc and still honors 
     assert.equal(resolveBuildVariant(entry, false, noCompiler, "prebuilt"), defaultReleaseVariant(entry));
     assert.equal(resolveBuildVariant(entry, true, noCompiler, "prebuilt"), "cpu");
   }
+});
+
+test("Windows CUDA Cargo capture works with Legacy arguments, UTF-8 paths and build failures", async (t) => {
+  // Use Windows PowerShell 5 itself on Windows; pwsh can exercise Legacy
+  // native argument passing locally without a Windows or CUDA toolchain.
+  const shell = process.platform === "win32" ? "powershell.exe" : "pwsh";
+  const probe = spawnSync(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"]);
+  if (probe.error?.code === "ENOENT" && process.platform !== "win32") {
+    t.skip("PowerShell is unavailable; Windows runs this with powershell.exe");
+    return;
+  }
+  assert.ifError(probe.error);
+  assert.equal(probe.status, 0);
+  const root = await mkdtemp(join(tmpdir(), "zg-cargo-capture-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const project = join(root, "project 中文");
+  const target = join(root, "target 中文");
+  await mkdir(join(project, "src"), { recursive: true });
+  await mkdir(target);
+  await writeFile(join(project, "Cargo.toml"),
+    '[package]\nname = "zg"\nversion = "0.0.0"\nedition = "2021"\n[features]\ncuda = []\n');
+  await writeFile(join(project, "Cargo.lock"),
+    'version = 4\n[[package]]\nname = "zg"\nversion = "0.0.0"\n');
+  await writeFile(join(project, "src/main.rs"), "fn main() {}\n");
+  const source = await readFile(new URL("./cuda/build.ps1", import.meta.url), "utf8");
+  const start = source.indexOf('$messages = Join-Path');
+  const end = source.indexOf('$profileDirectory = Join-Path', start);
+  assert.ok(start >= 0 && end > start, "locate the real Cargo capture and exit-code guard");
+  const script = join(root, "capture.ps1");
+  await writeFile(script, [
+    "param([string]$targetDirectory)",
+    '$ErrorActionPreference = "Stop"',
+    '$PSNativeCommandArgumentPassing = "Legacy"',
+    ...(process.platform === "win32" ? [] : ["Set-Alias -Name python -Value python3"]),
+    source.slice(start, end),
+    "exit $LASTEXITCODE",
+  ].join("\n"));
+  const execute = () => spawnSync(shell,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script, target],
+    { cwd: project, env: { ...process.env, CARGO_TARGET_DIR: target, CARGO_TERM_COLOR: "never" },
+      encoding: "utf8", timeout: 120_000 });
+  const records = async () => (await readFile(join(target, "cuda-build.json"), "utf8"))
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const success = execute();
+  assert.ifError(success.error);
+  assert.equal(success.status, 0, success.stdout + success.stderr);
+  const output = await records();
+  assert.equal(output.at(-1).success, true);
+  assert.ok(output.some((record) => record.reason === "compiler-artifact" &&
+    record.executable && record.manifest_path.includes("project 中文") &&
+    record.features.includes("cuda")));
+  await writeFile(join(project, "src/main.rs"), "compile_error!(\"expected capture failure\");\nfn main() {}\n");
+  const failure = execute();
+  assert.ifError(failure.error);
+  assert.notEqual(failure.status, 0);
+  assert.match(failure.stdout + failure.stderr, /cargo build failed with exit code 101/);
+  assert.equal((await records()).at(-1).success, false);
 });
 
 test("no-build uses the last successful variant rather than stale CUDA artifacts", async (t) => {

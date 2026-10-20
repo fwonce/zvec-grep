@@ -54,8 +54,14 @@ $targetDirectory = [IO.Path]::GetFullPath($targetDirectoryValue)
 $messages = Join-Path $targetDirectory "cuda-build.json"
 # Preserve Cargo's UTF-8 bytes and exit code (including non-ASCII local paths)
 # instead of passing JSON through PowerShell 5's text/code-page conversion.
-& python -c 'import subprocess,sys; sys.exit(subprocess.run(sys.argv[2:], stdout=open(sys.argv[1], "wb")).returncode)' `
-    $messages cargo build --locked --release --package zg --features cuda --message-format=json-render-diagnostics
+# Send ASCII Python source on stdin: Legacy native argument passing strips
+# embedded double quotes in python -c; paths stay separate native arguments.
+@'
+import subprocess, sys
+with open(sys.argv[1], "wb") as output:
+    result = subprocess.run(sys.argv[2:], stdout=output)
+sys.exit(result.returncode)
+'@ | python - $messages cargo build --locked --release --package zg --features cuda --message-format=json-render-diagnostics
 if ($LASTEXITCODE -ne 0) {
     throw "cargo build failed with exit code $LASTEXITCODE"
 }
