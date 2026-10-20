@@ -320,8 +320,8 @@ impl ScanArgs {
     fn update(&self) -> ScanRulesUpdate {
         ScanRulesUpdate {
             globs: (!self.glob_rules.is_empty()).then(|| self.glob_rules.clone()),
-            hidden: self.hidden,
-            no_ignore: self.no_ignore,
+            include_hidden: self.hidden,
+            use_default_ignores: self.no_ignore.map(|value| !value),
             nested_git: self.nested_git,
             ignore_files: (!self.ignore_files.is_empty()).then(|| self.ignore_files.clone()),
             max_depth: self.max_depth.map(Some),
@@ -566,12 +566,6 @@ pub struct IndexArgs {
     pub allow_remote: bool,
     #[command(flatten)]
     pub files: ScanArgs,
-    /// Include ripgrep file types when scanning the workspace.
-    #[arg(short = 't', long = "type", value_name = "TYPE")]
-    pub file_types: Vec<String>,
-    /// Exclude ripgrep file types when scanning the workspace.
-    #[arg(short = 'T', long = "type-not", value_name = "TYPE")]
-    pub excluded_file_types: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1443,8 +1437,6 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
             || args.allow_remote
             || args.debug
             || !args.files.is_empty()
-            || !args.file_types.is_empty()
-            || !args.excluded_file_types.is_empty()
         {
             return Err(CliError::DropWithIndexOptions);
         }
@@ -1462,9 +1454,6 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
         });
     }
     let mut scan = args.files.update();
-    scan.file_types = (!args.file_types.is_empty()).then_some(args.file_types);
-    scan.excluded_file_types =
-        (!args.excluded_file_types.is_empty()).then_some(args.excluded_file_types);
     scan.ignore_files = scan.ignore_files.map(|paths| {
         paths
             .into_iter()
@@ -2079,61 +2068,19 @@ mod tests {
     }
 
     #[test]
-    fn index_rejects_query_category_options() {
-        for (option, value) in [("--category", "code"), ("--category-not", "code")] {
+    fn index_rejects_query_format_and_category_options() {
+        for (option, value) in [
+            ("-t", "rust"),
+            ("--type", "rust"),
+            ("-T", "rust"),
+            ("--type-not", "rust"),
+            ("--category", "code"),
+            ("--category-not", "code"),
+        ] {
             assert!(
                 Cli::try_parse_from(["zg", "--index", option, value]).is_err(),
                 "index must reject query option {option}"
             );
-        }
-    }
-
-    #[test]
-    fn index_type_filters_reach_scan_request_and_reject_drop() {
-        let CliPlan::Index {
-            operation: IndexOperation::Build(request),
-            ..
-        } = Cli::try_parse_from([
-            "zg",
-            "--index",
-            "-t",
-            "rust",
-            "--type=go",
-            "-T",
-            "json",
-            "--type-not=toml",
-        ])
-        .expect("index type arguments")
-        .into_plan(std::env::temp_dir())
-        .expect("index plan")
-        else {
-            panic!("index build");
-        };
-        assert_eq!(
-            request.scan.file_types,
-            Some(vec!["rust".into(), "go".into()])
-        );
-        assert_eq!(
-            request.scan.excluded_file_types,
-            Some(vec!["json".into(), "toml".into()])
-        );
-        let wire = serde_json::to_value(request).expect("serialize index request");
-        assert_eq!(
-            wire["scan"]["file_types"],
-            serde_json::json!(["rust", "go"])
-        );
-        assert_eq!(
-            wire["scan"]["excluded_file_types"],
-            serde_json::json!(["json", "toml"])
-        );
-
-        for option in ["-t", "--type", "-T", "--type-not"] {
-            let parsed = Cli::try_parse_from(["zg", "--index", "--drop", "--yes", option, "rust"])
-                .expect("index drop syntax");
-            assert!(matches!(
-                parsed.into_plan(std::env::temp_dir()),
-                Err(super::CliError::DropWithIndexOptions)
-            ));
         }
     }
 
@@ -2207,28 +2154,30 @@ mod tests {
 
     #[test]
     fn index_scan_flags_distinguish_false_from_omission() {
-        let CliPlan::Index {
-            operation: IndexOperation::Build(request),
-            ..
-        } = Cli::try_parse_from([
-            "zg",
-            "--index",
-            "--hidden=false",
-            "--follow=false",
-            "--no-ignore=false",
-        ])
-        .expect("valid test fixture")
-        .into_plan(PathBuf::from("/workspace"))
-        .expect("valid test fixture")
-        else {
-            panic!("index");
-        };
-        assert_eq!(request.scan.hidden, Some(false));
-        assert_eq!(request.scan.follow_symlinks, Some(false));
-        assert_eq!(request.scan.no_ignore, Some(false));
-        assert_eq!(request.scan.globs, None);
-        assert_eq!(request.scan.ignore_files, None);
-        assert_eq!(request.scan.max_depth, None);
+        for (ignore_args, expected) in [
+            (vec![], None),
+            (vec!["--no-ignore"], Some(false)),
+            (vec!["--no-ignore=false"], Some(true)),
+        ] {
+            let mut args = vec!["zg", "--index", "--hidden=false", "--follow=false"];
+            args.extend(ignore_args);
+            let CliPlan::Index {
+                operation: IndexOperation::Build(request),
+                ..
+            } = Cli::try_parse_from(args)
+                .expect("valid test fixture")
+                .into_plan(PathBuf::from("/workspace"))
+                .expect("valid test fixture")
+            else {
+                panic!("index");
+            };
+            assert_eq!(request.scan.include_hidden, Some(false));
+            assert_eq!(request.scan.follow_symlinks, Some(false));
+            assert_eq!(request.scan.use_default_ignores, expected);
+            assert_eq!(request.scan.globs, None);
+            assert_eq!(request.scan.ignore_files, None);
+            assert_eq!(request.scan.max_depth, None);
+        }
     }
 
     #[test]
@@ -2333,15 +2282,17 @@ mod tests {
             glob_rules: rules.clone(),
             ..Default::default()
         };
-        let mut scan = zg_engine::api::index::options::ScanRules {
-            globs: vec![super::GlobRule {
+        let scan = zg_engine::api::index::options::ScanRulesUpdate {
+            globs: Some(vec![super::GlobRule {
                 pattern: "!secret/**".to_owned(),
                 case_insensitive: true,
-            }],
+            }]),
             ..Default::default()
-        };
-        args.update().apply(&mut scan);
-        assert_eq!(scan.globs, rules);
+        }
+        .apply(&zg_engine::api::index::options::ScanRules::default())
+        .expect("saved scan rules");
+        let scan = args.update().apply(&scan).expect("updated scan rules");
+        assert_eq!(scan.globs(), rules);
     }
 
     #[test]

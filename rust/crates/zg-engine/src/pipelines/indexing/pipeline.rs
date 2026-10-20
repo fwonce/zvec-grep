@@ -641,7 +641,7 @@ async fn index_candidates(
     let policy =
         resolve_index_batch_policy(context.embedding_concurrency, context.embedding_models[0])?;
     let scheduler = Arc::new(EmbeddingScheduler::new(policy));
-    let max_batch_size = context.embedding_models[0].info().max_batch_size;
+    let max_batch_size = context.embedding_models[0].info().model().max_batch_size();
     let mut stats = IndexWriteStats::default();
     let mut current_batch = Vec::new();
     let mut current_fragments = 0;
@@ -803,7 +803,7 @@ async fn ensure_model_prepared(
             error
                 .wrap(
                     "Unable to prepare embedding model",
-                    Some(format!("model={}", model.info().model.reference())),
+                    Some(format!("model={}", model.info().model().reference())),
                 )
                 .into_engine_error()
         })?;
@@ -968,7 +968,7 @@ async fn prepare_candidate(
         ))
     })?;
     let model = model_for_content(context, ContentKind::Text)?;
-    let chunk_options = index_chunk_options(model.info().max_input_tokens, Some(&source_text));
+    let chunk_options = index_chunk_options(model.info().max_input_tokens(), Some(&source_text));
     let text = TextSource {
         relative_path: file.relative_path.clone(),
         formats: formats.clone(),
@@ -980,10 +980,10 @@ async fn prepare_candidate(
         .iter()
         .map(|entity| {
             Ok((
-                entity.id.clone(),
-                model_for_content(context, entity.content.kind())?
+                entity.id().clone(),
+                model_for_content(context, entity.content().kind())?
                     .info()
-                    .model
+                    .model()
                     .reference(),
             ))
         })
@@ -1003,7 +1003,7 @@ fn model_for_content<'a>(
     context: &'a IndexingContext<'_>,
     kind: ContentKind,
 ) -> Result<&'a dyn IndexEmbeddingRuntime, EngineError> {
-    if kind != ContentKind::Text {
+    if !matches!(kind, ContentKind::Text | ContentKind::Code) {
         return Err(EngineError::unsupported(
             "this version only supports text embedding",
         ));
@@ -1012,12 +1012,21 @@ fn model_for_content<'a>(
         context.workspace_index.index.descriptor().ok_or_else(|| {
             EngineError::invalid_argument("indexing requires an enabled workspace")
         })?;
-    let reference = index.model_for(kind)?.model.reference();
+    let reference = index
+        .model_for(kind)
+        .ok_or_else(|| {
+            EngineError::unsupported(format!(
+                "no embedding model configured for {} content",
+                kind.as_str(),
+            ))
+        })?
+        .model()
+        .reference();
     context
         .embedding_models
         .iter()
         .copied()
-        .find(|model| model.info().model.reference() == reference)
+        .find(|model| model.info().model().reference() == reference)
         .ok_or_else(|| {
             EngineError::invalid_argument(format!("embedding runtime is missing for {reference}"))
         })
@@ -1030,30 +1039,34 @@ fn prepare_fragments(
     entities
         .iter()
         .flat_map(|entity| {
-            entity.fragments.iter().map(move |fragment| {
-                let content = match (fragment.range, &entity.content) {
+            entity.fragments().iter().map(move |fragment| {
+                let content = match (fragment.range, entity.content()) {
                     (Range::Full, content) => Cow::Borrowed(content),
-                    (Range::Byte(range), Content::Text(text)) => {
+                    (Range::Byte(range), Content::Text(text) | Content::Code(text)) => {
                         let start = usize::try_from(range.start_offset()).map_err(|_| {
                             EngineError::invalid_argument("fragment start offset exceeds platform limits")
                         })?;
                         let end = usize::try_from(range.end_offset()).map_err(|_| {
                             EngineError::invalid_argument("fragment end offset exceeds platform limits")
                         })?;
-                        Cow::Owned(Content::Text(crate::utils::slice_text(text, start, end)?.to_owned()))
+                        let selected = crate::utils::slice_text(text, start, end)?.to_owned();
+                        Cow::Owned(match entity.content() {
+                            Content::Code(_) => Content::Code(selected),
+                            _ => Content::Text(selected),
+                        })
                     }
                     _ => return Err(EngineError::invalid_argument(
-                        "fragments use Full or entity-relative byte ranges for text; images and tables require Full",
+                        "fragments use Full or entity-relative byte ranges for text and code; images require Full",
                     )),
                 };
                 Ok(PreparedFragment {
                     model: String::new(),
-                    entity_id: entity.id.clone(),
+                    entity_id: entity.id().clone(),
                     fragment_id: fragment.id.clone(),
-                    fts_text: lexical_text(&content, entity.metadata.as_ref()),
+                    fts_text: lexical_text(&content, entity.metadata()),
                     embedding_content: vector_content_for_fragment(
                         &content,
-                        entity.metadata.as_ref(),
+                        entity.metadata(),
                         max_chars,
                     ),
                 })
@@ -1095,16 +1108,11 @@ fn lexical_text(content: &Content, metadata: Option<&EntityMetadata>) -> String 
 fn append_contents(output: &mut String, contents: &[Content]) {
     for content in contents {
         match content {
-            Content::Text(text) => output.push_str(text),
+            Content::Text(text) | Content::Code(text) => output.push_str(text),
             Content::Image(image) => {
                 output.push_str("[image:");
                 output.push_str(image.format().as_str());
                 output.push(']');
-            }
-            Content::Table(table) => {
-                for cell in &table.cells {
-                    append_contents(output, &cell.contents);
-                }
             }
         }
         output.push('\n');
@@ -1133,14 +1141,14 @@ fn bind_entities(
                     })
                 })
                 .collect::<Result<Vec<_>, EngineError>>()?;
-            Ok(Entity {
+            Entity::new(
                 id,
                 file_id,
-                source_range: entity.source_range,
-                content: entity.content,
-                metadata: entity.metadata,
+                entity.source_range,
+                entity.content,
+                entity.metadata,
                 fragments,
-            })
+            )
         })
         .collect()
 }
@@ -1193,7 +1201,7 @@ async fn embed_prepared_files(
     progress: Option<IndexProgressReporter>,
 ) -> Result<EmbeddingBatchOutcome, ModelError> {
     let started = Instant::now();
-    if files.len() == 1 && files[0].fragments.len() > model.info().max_batch_size {
+    if files.len() == 1 && files[0].fragments.len() > model.info().model().max_batch_size() {
         let file = files.into_iter().next().expect("one prepared file");
         let outcome = match embed_file(
             &file.fragments,
@@ -1311,7 +1319,7 @@ async fn embed_file(
     signal: Option<&CancellationToken>,
     progress: Option<IndexProgressReporter>,
 ) -> Result<EmbeddingResult, ModelError> {
-    let maximum = model.info().max_batch_size;
+    let maximum = model.info().model().max_batch_size();
     let batch_signal = signal.map_or_else(CancellationToken::new, CancellationToken::child_token);
     let mut running = FuturesUnordered::new();
     for (batch_index, fragments) in fragments.chunks(maximum).enumerate() {
@@ -1563,7 +1571,7 @@ fn resolve_index_batch_policy(
         return resolve_embedding_policy(requested, model.concurrency_defaults());
     }
     resolve_embedding_policy(
-        crate::models::batch_concurrency(&model.info().model.reference(), requested),
+        crate::models::batch_concurrency(&model.info().model().reference(), requested),
         model.concurrency_defaults(),
     )
 }
@@ -1821,21 +1829,22 @@ fn validate_context(context: &IndexingContext<'_>) -> Result<(), EngineError> {
         .index
         .descriptor()
         .expect("enabled workspace");
-    if context.embedding_models.len() != index.embeddings.len() {
+    if context.embedding_models.len() != index.embeddings().len() {
         return Err(EngineError::invalid_argument(
             "runtime models differ from workspace models",
         ));
     }
     for model in context.embedding_models {
-        model.info().validate()?;
         let schema = index
-            .embeddings
-            .iter()
-            .find(|schema| schema.model.reference() == model.info().model.reference())
+            .embeddings()
+            .into_iter()
+            .find(|schema| schema.model().reference() == model.info().model().reference())
             .ok_or_else(|| {
                 EngineError::invalid_argument("runtime model is not in workspace index")
             })?;
-        schema.ensure_index_compatible(model.info())?;
+        schema
+            .ensure_index_compatible(model.info())
+            .map_err(|error| error.with_help("Rebuild the index with `zg --index --rebuild`."))?;
         let _ = resolve_index_batch_policy(context.embedding_concurrency, *model)?;
     }
     Ok(())
@@ -1891,7 +1900,7 @@ fn scanned_files(
         // handles returning from an explicit size limit to the default limits.
         let known_limit = workspace
             .scan
-            .max_file_size_bytes
+            .max_file_size_bytes()
             .unwrap_or(MIN_DEFAULT_FILE_SIZE_BYTES);
         if discovered.size_bytes <= known_limit
             && existing
@@ -1920,7 +1929,7 @@ fn scanned_files(
                 continue;
             }
         };
-        let explicit_maximum = workspace.scan.max_file_size_bytes;
+        let explicit_maximum = workspace.scan.max_file_size_bytes();
         let maximum = explicit_maximum.unwrap_or_else(|| default_file_size_limit(&formats));
         let reason = match source_kind(&formats) {
             None | Some(SourceKind::Image(_)) => Some(
@@ -2283,7 +2292,7 @@ mod tests {
         api::index::progress::IndexProgressPhase,
         domain::{
             Content, IndexDescriptor,
-            model::{EmbeddingModelInfo, Metric},
+            model::{EmbeddingMetric, EmbeddingModelInfo},
         },
     };
 
@@ -2325,7 +2334,7 @@ mod tests {
                 bind_entities(FileId::new(42), extracted.fragments).expect("bind entities");
             assert_eq!(entities.len(), 1, "{format:?}");
             let entity = &entities[0];
-            let Some(EntityMetadata::Code(metadata)) = &entity.metadata else {
+            let Some(EntityMetadata::Code(metadata)) = entity.metadata() else {
                 panic!("code metadata expected");
             };
             assert!(
@@ -2335,8 +2344,8 @@ mod tests {
                     .expect("signature")
                     .contains("recallneedle")
             );
-            let Content::Text(content) = &entity.content else {
-                panic!("text content expected");
+            let Content::Code(content) = entity.content() else {
+                panic!("code content expected");
             };
             assert!(!content.contains("recallneedle"));
             let prepared =
@@ -2344,8 +2353,8 @@ mod tests {
             assert!(!prepared.is_empty());
             for item in prepared {
                 assert!(item.fts_text.contains("recallneedle"), "{format:?}");
-                let [Content::Text(embedding_text)] = item.embedding_content.as_slice() else {
-                    panic!("text embedding expected");
+                let [Content::Code(embedding_text)] = item.embedding_content.as_slice() else {
+                    panic!("code embedding expected");
                 };
                 assert!(embedding_text.contains("recallneedle"), "{format:?}");
                 assert!(!item.fts_text.contains("diagnostic_only"));
@@ -2378,19 +2387,18 @@ mod tests {
         assert_eq!(entities, rebound);
         let mut ids = HashSet::new();
         for entity in &entities {
-            entity.validate().expect("valid entity");
-            assert!(ids.insert(entity.id.as_str()));
-            for (ordinal, fragment) in entity.fragments.iter().enumerate() {
+            assert!(ids.insert(entity.id().as_str()));
+            for (ordinal, fragment) in entity.fragments().iter().enumerate() {
                 assert!(ids.insert(fragment.id.as_str()));
                 assert_eq!(
                     fragment.id.as_str(),
-                    format!("{}{:08x}", entity.id.as_str(), ordinal)
+                    format!("{}{:08x}", entity.id().as_str(), ordinal)
                 );
             }
-            if let crate::domain::Range::Text(range) = entity.source_range {
+            if let crate::domain::Range::Text(range) = entity.source_range() {
                 assert_eq!(
-                    entity.content,
-                    Content::Text(
+                    entity.content(),
+                    &Content::Text(
                         crate::utils::slice_text(
                             &source.text,
                             range.start_byte_offset(),
@@ -2408,14 +2416,17 @@ mod tests {
             prepared.len(),
             entities
                 .iter()
-                .map(|entity| entity.fragments.len())
+                .map(|entity| entity.fragments().len())
                 .sum::<usize>()
         );
         let section = entities
             .iter()
-            .find(|entity| entity.fragments.len() > 1)
+            .find(|entity| entity.fragments().len() > 1)
             .expect("long section");
-        for item in prepared.iter().filter(|item| item.entity_id == section.id) {
+        for item in prepared
+            .iter()
+            .filter(|item| &item.entity_id == section.id())
+        {
             let [Content::Text(text)] = item.embedding_content.as_slice() else {
                 panic!("text embedding")
             };
@@ -2443,17 +2454,17 @@ mod tests {
         let file_id = FileId::new(42);
         let content = Content::Text(bodies.concat());
         let entity_id = EntityId::new(file_id, &content, Range::Full).expect("entity id");
-        let entity = Entity {
-            id: entity_id.clone(),
+        let entity = Entity::new(
+            entity_id.clone(),
             file_id,
-            source_range: Range::Full,
+            Range::Full,
             content,
-            metadata: Some(EntityMetadata::Markdown(MarkdownMetadata {
+            Some(EntityMetadata::Markdown(MarkdownMetadata {
                 heading: Some("Heading".into()),
                 scope: Some("Parent".into()),
                 level: Some(2),
             })),
-            fragments: vec![
+            vec![
                 EntityFragment {
                     id: FragmentId::new(&entity_id, 0),
                     range: Range::Byte(ByteRange::new(0, 11).expect("first range")),
@@ -2463,9 +2474,9 @@ mod tests {
                     range: Range::Byte(ByteRange::new(11, 18).expect("second range")),
                 },
             ],
-        };
+        )
+        .expect("entity");
         let entities = vec![entity];
-        entities[0].validate().expect("valid entity");
         let mut fragments = prepare_fragments(&entities, None).expect("prepare both projections");
         for (fragment, body) in fragments.iter_mut().zip(bodies) {
             assert_eq!(fragment.fts_text, format!("Heading\nParent\n{body}\n"));
@@ -2713,18 +2724,24 @@ mod tests {
     impl ConcurrentModel {
         fn new() -> Self {
             Self {
-                info: EmbeddingModelInfo {
-                    model: crate::domain::model::ModelInfo {
-                        provider: "local".to_owned(),
-                        name: "test".to_owned(),
-                        endpoint: None,
-                    },
-                    dimension: 2,
-                    metric: Metric::Cosine,
-                    max_batch_size: 1,
-                    max_input_tokens: Some(64),
-                    max_image_bytes: None,
-                },
+                info: EmbeddingModelInfo::new(
+                    crate::domain::model::ModelInfo::new(
+                        "local".to_owned(),
+                        "test".to_owned(),
+                        [
+                            crate::domain::ContentKind::Text,
+                            crate::domain::ContentKind::Code,
+                            crate::domain::ContentKind::Image,
+                        ],
+                        1,
+                    )
+                    .expect("valid model metadata"),
+                    2,
+                    EmbeddingMetric::Cosine,
+                    Some(64),
+                    None,
+                )
+                .expect("valid embedding metadata"),
                 prepare_calls: AtomicUsize::new(0),
                 prepare_failures: AtomicUsize::new(0),
                 calls: AtomicUsize::new(0),
@@ -2741,18 +2758,24 @@ mod tests {
     impl DrainingFailureModel {
         fn new() -> Self {
             Self {
-                info: EmbeddingModelInfo {
-                    model: crate::domain::model::ModelInfo {
-                        provider: "local".to_owned(),
-                        name: "test".to_owned(),
-                        endpoint: None,
-                    },
-                    dimension: 2,
-                    metric: Metric::Cosine,
-                    max_batch_size: 1,
-                    max_input_tokens: Some(64),
-                    max_image_bytes: None,
-                },
+                info: EmbeddingModelInfo::new(
+                    crate::domain::model::ModelInfo::new(
+                        "local".to_owned(),
+                        "test".to_owned(),
+                        [
+                            crate::domain::ContentKind::Text,
+                            crate::domain::ContentKind::Code,
+                            crate::domain::ContentKind::Image,
+                        ],
+                        1,
+                    )
+                    .expect("valid model metadata"),
+                    2,
+                    EmbeddingMetric::Cosine,
+                    Some(64),
+                    None,
+                )
+                .expect("valid embedding metadata"),
                 calls: AtomicUsize::new(0),
                 active: AtomicUsize::new(0),
                 calls_changed: Notify::new(),
@@ -2944,19 +2967,30 @@ mod tests {
             name: "fixture".to_owned(),
             root: root.to_path_buf(),
             scan: crate::domain::ScanRules::default(),
-            index: crate::domain::IndexState::Enabled(IndexDescriptor::single(
-                EmbeddingModelInfo {
-                    model: crate::domain::model::ModelInfo {
-                        provider: "local".to_owned(),
-                        name: "test".to_owned(),
-                        endpoint: None,
-                    },
-                    dimension: 2,
-                    metric: Metric::Cosine,
-                    max_batch_size: 32,
-                    max_input_tokens: Some(64),
-                    max_image_bytes: None,
-                },
+            index: crate::domain::IndexState::Enabled(Box::new(
+                IndexDescriptor::new(
+                    EmbeddingModelInfo::new(
+                        crate::domain::model::ModelInfo::new(
+                            "local".to_owned(),
+                            "test".to_owned(),
+                            [
+                                crate::domain::ContentKind::Text,
+                                crate::domain::ContentKind::Code,
+                                crate::domain::ContentKind::Image,
+                            ],
+                            32,
+                        )
+                        .expect("valid model metadata"),
+                        2,
+                        EmbeddingMetric::Cosine,
+                        Some(64),
+                        None,
+                    )
+                    .expect("valid embedding metadata"),
+                    std::collections::BTreeMap::new(),
+                    crate::domain::FTS_CONFIG,
+                )
+                .expect("index descriptor"),
             )),
             created_epoch_ms: 1,
             updated_epoch_ms: 1,
@@ -3267,7 +3301,11 @@ mod tests {
         let scanner = RecordingScanner::new();
         let storage = MemoryStorage::default();
         let mut model = ConcurrentModel::new();
-        model.info.max_batch_size = 32;
+        {
+            let mut metadata = serde_json::to_value(&model.info).expect("model metadata");
+            metadata["model"]["maxBatchSize"] = serde_json::json!(32);
+            model.info = serde_json::from_value(metadata).expect("valid model metadata");
+        }
         model.rejected_text = Some("bad");
 
         let result = index_workspace(&IndexingContext {
@@ -3334,28 +3372,28 @@ mod tests {
         std::fs::write(directory.path().join("note.txt"), "text").expect("source");
         let first = ConcurrentModel::new();
         let mut second = ConcurrentModel::new();
-        second.info.model.name = "image".into();
-        second.info.max_image_bytes = Some(1024);
+        {
+            let mut metadata = serde_json::to_value(&second.info).expect("model metadata");
+            metadata["model"]["name"] = serde_json::json!("image");
+            second.info = serde_json::from_value(metadata).expect("valid model metadata");
+        }
+        {
+            let mut metadata = serde_json::to_value(&second.info).expect("model metadata");
+            metadata["maxImageBytes"] = serde_json::json!(1024);
+            second.info = serde_json::from_value(metadata).expect("valid model metadata");
+        }
         let storage = MemoryStorage::default();
         let scanner = NativeScanner::default();
         for multiple in [true, false] {
             let mut workspace = workspace(directory.path());
-            workspace.index = crate::domain::IndexState::Enabled(IndexDescriptor {
-                fts: crate::domain::FTS_CONFIG,
-                embeddings: if multiple {
-                    vec![first.info.clone(), second.info.clone()]
-                } else {
-                    vec![second.info.clone()]
-                },
-                routes: if multiple {
-                    BTreeMap::from([
-                        (ContentKind::Text, first.info.model.reference()),
-                        (ContentKind::Image, second.info.model.reference()),
-                    ])
-                } else {
-                    BTreeMap::from([(ContentKind::Image, second.info.model.reference())])
-                },
-            });
+            workspace.index = crate::domain::IndexState::Enabled(Box::new(
+                IndexDescriptor::new(
+                    first.info.clone(),
+                    BTreeMap::from([(ContentKind::Image, second.info.clone())]),
+                    crate::domain::FTS_CONFIG,
+                )
+                .expect("index descriptor"),
+            ));
             let models: Vec<&dyn IndexEmbeddingRuntime> = if multiple {
                 vec![&first, &second]
             } else {
@@ -3745,7 +3783,14 @@ mod tests {
         };
         std::fs::remove_file(root.join("missing.txt")).expect("remove source");
         std::fs::write(root.join("requested.txt"), "requested changed").expect("change source");
-        workspace.scan.globs.push("!excluded.txt".into());
+        let mut globs = workspace.scan.globs().to_vec();
+        globs.push("!excluded.txt".into());
+        workspace.scan = crate::api::index::options::ScanRulesUpdate {
+            globs: Some(globs),
+            ..Default::default()
+        }
+        .apply(&workspace.scan)
+        .expect("scan rules");
         let changes = [WorkspaceChange::Upsert(PathBuf::from("requested.txt"))];
         let result = index_workspace(&IndexingContext {
             workspace_index: &workspace,
@@ -3991,7 +4036,12 @@ mod tests {
         std::fs::write(directory.path().join("large.rs"), "fn main() {}\n")
             .expect("source for format validation");
         let mut workspace = workspace(directory.path());
-        workspace.scan.max_file_size_bytes = Some(3 * MIN_DEFAULT_FILE_SIZE_BYTES);
+        workspace.scan = crate::api::index::options::ScanRulesUpdate {
+            max_file_size_bytes: Some(Some(3 * MIN_DEFAULT_FILE_SIZE_BYTES)),
+            ..Default::default()
+        }
+        .apply(&workspace.scan)
+        .expect("explicit size limit");
         let discovered = DiscoveredFile {
             root: directory.path().to_path_buf(),
             relative_path: PathBuf::from("large.rs"),
@@ -4026,7 +4076,12 @@ mod tests {
             1
         );
 
-        workspace.scan.max_file_size_bytes = None;
+        workspace.scan = crate::api::index::options::ScanRulesUpdate {
+            max_file_size_bytes: Some(None),
+            ..Default::default()
+        }
+        .apply(&workspace.scan)
+        .expect("default size limit");
         let (scanned, skipped) = classify_files(
             &workspace,
             vec![discovered],

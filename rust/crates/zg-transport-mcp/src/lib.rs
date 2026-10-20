@@ -591,8 +591,8 @@ impl ServerHandler for ZvecGrepMcpServer {
                 if request.name == "zvec_grep_search"
                     && matches!(
                         field.as_str(),
-                        "hidden"
-                            | "noIgnore"
+                        "includeHidden"
+                            | "useDefaultIgnores"
                             | "ignoreFiles"
                             | "maxDepth"
                             | "maxFileSizeBytes"
@@ -785,20 +785,18 @@ pub struct IndexInput {
     /// Explicitly rebuild the existing index.
     #[schemars(extend("type" = "boolean"))]
     pub rebuild: Option<bool>,
-    /// Replace the index root-path configuration.
+    /// Clear saved scanning settings before applying this request.
     #[schemars(extend("type" = "boolean"))]
     pub reset_paths: Option<bool>,
     #[schemars(length(max = 128))]
     pub globs: Option<GlobListInput>,
     /// Ordered case-insensitive rg glob rules, applied after globs.
     pub insensitive_globs: Option<PathListInput>,
-    /// Ripgrep type names, such as ts, py, h or cpp.
-    pub file_types: Option<PathListInput>,
-    pub excluded_file_types: Option<PathListInput>,
     #[schemars(extend("type" = "boolean"))]
-    pub hidden: Option<bool>,
+    pub include_hidden: Option<bool>,
+    /// Apply built-in exclusions and discovered ignore files; explicit ignore files stay active.
     #[schemars(extend("type" = "boolean"))]
-    pub no_ignore: Option<bool>,
+    pub use_default_ignores: Option<bool>,
     /// Whether indexing scans nested Git repositories and submodules.
     #[schemars(extend("type" = "boolean"))]
     pub nested_git: Option<bool>,
@@ -1103,13 +1101,10 @@ struct RootSpecOutput {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     globs: Vec<String>,
     insensitive_globs: Vec<String>,
-    file_types: Vec<String>,
-    excluded_file_types: Vec<String>,
     glob_rules: Vec<GlobInput>,
     #[serde(skip_serializing_if = "is_false")]
-    hidden: bool,
-    #[serde(skip_serializing_if = "is_false")]
-    no_ignore: bool,
+    include_hidden: bool,
+    use_default_ignores: bool,
     nested_git: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     ignore_files: Vec<String>,
@@ -1615,16 +1610,8 @@ impl IndexInput {
 
         let glob_update = normalize_index_globs(self.globs, self.insensitive_globs)?;
         let scan = ScanRulesUpdate {
-            file_types: self
-                .file_types
-                .map(|values| normalize_types(Some(values), "fileTypes"))
-                .transpose()?,
-            excluded_file_types: self
-                .excluded_file_types
-                .map(|values| normalize_types(Some(values), "excludedFileTypes"))
-                .transpose()?,
-            hidden: self.hidden,
-            no_ignore: self.no_ignore,
+            include_hidden: self.include_hidden,
+            use_default_ignores: self.use_default_ignores,
             nested_git: self.nested_git,
             ignore_files: self
                 .ignore_files
@@ -1683,10 +1670,8 @@ impl IndexInput {
             || self.reset_paths.is_some()
             || self.globs.is_some()
             || self.insensitive_globs.is_some()
-            || self.file_types.is_some()
-            || self.excluded_file_types.is_some()
-            || self.hidden.is_some()
-            || self.no_ignore.is_some()
+            || self.include_hidden.is_some()
+            || self.use_default_ignores.is_some()
             || self.nested_git.is_some()
             || self.ignore_files.is_some()
             || self.max_depth.is_some()
@@ -2081,7 +2066,7 @@ impl From<InfoResult> for IndexStatusOutput {
             id: info.name.clone(),
             name: info.name,
             path: info.path.display().to_string(),
-            root_paths: vec![RootSpecOutput::new(&info.root, info.scan)],
+            root_paths: vec![RootSpecOutput::new(&info.root, &info.scan)],
             embedding: info.embedding.map(|embedding| IndexedEmbeddingOutput {
                 provider: embedding.provider,
                 model: embedding.model,
@@ -2232,36 +2217,34 @@ const fn index_job_state(state: IndexOperationState) -> IndexJobState {
 }
 
 impl RootSpecOutput {
-    fn new(root: &Path, scan: ScanRules) -> Self {
+    fn new(root: &Path, scan: &ScanRules) -> Self {
         Self {
             absolute_path: root.display().to_string(),
             recursive: true,
             globs: scan
-                .globs
+                .globs()
                 .iter()
                 .filter(|rule| !rule.case_insensitive)
                 .map(|rule| rule.pattern.clone())
                 .collect(),
             insensitive_globs: scan
-                .globs
+                .globs()
                 .iter()
                 .filter(|rule| rule.case_insensitive)
                 .map(|rule| rule.pattern.clone())
                 .collect(),
-            glob_rules: scan.globs.into_iter().map(Into::into).collect(),
-            file_types: scan.file_types,
-            excluded_file_types: scan.excluded_file_types,
-            hidden: scan.hidden,
-            no_ignore: scan.no_ignore,
-            nested_git: scan.nested_git,
+            glob_rules: scan.globs().iter().cloned().map(Into::into).collect(),
+            include_hidden: scan.include_hidden(),
+            use_default_ignores: scan.use_default_ignores(),
+            nested_git: scan.nested_git(),
             ignore_files: scan
-                .ignore_files
-                .into_iter()
+                .ignore_files()
+                .iter()
                 .map(|path| path.display().to_string())
                 .collect(),
-            max_depth: scan.max_depth,
-            max_file_size_bytes: scan.max_file_size_bytes,
-            follow: scan.follow_symlinks,
+            max_depth: scan.max_depth(),
+            max_file_size_bytes: scan.max_file_size_bytes(),
+            follow: scan.follow_symlinks(),
         }
     }
 }
@@ -2404,7 +2387,7 @@ mod tests {
             assert!(request.filter.formats.is_empty());
         }
         let index: IndexInput = serde_json::from_value(
-            serde_json::json!({"root":test_root(), "globs":"*.h", "fileTypes":"h", "follow":true}),
+            serde_json::json!({"root":test_root(), "globs":"*.h", "follow":true}),
         )
         .expect("index");
         let IndexToolRequest::Index { options, wait, .. } = index.into_request().expect("mapping")
@@ -2413,7 +2396,6 @@ mod tests {
         };
         assert!(!wait);
         assert_eq!(options.scan.follow_symlinks, Some(true));
-        assert_eq!(options.scan.file_types, Some(vec!["h".into()]));
         for arguments in [
             serde_json::json!({"fileTypes":"not-a-real-type"}),
             serde_json::json!({"queries":[" ".repeat(4001)]}),
@@ -2765,8 +2747,8 @@ mod tests {
                         ("drop", "boolean"),
                         ("rebuild", "boolean"),
                         ("resetPaths", "boolean"),
-                        ("hidden", "boolean"),
-                        ("noIgnore", "boolean"),
+                        ("includeHidden", "boolean"),
+                        ("useDefaultIgnores", "boolean"),
                         ("nestedGit", "boolean"),
                         ("follow", "boolean"),
                         ("embeddingConcurrency", "integer"),
@@ -2852,8 +2834,8 @@ mod tests {
             "drop",
             "rebuild",
             "resetPaths",
-            "hidden",
-            "noIgnore",
+            "includeHidden",
+            "useDefaultIgnores",
             "nestedGit",
             "follow",
             "embeddingConcurrency",
@@ -2913,6 +2895,10 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(IndexInput)).expect("index input schema");
         assert!(schema["properties"].get("embedding").is_some());
         assert!(schema["properties"].get("embeddingRoutes").is_none());
+        assert!(schema["properties"].get("includeHidden").is_some());
+        assert!(schema["properties"].get("hidden").is_none());
+        assert!(schema["properties"].get("useDefaultIgnores").is_some());
+        assert!(schema["properties"].get("noIgnore").is_none());
         assert_eq!(schema["additionalProperties"], false);
     }
 
@@ -2920,7 +2906,7 @@ mod tests {
     fn index_updates_preserve_omitted_empty_false_and_null_values() {
         let parsed: IndexInput = serde_json::from_value(serde_json::json!({
             "root": test_root(), "globs": [],
-            "hidden": false, "followSymlinks": false, "nestedGit": false, "ignoreFiles": [],
+            "includeHidden": false, "followSymlinks": false, "nestedGit": false, "ignoreFiles": [],
             "maxDepth": null, "maxFileSizeBytes": null
         }))
         .expect("valid test fixture");
@@ -2930,10 +2916,10 @@ mod tests {
             panic!("index");
         };
         assert_eq!(options.scan.sensitive_globs, Some(Vec::new()));
-        assert_eq!(options.scan.hidden, Some(false));
+        assert_eq!(options.scan.include_hidden, Some(false));
         assert_eq!(options.scan.follow_symlinks, Some(false));
         assert_eq!(options.scan.nested_git, Some(false));
-        assert_eq!(options.scan.no_ignore, None);
+        assert_eq!(options.scan.use_default_ignores, None);
         assert_eq!(options.scan.ignore_files, Some(Vec::new()));
         assert_eq!(options.scan.max_depth, Some(None));
         assert_eq!(options.scan.max_file_size_bytes, Some(None));
@@ -2951,16 +2937,18 @@ mod tests {
         else {
             panic!("index request expected");
         };
-        let mut scan = super::ScanRules {
-            globs: vec![super::GlobRule {
+        let scan = super::ScanRulesUpdate {
+            globs: Some(vec![super::GlobRule {
                 pattern: "!secret/**".to_owned(),
                 case_insensitive: true,
-            }],
+            }]),
             ..Default::default()
-        };
-        options.scan.apply(&mut scan);
+        }
+        .apply(&super::ScanRules::default())
+        .expect("saved scan rules");
+        let scan = options.scan.apply(&scan).expect("updated scan rules");
         assert_eq!(
-            scan.globs,
+            scan.globs(),
             vec![
                 super::GlobRule {
                     pattern: "*.MD".to_owned(),
@@ -3011,12 +2999,14 @@ mod tests {
             else {
                 panic!("index request expected");
             };
-            let mut saved = super::ScanRules {
-                globs: vec![sensitive.clone(), insensitive.clone()],
+            let saved = super::ScanRulesUpdate {
+                globs: Some(vec![sensitive.clone(), insensitive.clone()]),
                 ..Default::default()
-            };
-            options.scan.apply(&mut saved);
-            assert_eq!(saved.globs, expected);
+            }
+            .apply(&super::ScanRules::default())
+            .expect("saved scan rules");
+            let updated = options.scan.apply(&saved).expect("updated scan rules");
+            assert_eq!(updated.globs(), expected);
         }
     }
 
@@ -3071,6 +3061,8 @@ mod tests {
         let output_schema = serde_json::to_value(schemars::schema_for!(super::RootSpecOutput))
             .expect("scan status schema");
         for (input_field, output_field) in [
+            ("fileTypes", "file_types"),
+            ("excludedFileTypes", "excluded_file_types"),
             ("formats", "formats"),
             ("excludedFormats", "excluded_formats"),
             ("categories", "categories"),
@@ -3085,10 +3077,11 @@ mod tests {
     }
 
     #[test]
-    fn nested_git_is_index_only_and_status_preserves_both_boolean_values() {
+    fn scan_switches_are_index_only_and_status_preserves_both_boolean_values() {
         for value in [true, false] {
             let input: IndexInput = serde_json::from_value(serde_json::json!({
-                "root": test_root(), "nestedGit": value
+                "root": test_root(), "includeHidden": value,
+                "nestedGit": value, "useDefaultIgnores": value
             }))
             .expect("index input");
             let IndexToolRequest::Index { options, .. } =
@@ -3097,23 +3090,34 @@ mod tests {
                 panic!("index");
             };
             assert_eq!(options.scan.nested_git, Some(value));
-            assert!(
-                serde_json::from_value::<SearchInput>(serde_json::json!({
-                    "root": test_root(), "query": "needle", "nestedGit": value
-                }))
-                .is_err()
-            );
+            assert_eq!(options.scan.include_hidden, Some(value));
+            assert_eq!(options.scan.use_default_ignores, Some(value));
+            for field in ["includeHidden", "nestedGit", "useDefaultIgnores"] {
+                let mut input = serde_json::json!({"root": test_root(), "query": "needle"});
+                input[field] = serde_json::json!(value);
+                assert!(serde_json::from_value::<SearchInput>(input).is_err());
+            }
             let output = super::RootSpecOutput::new(
                 &test_root(),
-                super::ScanRules {
-                    nested_git: value,
-                    ..super::ScanRules::default()
-                },
+                &super::ScanRulesUpdate {
+                    include_hidden: Some(value),
+                    nested_git: Some(value),
+                    use_default_ignores: Some(value),
+                    ..Default::default()
+                }
+                .apply(&super::ScanRules::default())
+                .expect("saved scan rules"),
             );
+            let output = serde_json::to_value(output).expect("status output");
             assert_eq!(
-                serde_json::to_value(output).expect("status output")["nested_git"],
-                value
+                output
+                    .get("include_hidden")
+                    .and_then(serde_json::Value::as_bool),
+                value.then_some(true)
             );
+            assert!(output.get("hidden").is_none());
+            assert_eq!(output["nested_git"], value);
+            assert_eq!(output["use_default_ignores"], value);
         }
         assert!(index_input().into_request().is_ok());
         let IndexToolRequest::Index { options, .. } =
@@ -3122,6 +3126,8 @@ mod tests {
             panic!("index");
         };
         assert_eq!(options.scan.nested_git, None);
+        assert_eq!(options.scan.include_hidden, None);
+        assert_eq!(options.scan.use_default_ignores, None);
     }
 
     #[test]
@@ -3150,7 +3156,7 @@ mod tests {
         assert!(request.globs.is_empty() && request.file_types.is_empty());
         assert!(
             serde_json::from_value::<SearchInput>(serde_json::json!({
-                "root": test_root(), "query": "needle", "hidden": true
+                "root": test_root(), "query": "needle", "includeHidden": true
             }))
             .is_err()
         );
@@ -3315,10 +3321,8 @@ mod tests {
                 case_insensitive: false,
             }])),
             insensitive_globs: None,
-            file_types: None,
-            excluded_file_types: None,
-            hidden: None,
-            no_ignore: None,
+            include_hidden: None,
+            use_default_ignores: None,
             nested_git: None,
             ignore_files: None,
             max_depth: None,

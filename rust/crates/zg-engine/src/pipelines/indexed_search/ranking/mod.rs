@@ -98,7 +98,7 @@ fn rank_with_policy(
         .into_iter()
         .zip(roles)
         .map(|(hit, roles)| {
-            let (symbol_match, symbol_bonus, definition_bonus) = match &hit.entity.metadata {
+            let (symbol_match, symbol_bonus, definition_bonus) = match hit.entity.metadata() {
                 Some(EntityMetadata::Code(code)) => query.symbol_bonus_with(code, policy),
                 _ => ("none", 0.0, 0.0),
             };
@@ -163,7 +163,7 @@ fn select(
                 effective(b)
                     .total_cmp(&effective(a))
                     .then_with(|| a.hit.rank.cmp(&b.hit.rank))
-                    .then_with(|| a.hit.entity.id.as_str().cmp(b.hit.entity.id.as_str()))
+                    .then_with(|| a.hit.entity.id().as_str().cmp(b.hit.entity.id().as_str()))
             })
             .map_or(0, |(index, _)| index);
         let mut item = scored.swap_remove(best);
