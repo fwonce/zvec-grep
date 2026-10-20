@@ -49,6 +49,20 @@ jobs:
         if: runner.os == 'Windows'
         with:
           python-version: "3.12"
+      - name: Use a short Windows Cargo home
+        if: runner.os == 'Windows'
+        shell: python
+        run: |
+          import os, pathlib
+          # Cargo checks out Git submodules before build.rs, even in prebuilt mode.
+          # Keep the pinned llama.cpp source tree below Windows MAX_PATH.
+          cargo_home = pathlib.Path(pathlib.Path(os.environ["GITHUB_WORKSPACE"]).anchor) / "zg-cargo"
+          (cargo_home / "bin").mkdir(parents=True, exist_ok=True)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as environment:
+              environment.write(f"CARGO_HOME={cargo_home}\n")
+          with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as path:
+              path.write(f"{cargo_home / 'bin'}\n")
+          print(f"CARGO_HOME={cargo_home}")
       - name: Set up MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -74,10 +88,10 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/registry/src/
-            ~/.cargo/git/db/
+            ${{ runner.os == 'Windows' && env.CARGO_HOME || '~/.cargo' }}/registry/index/
+            ${{ runner.os == 'Windows' && env.CARGO_HOME || '~/.cargo' }}/registry/cache/
+            ${{ runner.os == 'Windows' && env.CARGO_HOME || '~/.cargo' }}/registry/src/
+            ${{ runner.os == 'Windows' && env.CARGO_HOME || '~/.cargo' }}/git/db/
             rust/target/release/
           # Per-commit keys would exhaust the 10 GB repository cache quota and evict Rust CI caches.
           key: rust-release-v3-${{ inputs.target }}-${{ inputs.runner }}-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml') }}
@@ -195,10 +209,10 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/registry/src/
-            ~/.cargo/git/db/
+            ${{ runner.os == 'Windows' && env.CARGO_HOME || '~/.cargo' }}/registry/index/
+            ${{ runner.os == 'Windows' && env.CARGO_HOME || '~/.cargo' }}/registry/cache/
+            ${{ runner.os == 'Windows' && env.CARGO_HOME || '~/.cargo' }}/registry/src/
+            ${{ runner.os == 'Windows' && env.CARGO_HOME || '~/.cargo' }}/git/db/
             rust/target/release/
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
       - name: Audit the Windows CPU/CUDA bundle
