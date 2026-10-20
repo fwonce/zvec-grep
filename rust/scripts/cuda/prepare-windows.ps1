@@ -140,9 +140,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $gitBash "bash.exe"))) {
 $gitBash | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
 $components = @(
+    # Rust linking and other C/C++ crates still need MSVC + the Windows SDK.
+    # llama's pinned SDK needs neither CUDA 12's older compiler nor bindgen.
     "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-    "Microsoft.VisualStudio.Component.VC.14.38.17.8.x86.x64",
-    "Microsoft.VisualStudio.Component.VC.CMake.Project",
     "Microsoft.VisualStudio.Component.Windows11SDK.26100"
 )
 
@@ -178,14 +178,4 @@ if (-not $installation) {
     $installation = Find-Compiler
     if (-not $installation) { throw "Visual Studio 2022 C++ build components are still missing" }
 }
-Write-Host "Visual Studio CUDA build tools: $installation"
-
-$clang = Join-Path $env:RUNNER_TEMP "zg-libclang"
-& python -m pip install --no-deps --only-binary=:all: --require-hashes `
-    --target $clang -r rust/scripts/cuda/windows-build-requirements.txt
-if ($LASTEXITCODE -ne 0) { throw "Installing the pinned libclang DLL failed" }
-$clangDirectory = Join-Path $clang "clang/native"
-if (-not (Test-Path -LiteralPath (Join-Path $clangDirectory "libclang.dll"))) {
-    throw "The libclang wheel did not contain libclang.dll"
-}
-"LIBCLANG_PATH=$clangDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+Write-Host "Visual Studio Rust/C++ linker tools: $installation"

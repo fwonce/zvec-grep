@@ -164,8 +164,9 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as environment:
               environment.write(f"ZVEC_GREP_MODEL_CACHE={cache}\n")
               if os.environ["CUDA_VERIFY"] == "true":
-                  environment.write("CARGO_BUILD_JOBS=2\nCMAKE_BUILD_PARALLEL_LEVEL=2\nCMAKE_CUDA_ARCHITECTURES=75\n")
-      - name: Prepare Windows GPU driver and CUDA build tools without rebooting
+                  environment.write("CARGO_BUILD_JOBS=2\nCMAKE_BUILD_PARALLEL_LEVEL=2\nLLAMA_CPP_BUILD_MODE=prebuilt\n")
+                  environment.write(f"LLAMA_CPP_RUNTIME_CACHE={os.path.abspath('target/llama-runtimes')}\n")
+      - name: Prepare Windows GPU driver and Rust linker tools without rebooting
         if: matrix.cuda && runner.os == 'Windows'
         shell: powershell
         working-directory: ${{ github.workspace }}
@@ -204,31 +205,22 @@ jobs:
           Get-ChildItem "$site/nvidia" -Filter *.dll -Recurse |
             ForEach-Object { $_.DirectoryName } | Sort-Object -Unique |
             Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - name: Install the Windows CUDA compiler
+      - name: Install the Windows CUDA 13 runtime
         if: matrix.cuda && runner.os == 'Windows'
         uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
           cuda: "13.1.1"
           method: network
-          sub-packages: '["nvcc", "nvvm", "crt", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+          sub-packages: '["cudart", "cublas"]'
           use-local-cache: true
-      - name: Verify and select the Windows CUDA compiler
+      - name: Configure Windows CUDA 13 runtime lookup
         if: matrix.cuda && runner.os == 'Windows'
         shell: python
         run: |
-          import os, pathlib, re, subprocess, sys
+          import os, pathlib, sys
           sys.path.insert(0, "scripts/cuda")
           from e2e import configure_windows_cuda_paths
           configure_windows_cuda_paths(pathlib.Path(os.environ["CUDA_PATH"]))
-          compiler = pathlib.Path(os.environ["CUDA_PATH"]) / "bin" / "nvcc.exe"
-          result = subprocess.run([str(compiler), "--version"], capture_output=True, text=True)
-          print(result.stdout + result.stderr, flush=True)
-          result.check_returncode()
-          if not re.search(r"\brelease 13\.1,", result.stdout):
-              raise RuntimeError("CUDA verification requires the CUDA 13.1 compiler")
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as environment:
-              environment.write(f"CUDACXX={compiler.as_posix()}\n")
-              environment.write(f"CMAKE_CUDA_COMPILER={compiler.as_posix()}\n")
       - name: Install the pinned Rust toolchain
         if: ${{ !matrix.cuda }}
         run: rustup show active-toolchain
@@ -296,6 +288,7 @@ jobs:
           nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
           mkdir -p rust/target "$HOME/.cargo/registry" "$HOME/.cargo/git"
           docker build --platform linux/amd64 --file rust/scripts/cuda/cuda-builder.Dockerfile \
+            --build-arg CUDA_IMAGE=nvidia/cuda:13.1.1-runtime-ubuntu24.04@sha256:12e26235ebe186000d71f8e457a9ad2aed6c0cb743a7935f0443bacef206aa34 \
             --build-arg RUST_VERSION="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust/rust-toolchain.toml)" \
             --tag zvec-grep-cuda-ci .
           docker run --rm --gpus all --platform linux/amd64 \
@@ -304,18 +297,15 @@ jobs:
             --volume "$HOME/.cargo/git:/root/.cargo/git" \
             --volume "$(command -v cargo-nextest):/usr/local/bin/cargo-nextest:ro" \
             --env CARGO_INCREMENTAL --env CARGO_PROFILE_DEV_DEBUG --env CARGO_PROFILE_TEST_DEBUG \
-            --env CARGO_BUILD_JOBS --env CMAKE_BUILD_PARALLEL_LEVEL --env CMAKE_CUDA_ARCHITECTURES \
+            --env CARGO_BUILD_JOBS --env CMAKE_BUILD_PARALLEL_LEVEL \
+            --env LLAMA_CPP_BUILD_MODE=prebuilt --env LLAMA_CPP_RUNTIME_CACHE=/work/rust/target/llama-runtimes \
             --env RUST_BACKTRACE --env CARGO_TERM_COLOR \
             --env ORT_DYLIB_PATH=/work/rust/target/debug/libonnxruntime.so.1 \
             zvec-grep-cuda-ci bash -euo pipefail -c '
               cargo nextest --version
-              cuda_ci_nvcc_version="$(nvcc --version)"
-              echo "$cuda_ci_nvcc_version"
-              grep -Eq "release 13\.1," <<< "$cuda_ci_nvcc_version"
-              export CUDACXX="$(command -v nvcc)"
-              export CMAKE_CUDA_COMPILER="$CUDACXX"
               cargo test --locked --workspace --all-targets --features zg/cuda --no-run \
                 --message-format=json > target/ci-tests.json
+              python3 scripts/cuda/runtime.py --cargo-messages target/ci-tests.json --destination target/debug
               python3 scripts/cuda/prepare-onnxruntime.py --platform linux \
                 --cache-dir target/ort-cuda12 --destination target/debug
               native_dirs="$(find /work/rust/target/debug -name "*.so*" -printf "%h\n" | sort -u | paste -sd :)"
@@ -343,6 +333,8 @@ jobs:
         run: |
           import os, pathlib, subprocess, sys
           if os.environ["CUDA_VERIFY"] == "true":
+              subprocess.run([sys.executable, "scripts/cuda/runtime.py", "--cargo-messages",
+                              "target/ci-tests.json", "--destination", "target/debug"], check=True)
               subprocess.run([sys.executable, "scripts/cuda/prepare-onnxruntime.py", "--platform", "win32",
                               "--cache-dir", "target/ort-cuda12", "--destination", "target/debug"], check=True)
           suffix = "*.dll" if os.name == "nt" else "*.dylib" if sys.platform == "darwin" else "*.so*"
@@ -360,15 +352,12 @@ jobs:
         if: matrix.cuda && runner.os == 'Windows'
         shell: python
         run: |
-          import json, pathlib, sys
+          import pathlib, sys
           sys.path.insert(0, "scripts/cuda")
           from e2e import verify_windows_cuda_plugin
-          records = [json.loads(line) for line in pathlib.Path("target/ci-tests.json").read_text(encoding="utf-8").splitlines()]
-          plugins = {pathlib.Path(record["out_dir"]) / "backends" / "ggml-cuda.dll" for record in records
-                     if record.get("reason") == "build-script-executed"
-                     and "llama-cpp-sys-2" in record.get("package_id", "")}
-          assert len(plugins) == 1, f"Expected one active llama.cpp CUDA plugin from Cargo: {plugins}"
-          verify_windows_cuda_plugin(plugins.pop(), 13, pathlib.Path("model-logs/windows-loader"))
+          from runtime import backend_directory, cargo_records
+          plugin = backend_directory(cargo_records("target/ci-tests.json")) / "ggml-cuda.dll"
+          verify_windows_cuda_plugin(plugin, 13, pathlib.Path("model-logs/windows-loader"))
       - name: Run workspace tests
         if: ${{ !matrix.cuda || runner.os != 'Linux' }}
         shell: python
@@ -479,6 +468,8 @@ jobs:
         shell: python
         run: |
           import json, os, pathlib, re, subprocess, sys
+          sys.path.insert(0, "scripts/cuda")
+          from runtime import backend_directory
           records = [json.loads(line) for line in pathlib.Path("target/ci-tests.json").read_text(encoding="utf-8").splitlines()]
           def test_binary(name):
               binaries = {record["executable"] for record in records
@@ -487,11 +478,7 @@ jobs:
                           and record["profile"]["test"] and record.get("executable")}
               assert len(binaries) == 1, f"Expected one {name} test executable: {binaries}"
               return binaries.pop()
-          directories = {str(pathlib.Path(record["out_dir"]) / "backends") for record in records
-                         if record.get("reason") == "build-script-executed"
-                         and "llama-cpp-sys-2" in record.get("package_id", "")}
-          assert len(directories) == 1, f"Expected one active llama.cpp backend directory: {directories}"
-          directory = directories.pop()
+          directory = str(backend_directory(records))
           windows = sys.platform == "win32"
           plugin = str(pathlib.Path(directory) / ("ggml-cuda.dll" if windows else "libggml-cuda.so"))
           cases = [

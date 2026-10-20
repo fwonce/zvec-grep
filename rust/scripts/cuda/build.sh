@@ -8,7 +8,11 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   echo "CUDA builds are supported only on Linux" >&2
   exit 2
 fi
-for command in cargo cmake nvcc patchelf readelf python3; do
+commands=(cargo patchelf readelf python3)
+if [[ "${LLAMA_CPP_BUILD_MODE:-auto}" != prebuilt ]]; then
+  commands+=(cmake nvcc)
+fi
+for command in "${commands[@]}"; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is unavailable: ${command}" >&2
     exit 2
@@ -31,7 +35,10 @@ if [[ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]]; then
   export CMAKE_BUILD_PARALLEL_LEVEL
 fi
 
-cuda_toolkit_version="$(nvcc --version | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' | tail -n 1)"
+cuda_toolkit_version=13.1
+if [[ "${LLAMA_CPP_BUILD_MODE:-auto}" != prebuilt ]]; then
+  cuda_toolkit_version="$(nvcc --version | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' | tail -n 1)"
+fi
 if [[ "${cuda_toolkit_version}" != "13.1" ]]; then
   echo "the primary GGUF backend requires CUDA 13.1 (found ${cuda_toolkit_version})" >&2
   exit 2
@@ -43,18 +50,11 @@ target_dir="${CARGO_TARGET_DIR:-target}"
 if [[ "${target_dir}" != /* ]]; then
   target_dir="${PWD}/${target_dir}"
 fi
-build_config="cuda_toolkit=${cuda_toolkit_version};ort=1.28.0-cuda12-dynamic;architectures=${CMAKE_CUDA_ARCHITECTURES}"
-build_config_file="${target_dir}/.zvec-grep-cuda-build-config"
-previous_build_config="$(sed -n '1p' "${build_config_file}" 2>/dev/null || true)"
-if [[ "${previous_build_config}" != "${build_config}" && -f "${target_dir}/CACHEDIR.TAG" ]]; then
-  # A failed custom build is not necessarily removed by package-scoped
-  # `cargo clean`, leaving its CMake cache configured for the old architecture.
-  echo "CUDA build configuration changed; rebuilding the target directory"
-  cargo clean --target-dir "${target_dir}"
-fi
-
-cargo build --locked --release --package zg --features cuda
-printf '%s\n' "${build_config}" > "${build_config_file}"
+# The pinned sys crate fingerprints native options and invalidates its own
+# CMake state. Do not discard unrelated Rust output or the verified SDK cache.
+mkdir -p "${target_dir}"
+cargo build --locked --release --package zg --features cuda \
+  --message-format=json-render-diagnostics > "${target_dir}/cuda-build.json"
 
 profile_dir="${target_dir}/release"
 bundle_dir="${profile_dir}/zg-cuda"
@@ -64,49 +64,8 @@ install -d "${staging_dir}/bin" "${staging_dir}/lib"
 
 install -m 0755 "${profile_dir}/zg" "${staging_dir}/bin/zg"
 
-cuda_backend="$(find "${profile_dir}/build" -path '*/llama-cpp-sys-2-*/out/backends/libggml-cuda.so*' -type f -printf '%T@ %p\n' \
-  | sort -nr | sed -n '1s/^[^ ]* //p')"
-if [[ -z "${cuda_backend}" ]]; then
-  echo "unable to locate the llama.cpp CUDA backend module" >&2
-  exit 1
-fi
-backend_dir="$(dirname -- "${cuda_backend}")"
-llama_out_dir="$(dirname -- "${backend_dir}")"
-
-shopt -s nullglob
-llama_backend_libraries=("${backend_dir}"/libggml-*.so*)
-if (( ${#llama_backend_libraries[@]} == 0 )); then
-  echo "llama.cpp shared libraries are incomplete" >&2
-  exit 1
-fi
-
-copy_core_library() {
-  local stem="$1"
-  local source=""
-  local candidate
-  for candidate in "${llama_out_dir}"/lib*/"${stem}".so*; do
-    if [[ -f "${candidate}" && ! -L "${candidate}" ]]; then
-      source="${candidate}"
-      break
-    fi
-  done
-  if [[ -z "${source}" ]]; then
-    echo "unable to locate the real shared library for ${stem}" >&2
-    exit 1
-  fi
-  local soname
-  soname="$(readelf -d "${source}" | sed -n 's/.*(SONAME).*\[\([^]]*\)\].*/\1/p' | head -n 1)"
-  if [[ -z "${soname}" || "${soname}" == */* ]]; then
-    echo "invalid or missing SONAME for ${source}: ${soname}" >&2
-    exit 1
-  fi
-  cp -L --preserve=mode,timestamps -- "${source}" "${staging_dir}/lib/${soname}"
-}
-
-copy_core_library libllama
-copy_core_library libggml
-copy_core_library libggml-base
-cp -L --preserve=mode,timestamps -- "${llama_backend_libraries[@]}" "${staging_dir}/lib/"
+python3 scripts/cuda/runtime.py --cargo-messages "${target_dir}/cuda-build.json" \
+  --destination "${staging_dir}/lib"
 
 python3 scripts/cuda/prepare-onnxruntime.py --platform linux \
   --cache-dir "${target_dir}/ort-cuda12" --destination "${staging_dir}/lib"
@@ -128,11 +87,13 @@ while IFS= read -r -d '' file; do
 done < <(find "${staging_dir}/lib" -maxdepth 1 -type f -print0)
 
 chmod 0755 "${staging_dir}"
-# CI can build the fallback in a separate CUDA 12.4 container before auditing.
-# Primary-only output is explicitly staging, never a complete local bundle.
+# SDK staging includes both plugins. Source builds may defer the fallback to
+# another toolchain. --primary-only always defers the complete bundle audit.
 if [[ "${1:-}" != "--primary-only" ]]; then
-  python3 scripts/cuda/build-fallback.py --bundle "${staging_dir}" \
-    --cuda-root "${CUDA12_ROOT:-/usr/local/cuda-12.4}"
+  if [[ ! -f "${staging_dir}/lib/cuda12/libggml-cuda.so" ]]; then
+    python3 scripts/cuda/build-fallback.py --bundle "${staging_dir}" \
+      --cuda-root "${CUDA12_ROOT:-/usr/local/cuda-12.4}"
+  fi
   bash scripts/cuda/check.sh "${staging_dir}"
 else
   bundle_dir="${profile_dir}/zg-cuda-staging"

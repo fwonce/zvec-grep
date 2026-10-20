@@ -188,7 +188,7 @@ jobs:
         with:
           name: rust-verification-${{ needs.source.outputs.version }}
           path: rust/dist/npm/release/tarballs
-      - name: Verify GGUF and ONNX CUDA without rebuilding
+      - name: Verify CPU bootstrap, npm rebuild and GGUF/ONNX CUDA inference
         uses: ./.github/actions/cuda-cli-e2e
         with:
           target: ${{ matrix.target }}
@@ -296,7 +296,7 @@ jobs:
             ubuntu:24.04 bash -euo pipefail -c '
               apt-get update -qq
               apt-get install --yes --no-install-recommends python3 ca-certificates libstdc++6 >/dev/null
-              npm run release:artifact-smoke
+              npm run release:artifact-smoke -- --expect-cpu
               python3 scripts/cuda/e2e.py --cpu-only \
                 --bundle dist/npm/release/artifact-smoke/prefix/lib/node_modules/@zvec/zvec-grep \
                 --model-cache /model-cache --logs /work/cpu-logs
@@ -308,7 +308,7 @@ jobs:
           # Hosted CPU images may include toolkit paths; do not let them satisfy DLL dependencies.
           $env:PATH = (($env:PATH -split ';') | Where-Object { $_ -notmatch '(?i)cuda|cudnn|NVIDIA GPU Computing Toolkit' }) -join ';'
           Get-ChildItem Env: | Where-Object { $_.Name -match '^CUDA' } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
-          npm run release:artifact-smoke
+          npm run release:artifact-smoke -- --expect-cpu
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/cuda/e2e.py --cpu-only `
             --bundle dist/npm/release/artifact-smoke/prefix/node_modules/@zvec/zvec-grep `
@@ -322,7 +322,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" cpu-logs "${RUNNER_TEMP}/zvec-grep-model-cache"
       - name: Install and exercise the macOS and Linux ARM64 artifacts
         if: ${{ !matrix.cuda_package }}
-        run: npm run release:artifact-smoke
+        run: npm run release:artifact-smoke -- --expect-cpu
       - name: Retain CPU artifact execution evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
@@ -331,6 +331,7 @@ jobs:
           path: |
             cpu-logs/
             rust/dist/npm/release/artifact-smoke/installation.json
+            rust/dist/npm/release/artifact-smoke/cpu-downloads.json
           if-no-files-found: warn
           retention-days: 7
 

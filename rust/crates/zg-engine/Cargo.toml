@@ -9,9 +9,8 @@ publish.workspace = true
 
 [features]
 default = []
-# CUDA and Vulkan require their native toolchains at build time. Platform
-# release builds enable the matching feature, while unsupported requests keep
-# the same warning-and-CPU-fallback behavior as main.
+# Matching CUDA builds reuse the pinned native SDK; custom CUDA/Vulkan
+# configurations require source toolchains. Runtime CPU fallback is unchanged.
 cuda = [
     "dep:zg-llama-native",
     "llama-cpp-2/cuda",
@@ -33,7 +32,7 @@ hex = "0.4.3"
 ignore.workspace = true
 hmac-sha256 = "1.1.14"
 httpdate = "1.0.3"
-llama-cpp-2 = { version = "0.1.154", default-features = false }
+llama-cpp-2.workspace = true
 # Stage ORT runtime sidecars beside Cargo outputs for npm packaging, including
 # dynamically linked Intel macOS ORT and Windows DirectML's DLL.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["api-27", "copy-dylibs", "download-binaries", "std", "tls-rustls"] }

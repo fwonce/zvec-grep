@@ -1,4 +1,7 @@
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { spawn } from "node:child_process";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -139,16 +142,76 @@ export async function smokeInstalledPackage({
   );
 }
 
-export async function installArtifactRelease({
-  manifest,
-  release,
-  tarballRoot,
-  prefixRoot,
-  target,
-  accelerator = "cpu",
-  runNpm = run,
-  verifyInstalled = verifyInstalledRelease,
-}) {
+// npm's postinstall invokes npm pack synchronously. Keep this parent asynchronous
+// so the loopback registry can serve the actual, unpublished component archives.
+function runArtifactNpm(command, args, options) {
+  const windows = process.platform === "win32";
+  const npmCli = process.env.npm_execpath ??
+    join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+  return new Promise((resolve, reject) => {
+    const child = spawn(windows ? process.execPath : command, windows ? [npmCli, ...args] : args,
+      { cwd: workspaceDir, env: options.env, stdio: "inherit", timeout: 600_000 });
+    child.on("error", reject);
+    child.on("close", (code, signal) => code === 0 ? resolve() :
+      reject(new Error(`artifact npm ${args[0]} failed: ${signal || code}`)));
+  });
+}
+
+async function withArtifactRegistry({ release, entry, tarballRoot, evidence }, operation) {
+  const components = release.packages.filter((pkg) =>
+    entry.components?.some((component) => component.package === pkg.name));
+  const requests = [];
+  const server = createHttpServer((request, response) => {
+    let path;
+    try { path = decodeURIComponent(new URL(request.url, "http://localhost").pathname); }
+    catch { response.writeHead(400).end(); return; }
+    const pkg = components.find((candidate) =>
+      path === `/${candidate.name}` || path === `/tarballs/${candidate.file}`);
+    requests.push({ path, component: pkg?.name ?? null });
+    // No proxy/public registry fallback, nor any files outside the release inventory.
+    if (!pkg) { response.writeHead(404).end(); return; }
+    if (path.startsWith("/tarballs/")) {
+      response.setHeader("Content-Type", "application/octet-stream");
+      createReadStream(join(tarballRoot, pkg.file)).on("error", () => response.destroy()).pipe(response);
+      return;
+    }
+    response.setHeader("Content-Type", "application/json");
+    response.end(JSON.stringify({ name: pkg.name, "dist-tags": { latest: pkg.version }, versions: {
+      [pkg.version]: { name: pkg.name, version: pkg.version, dist: {
+        tarball: `http://127.0.0.1:${server.address().port}/tarballs/${pkg.file}`, integrity: pkg.integrity,
+      } },
+    } }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    return await operation(`http://127.0.0.1:${server.address().port}`, requests);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await writeFile(evidence, `${JSON.stringify({ requests,
+      cudaRequests: requests.filter((request) => request.component).length }, null, 2)}\n`);
+  }
+}
+
+function artifactEnvironment(prefixRoot, accelerator, registry, tarballRoot) {
+  const env = { ...npmEnvironment(join(prefixRoot, "cache")),
+    ZG_PLUGIN_DIR: registry ? "" : tarballRoot,
+    ZG_PLUGIN_CACHE: join(prefixRoot, "plugin-cache"),
+    ZG_INSTALL_OFFLINE: registry ? "0" : "1",
+    npm_config_offline: registry ? "false" : "true" };
+  // Exercise the installer's real default, not an explicit CPU/auto override.
+  if (accelerator === "auto") delete env.ZG_INSTALL_ACCELERATOR;
+  else env.ZG_INSTALL_ACCELERATOR = accelerator;
+  if (registry) {
+    env.npm_config_registry = registry;
+    env["npm_config_@zvec:registry"] = registry;
+  }
+  return env;
+}
+
+async function artifactInputs({ manifest, release, tarballRoot, target, accelerator, expectCpu }) {
   if (
     release.schemaVersion !== 1 || !Array.isArray(release.packages) ||
     !/^\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?$/.test(release.version)
@@ -168,7 +231,7 @@ export async function installArtifactRelease({
     ...nativePackageEntries(entry),
     { name: manifest.metaPackage, target: "meta" },
   ]) {
-    if (component && accelerator === "cpu") continue;
+    if (component && accelerator === "cpu" && !expectCpu) continue;
     const matches = release.packages.filter((candidate) => candidate.name === name);
     const candidate = matches[0];
     const file = `${name.replace(/^@/, "").replaceAll("/", "-")}-${release.version}.tgz`;
@@ -184,6 +247,32 @@ export async function installArtifactRelease({
     }
     if (!component) tarballs.push(path);
   }
+  return { entry, tarballs };
+}
+
+async function assertCpuInstallation({ installation, entry, prefixRoot, bundle }) {
+  if (installation.components.length) throw new Error("CPU artifact installation unexpectedly installed CUDA plugins");
+  for (const file of new Set((entry.components ?? []).map((component) => component.file))) {
+    const exists = await access(join(bundle, file)).then(() => true, (error) => {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    });
+    if (exists) throw new Error(`CPU artifact installation contains a CUDA plugin: ${file}`);
+  }
+  const cache = await readdir(join(prefixRoot, "plugin-cache")).catch((error) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  if (cache.length) throw new Error("CPU artifact installation attempted to populate the CUDA cache");
+}
+
+export async function installArtifactRelease({
+  manifest, release, tarballRoot, prefixRoot, target,
+  accelerator = "auto", expectCpu = false,
+  runNpm = runArtifactNpm, verifyInstalled = verifyInstalledRelease,
+}) {
+  if (expectCpu && accelerator !== "auto") throw new Error("CPU-host verification must use default auto installation");
+  const { entry, tarballs } = await artifactInputs({ manifest, release, tarballRoot, target, accelerator, expectCpu });
   // Use the exact downloaded bytes, a fresh prefix/cache and no registry fallback.
   // Verification must never build or repack a package.
   const destination = resolve(prefixRoot);
@@ -193,30 +282,88 @@ export async function installArtifactRelease({
     throw new Error("artifact installation needs a dedicated prefix directory outside its inputs");
   }
   const existing = await readdir(destination).catch((error) => { if (error.code === "ENOENT") return []; throw error; });
-  if (existing.some((name) => !["prefix", "cache", "plugin-cache", "workspace", "installation.json"].includes(name))) {
+  if (existing.some((name) => !["prefix", "cache", "plugin-cache", "workspace", "installation.json",
+    "cpu-installation.json", "cpu-downloads.json", "rebuild-downloads.json"].includes(name))) {
     throw new Error("refusing to replace a directory not owned by artifact installation");
   }
   await rm(prefixRoot, { recursive: true, force: true });
+  await mkdir(prefixRoot, { recursive: true });
   const prefix = join(prefixRoot, "prefix");
-  await runNpm(
+  const install = (registry) => runNpm(
     "npm",
     [
       "install", "--global", "--prefix", prefix,
-      "--offline", "--no-audit", "--no-fund",
+      ...(registry ? [`--registry=${registry}`, `--@zvec:registry=${registry}`, "--fetch-retries=0"] : ["--offline"]),
+      "--no-audit", "--no-fund", "--ignore-scripts=false", "--foreground-scripts",
       `--allow-scripts=${tarballs.at(-1)}`, ...tarballs,
     ],
-    { env: { ...npmEnvironment(join(prefixRoot, "cache")), ZG_INSTALL_ACCELERATOR: accelerator,
-      ZG_PLUGIN_DIR: tarballRoot, ZG_PLUGIN_CACHE: join(prefixRoot, "plugin-cache"), ZG_INSTALL_OFFLINE: "1" } },
+    { env: artifactEnvironment(prefixRoot, accelerator, registry, tarballRoot) },
   );
+  if (expectCpu) {
+    await withArtifactRegistry({ release, entry, tarballRoot, evidence: join(prefixRoot, "cpu-downloads.json") },
+      async (registry, requests) => {
+        await install(registry);
+        if (requests.some((request) => request.component)) {
+          throw new Error("Default CPU-host installation requested CUDA plugins (including failed attempts)");
+        }
+      });
+  } else await install();
   const installation = await verifyInstalled({ manifest, entry, version: release.version, prefix,
-    requireCuda: Boolean(entry.components?.length && accelerator !== "cpu") });
+    requireCuda: Boolean(entry.components?.length && accelerator !== "cpu" && !expectCpu) });
   if (accelerator === "cpu" && installation.coreId && installation.components.length) {
     throw new Error("CPU artifact installation unexpectedly installed CUDA plugins");
   }
   const bundle = installedPackageRoot(prefix, manifest.metaPackage);
+  if (expectCpu) await assertCpuInstallation({ installation, entry, prefixRoot, bundle });
   await writeFile(join(prefixRoot, "installation.json"), `${JSON.stringify({
-    ...installation, bundle, accelerator, commit: release.commit,
+    ...installation, bundle, accelerator, expectCpu, commit: release.commit,
     packages: release.packages.filter((pkg) => pkg.target === entry.target || pkg.target === "meta"),
+  }, null, 2)}\n`);
+  return { entry, prefix, bundle };
+}
+
+export async function rebuildArtifactRelease({
+  manifest, release, tarballRoot, prefixRoot, target,
+  runNpm = runArtifactNpm, verifyInstalled = verifyInstalledRelease,
+}) {
+  const { entry } = await artifactInputs({ manifest, release, tarballRoot, target, accelerator: "cuda" });
+  if (!entry.components?.length) throw new Error("CUDA rebuild requires a platform with CUDA components");
+  const prefix = join(prefixRoot, "prefix");
+  const bundle = installedPackageRoot(prefix, manifest.metaPackage);
+  const report = JSON.parse(await readFile(join(prefixRoot, "installation.json"), "utf8"));
+  const packages = release.packages.filter((pkg) => pkg.target === entry.target || pkg.target === "meta");
+  if (report.commit !== release.commit || JSON.stringify(report.packages) !== JSON.stringify(packages)) {
+    throw new Error("CPU installation belongs to a different artifact release");
+  }
+  const before = await verifyInstalled({ manifest, entry, version: release.version, prefix });
+  if (before.coreId !== report.coreId || before.target !== report.target || before.version !== report.version) {
+    throw new Error("CPU installation no longer matches its original receipt");
+  }
+  await assertCpuInstallation({ installation: before, entry, prefixRoot, bundle });
+  const binarySha256 = await sha256File(join(bundle, "bin/zg.exe"));
+  await writeFile(join(prefixRoot, "cpu-installation.json"), `${JSON.stringify(report, null, 2)}\n`);
+  await withArtifactRegistry({ release, entry, tarballRoot, evidence: join(prefixRoot, "rebuild-downloads.json") },
+    async (registry, requests) => {
+      // Deliberately no rm, npm install or fresh prefix: rerun the installed postinstall.
+      await runNpm("npm", ["rebuild", "--global", "--prefix", prefix,
+        `--registry=${registry}`, `--@zvec:registry=${registry}`,
+        "--ignore-scripts=false", `--allow-scripts=${manifest.metaPackage}`, "--foreground-scripts",
+        manifest.metaPackage], { env: artifactEnvironment(prefixRoot, "cuda", registry) });
+      for (const component of entry.components) {
+        const pkg = packages.find((candidate) => candidate.name === component.package);
+        if (!requests.some((request) => request.path === `/tarballs/${pkg.file}`)) {
+          throw new Error(`npm rebuild did not fetch this run's CUDA component: ${pkg.name}`);
+        }
+      }
+    });
+  const after = await verifyInstalled({ manifest, entry, version: release.version, prefix, requireCuda: true });
+  if (!before.coreId || after.coreId !== before.coreId ||
+      await sha256File(join(bundle, "bin/zg.exe")) !== binarySha256) {
+    throw new Error("npm rebuild changed the installed CPU core or executable");
+  }
+  await writeFile(join(prefixRoot, "installation.json"), `${JSON.stringify({
+    ...after, bundle, accelerator: "cuda", operation: "rebuild", commit: release.commit,
+    binarySha256, previousCoreId: before.coreId, packages,
   }, null, 2)}\n`);
   return { entry, prefix, bundle };
 }

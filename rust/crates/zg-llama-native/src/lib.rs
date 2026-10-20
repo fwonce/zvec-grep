@@ -30,7 +30,7 @@ impl RegistryGuard {
     /// Returns an error if the directory has no usable CPU plugin or its path cannot
     /// be passed to ggml. CUDA and other GPU plugins are never opened by this loader.
     pub fn load_cpu_backend(&self, directory: &Path) -> Result<(), String> {
-        let path = select_cpu_backend(directory, cpu_score)?;
+        let path = select_cpu_backend(directory, initialize_core, cpu_score)?;
         let path_string = path
             .to_str()
             .ok_or("llama.cpp backend path must be UTF-8")?;
@@ -49,6 +49,19 @@ impl RegistryGuard {
     }
 }
 
+fn initialize_core() {
+    // Resolve our ggml-base import BEFORE temporarily loading CPU variants.
+    // Windows zg delay-loads this DLL: without an executable-owned reference,
+    // dropping a scoring library can unload ggml-base while its process-wide
+    // std::terminate handler remains installed. Reloading then asserts.
+    // The delay-load import holds the core for process life, independently of
+    // the temporary scoring handles. Do not initialize the backend registry or
+    // call the all-backend loader here: explicit CPU must not probe any GPU.
+    // SAFETY: the pinned ggml API exposes this idempotent timer initializer.
+    // It neither enumerates devices nor loads/registers backend plugins.
+    unsafe { llama_cpp_sys_2::ggml_time_init() };
+}
+
 fn cpu_score(path: &Path) -> Option<i32> {
     // SAFETY: only CPU-named plugins from the caller's trusted native bundle are
     // opened. The pinned ggml ABI defines ggml_backend_score as int(void).
@@ -64,6 +77,7 @@ fn cpu_score(path: &Path) -> Option<i32> {
 
 fn select_cpu_backend(
     directory: &Path,
+    initialize_core: impl FnOnce(),
     mut score: impl FnMut(&Path) -> Option<i32>,
 ) -> Result<PathBuf, String> {
     let (prefix, extension) = if cfg!(target_os = "windows") {
@@ -95,6 +109,7 @@ fn select_cpu_backend(
     // CPU plugin if no variant is supported. Never score a GPU plugin.
     let mut best = None;
     let mut best_score = 0;
+    initialize_core();
     for path in variants {
         if let Some(value) = score(&path)
             && value > best_score

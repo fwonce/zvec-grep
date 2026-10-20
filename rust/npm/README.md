@@ -94,12 +94,15 @@ enable GPU use, while hosts without them continue on CPU. Release maintainers
 may use `--cpu-only` for a CPU-only build, but that variant is not
 published as the default x64 package on Linux or Windows.
 
-`npm run build` and release packaging prefer CUDA on those two targets when
+In default build mode, `npm run build` and release packaging prefer CUDA on those two targets when
 `nvcc` from CUDA 13.1 is available. If `nvcc` is absent they build a CPU-only
 package instead. An installed but unsupported CUDA toolkit is an error; use
 `--cpu-only` deliberately rather than silently producing a different GPU ABI.
-The full CUDA build also needs the 12.4 toolkit for the fallback plugin; an
-incomplete CUDA build fails and does not silently publish a CPU package.
+Matching configurations reuse the fork's pinned native SDK, including the
+12.4 fallback. Only **source** builds need a second 12.4 toolkit. Explicit
+`LLAMA_CPP_BUILD_MODE=prebuilt` builds the CUDA bundle without either compiler;
+it fails on a configuration mismatch. An incomplete CUDA build fails and does
+not silently publish a CPU package.
 CPU/CUDA build trees are isolated under `target/cpu` and `target/cuda` on these
 targets. `--no-build` reuses the last successful recorded build, not a stale
 bundle selected by its existence. Explicit CI bundles use `--bundle-dir`.
@@ -129,7 +132,7 @@ The CUDA 13.1 primary GGUF plugin uses
 `50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real`: PTX plus native
 SM86 code, reducing installed size while retaining driver JIT compilation where
 compatible native code is unavailable. `CMAKE_CUDA_ARCHITECTURES` overrides the
-primary build; `CUDA12_ARCHITECTURES` overrides only the fallback, which does not
+primary source build; `CUDA12_ARCHITECTURES` overrides only the fallback, which does not
 inherit the primary list. These build targets do not imply hardware validation
 on every GPU generation. The current runtime device-enumeration check is not
 a PTX/driver compatibility check: this release does not add PTX-version rejection
@@ -140,6 +143,10 @@ The primary GGUF CUDA plugin remains directly under `lib/`; there is no new
 `lib/cuda13/` directory. Explicit CPU execution uses a selective CPU-plugin
 loader rather than scanning that directory for every backend, and ignores
 `GGML_BACKEND_PATH`. Optional GPU registration is separate from CPU initialization.
+Before scoring CPU variants, a device-independent ggml timer call resolves the
+core import. This keeps `ggml-base.dll` loaded for the process lifetime on
+Windows, including when temporary scoring handles are released; it does not
+scan GPU plugins or initialize a GPU.
 
 On Windows, CUDA 13 runtime DLLs reside under the toolkit's `bin/x64`, while
 older toolkits use `bin`. The required host runtime directories must be visible
@@ -187,12 +194,13 @@ individually.
 `publish=true` requires `platform=all`; a subset is a validation-only candidate,
 not a complete release. Pushes to `main` and
 `release/rust-*`, and manual runs with `publish=false, cuda=false`, use ordinary CPU runners;
-they do not allocate GPUs or publish packages. CUDA compilation still runs
-for the default Linux/Windows x64 bundles and does not require GPU hardware.
+they do not allocate GPUs or publish packages. All five package builds require
+the pinned llama-cpp-rs prebuilt SDK. Linux/Windows x64 still produce CUDA-capable
+bundles, but neither the 13.1 primary nor 12.4 fallback is compiled in zg CI.
 All packaging builds stay on ordinary CPU runners, including when `cuda=true`
 or `publish=true`. Manual `cuda=true` runs add separate Linux/Windows x64 GPU
 jobs that download the exact native npm artifacts from the same workflow run
-and perform package-level GPU end-to-end validation, without rebuilding or
+and perform package-level GPU end-to-end validation, without recompiling native code or
 repacking. Publishing also enables GPU validation unconditionally, even if
 `cuda` was not selected. Candidate collection precedes parallel CPU/GPU checks;
 it proves package completeness, not runtime success. A GPU failure does not skip
@@ -206,19 +214,26 @@ pinned sources, cached, and bundled with the native package. The Intel release
 targets macOS 14 and later.
 
 Build jobs select Cargo/CMake parallelism from the runner's available CPUs and
-total memory, budgeting 3 GiB per job and capping concurrency at 8. Both Linux
-CUDA containers receive the same limits. This is a conservative memory heuristic,
-not an OOM guarantee. Linux x64 and Windows x64 have a 180-minute timeout for the
-primary CUDA 13.1 build plus CUDA 12.4 fallback. Windows installs MSVC 14.38 before
-any compilation, then switches to that toolset only for the fallback build.
+total memory, budgeting 3 GiB per job and capping concurrency at 8. The Linux
+builder receives the same limits. This is a conservative memory heuristic,
+not an OOM guarantee. The pinned SDK contains the shared core, CPU variants and
+both CUDA plugins; no Windows CUDA compiler/MSVC 14.38 fallback setup or second
+Linux CUDA builder is needed. Rust linking and dependency audits remain. The SDK
+cache is keyed separately from Cargo build output and checked by the fork's
+embedded archive/manifest hashes. Native configuration drift fails release CI
+instead of silently rebuilding. ORT and zvec build/download behavior is unchanged.
 
 All-platform runs produce `rust-release-<version>`; subset runs produce
 `rust-candidate-<version>` with the selected native tarballs and all their components, the same
 exact-version meta tarball, checksums and a `release.json` marked `partial`.
 Publication and promotion reject partial candidates. After collection,
 independent CPU jobs for every selected target download and install the exact
-base/meta tarballs offline without installing any CUDA components, rebuilding or repacking. They verify
-checksums, CLI startup and daemon IPC. Linux/Windows x64 also verify real
+base/meta tarballs with the default `auto` installation mode, without compiling
+or repacking. A loopback registry exposes only this run's CUDA archives and
+records requests. CPU installation must make zero CUDA metadata/tarball requests,
+leave the plugin cache empty and install no CUDA components; optional download
+failure followed by CPU fallback is not a pass. No public registry is used.
+They verify checksums, CLI startup and daemon IPC. Linux/Windows x64 also verify real
 GGUF/ONNX indexing and vector queries with
 explicit CPU selection and default CPU fallback, without CUDA host libraries.
 These checks also run for unpublished candidates and must pass before npm
@@ -228,14 +243,23 @@ The package GPU jobs use the hosted T4 runners with CUDA runtime libraries,
 not Rust/C++/CUDA compiler setup. They verify the downloaded native package's
 payload checksums, share the `install-artifacts` installation path with CPU smoke
 checks (real meta-package postinstall, no synthetic metadata). Installation runs
-inside each Linux CUDA container and after Windows runtime preparation, using
-fresh prefixes/caches and only this run's artifacts. Auto installation is tested
-in CUDA 12 and forced installation in CUDA 13, with explicit CPU installation on
-a GPU host also covered. Both CUDA 12 fallback and CUDA 13 primary paths require
-real inference evidence, not merely successful installation.
+inside the Linux CUDA 12 container and after Windows runtime preparation, using
+only this run's artifacts. Each GPU job first installs the CPU base in a fresh
+prefix and exercises explicit CPU inference. It then runs real
+`ZG_INSTALL_ACCELERATOR=cuda npm rebuild` in that same prefix, fetching the
+unpublished CUDA archives from a loopback registry. Every plugin must verify,
+and the original core identity and binary must remain unchanged.
+The rebuilt installation is used for both CUDA 12 fallback and CUDA 13 primary
+inference (shared between Linux runtime containers); fresh automatic GPU
+installation is also checked separately. These checks run with
+`publish=false,cuda=true` and require real inference evidence, not merely
+successful installation. CPU/GPU jobs remain parallel; the GPU job bootstraps
+its own CPU installation rather than transferring the CPU runner's prefix.
 Both verification paths use the current platform's native artifact plus the
 small `rust-verification-<version>` meta/inventory artifact; their installation
-reports identify the exact collected hashes. Registry checks run on CPU runners
+reports identify the exact collected hashes. CPU request logs and GPU
+before/after receipts plus rebuild request logs are retained as evidence.
+Public registry checks run on CPU runners
 and validate downloaded component versions/hashes and the reconstructed runtime,
 so CPU fallback cannot mask missing or corrupt GPU payloads.
 Windows GPU jobs also prepare the pinned NVIDIA 591.59 driver when an older

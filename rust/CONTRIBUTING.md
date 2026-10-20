@@ -71,15 +71,19 @@ RUSTDOCFLAGS="-D warnings" cargo doc -p zg-engine --no-deps
 ## CUDA validation
 
 CUDA-specific helpers live only in `scripts/cuda/`: `build.sh`/`build.ps1`
-assemble the primary bundle, `build-fallback.py` adds only the CUDA 12.4 plugin,
+assemble the bundle; `runtime.py` stages the exact native runtime selected by
+Cargo, including the SDK's CUDA 12 fallback. In explicit source mode,
+`build-fallback.py` builds only the CUDA 12.4 plugin.
 `prepare-onnxruntime.py` verifies and stages official ORT archives, and
 `check.sh`/`check.ps1` audit the resulting runtime linkage. `prepare-windows.ps1`
-and the two pinned requirements files provision Windows build/runtime tools.
-`cuda-builder.Dockerfile` provides the shared Linux CUDA build environment for
-source CI and package builds.
+and the pinned runtime requirements provision Windows linker/runtime tools.
+`cuda-builder.Dockerfile` provides Linux Rust build dependencies; CI selects a
+compiler-free base image for packaging or a CUDA runtime image for GPU tests.
 `e2e.py` validates installed packages on a real GPU or, with `--cpu-only`, on a
 host without loadable CUDA libraries. CUDA validation consists of actual
-compilation, linkage audits and GPU end-to-end execution; ordinary PR CI retains
+Rust compilation/linking against the prebuilt SDK, linkage audits and GPU
+end-to-end execution. The fork's SDK release gates own llama.cpp/CUDA compilation;
+ordinary PR CI retains
 the npm packaging tests without a separate CUDA mock-test suite.
 
 ### Workspace and real-model CI
@@ -97,7 +101,8 @@ Linux/Windows test jobs to `gpu-linux-t4` and `gpu-windows-t4` in `gpu-runners`.
 `platform` accepts `all` (the default), `linux`, or `windows`. Optional `ref`
 selects the reviewed source; otherwise the workflow's selected commit is used.
 The source job resolves it once to a SHA for all subsequent checkouts.
-CUDA test jobs enable `zg/cuda` from the first compilation and target T4 (SM 75).
+CUDA test jobs enable `zg/cuda` from the first Rust compilation and require the
+pinned multi-architecture SDK; real execution uses T4 (SM 75).
 The quality job remains non-CUDA, and macOS stays non-CUDA when `platform=all`.
 This workflow does not call `rust-package-build.yml` or build/install npm packages;
 it is not a substitute for package-level GPU validation.
@@ -123,6 +128,11 @@ the only registered backend even with `GGML_BACKEND_PATH` pointing at a present
 CUDA plugin. They reuse the model cache and Cargo-reported backend directory;
 no extra build is performed. Each selection must report exactly one passing
 test, and `c5-*.log` files are retained with the other real-model evidence.
+The packaged Windows CLI also exercises delayed DLL imports, unlike ordinary
+Rust test executables: CPU variant scoring must first resolve the ggml core
+import through its device-independent timer initialization, so releasing a
+temporary CPU plugin cannot unload the core and leave its exception handler
+dangling. The existing packaged CPU GGUF index/query checks cover this path.
 
 ### Package validation
 
@@ -134,7 +144,7 @@ to npm. Compilation always stays on CPU runners, including when `cuda=true` or
 `publish=true`; Linux/Windows x64 still build the default CUDA-capable bundles.
 Set `cuda=true,publish=false` to add GPU validation without publishing.
 Separate GPU jobs download the exact native npm artifacts from the same run and
-invoke `.github/actions/cuda-cli-e2e`, without rebuilding or repacking. Publication
+invoke `.github/actions/cuda-cli-e2e`, without recompiling native code or repacking. Publication
 always requires these GPU checks, even when `cuda` is unchecked. Collection runs
 first; CPU and requested GPU validation then run independently in parallel.
 Failures retain candidates and do not skip the other validation path, but every
@@ -151,8 +161,13 @@ the exact-version meta tarball, checksums and installation instructions.
 
 After collection, separate CPU jobs for every selected target download their
 native artifact plus the collected meta/inventory artifact, verify tarball SHA256
-values, and install only base/meta tarballs offline into a fresh prefix without
-rebuilding or repacking. They verify CLI and daemon IPC. Linux/Windows x64 then
+values, and install base/meta tarballs into a fresh prefix without compiling or
+repacking. `ZG_INSTALL_ACCELERATOR` is unset to exercise the default `auto`
+behavior on the real CPU host. An isolated loopback registry serves only this
+run's CUDA archives: any CUDA metadata/tarball request (even a failed optional
+attempt), installed plugin or populated plugin cache fails CPU validation.
+`cpu-downloads.json` retains the request evidence; no public registry is used.
+They verify CLI and daemon IPC. Linux/Windows x64 then
 run `scripts/cuda/e2e.py --cpu-only` against the installed meta
 package. This checks both explicit `--device cpu` and default automatic CPU
 fallback for real GGUF/ONNX indexing and vector queries. Linux uses a plain
@@ -161,13 +176,19 @@ libraries to be unavailable and retain `cpu-artifact-evidence-*` logs on failure
 CPU artifact validation runs even when `publish=false`; failure blocks npm
 publication, while the downloaded candidate remains available for diagnosis.
 
-CUDA component downloads are tested through the actual postinstall, not a
-workspace-only assembly shortcut. Linux installs inside each CUDA runtime
-container; Windows installs after the relevant runtime is prepared. Each case
-uses a fresh prefix/cache and this run's local plugin archives. Auto and forced
-CUDA installation must activate every verified plugin before GPU inference;
-explicit CPU installation on a GPU host must request none. Registry smoke also
-forces plugin fetching so optional CPU fallback cannot hide unavailable assets.
+CPU and GPU jobs remain independent. On each GPU host, the actual npm
+postinstall first installs a CPU-only base with `ZG_INSTALL_ACCELERATOR=cpu`,
+then runs explicit CPU inference. In that same prefix,
+`ZG_INSTALL_ACCELERATOR=cuda npm rebuild` fetches the exact unpublished component
+archives through a loopback registry and must activate every verified plugin.
+It must preserve the installed core identity and executable. Both CUDA 12
+GGUF/ONNX inference and CUDA 13 GGUF inference use that rebuilt installation;
+Windows also checks ONNX with CUDA 13 present. Linux shares the prefix between
+its two runtime containers. Fresh automatic GPU installation remains separately
+covered. Before/after installation receipts and `rebuild-downloads.json` are
+retained with the GPU evidence, including on failure. This chain runs for
+`publish=false,cuda=true`, without compiling or publishing anything. Public
+registry smoke remains a separate post-publication check.
 
 Both platforms run the same CLI index, readiness and vector-search test with
 GGUF `local/embeddinggemma-300m` and ONNX `local/all-minilm-l6-v2`, explicitly
@@ -210,8 +231,12 @@ CUDA Driver API initialization and device enumeration. A reboot requirement, an
 inactive upgrade or failed CUDA initialization fails the job explicitly; the
 helper never reboots the runner.
 
-The Rust CI CUDA test job also provisions VS 2022 C++ tools (including MSVC 14.38),
-a pinned libclang wheel and the repository-pinned Rust toolchain. The GPU image
+The Rust CI CUDA test job also provisions VS 2022 C++ linker tools, the Windows
+SDK and the repository-pinned Rust toolchain. It no longer installs the old
+MSVC 14.38 fallback toolset or libclang. llama itself
+uses the pinned prebuilt SDK: CUDA 13/12 plugins and generated bindings are reused,
+not rebuilt. CUDA runtime libraries are still installed for actual inference.
+The GPU image
 may lack `pwsh`, so the helper downloads a SHA256-pinned portable
 PowerShell 7.6.7 into `RUNNER_TEMP` for the nextest installer. A separate `pwsh`
 step verifies shell lookup before installing nextest. Package GPU

@@ -140,8 +140,12 @@ export function cargoTargetDirectory() {
   return resolve(workspaceDir, process.env.CARGO_TARGET_DIR ?? "target");
 }
 
-export function resolveBuildVariant(entry, cpuOnly, probe = () => run("nvcc", ["--version"], { capture: true })) {
+export function resolveBuildVariant(entry, cpuOnly, probe = () => run("nvcc", ["--version"], { capture: true }),
+  buildMode = process.env.LLAMA_CPP_BUILD_MODE) {
   if (cpuOnly || defaultReleaseVariant(entry) !== "cuda") return "cpu";
+  // Explicit SDK mode needs a Rust linker, not an installed CUDA compiler.
+  // Auto mode retains the existing no-toolchain => CPU-only behavior.
+  if (buildMode === "prebuilt") return "cuda";
   let output;
   try {
     output = probe();

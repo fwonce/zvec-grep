@@ -339,6 +339,14 @@ test("prefers CUDA, permits absent toolkits, and never hides broken CUDA builds"
     () => { throw new Error("must not probe"); }), "cpu");
 });
 
+test("explicit prebuilt mode selects CUDA without probing nvcc and still honors CPU-only", () => {
+  const noCompiler = () => { throw new Error("prebuilt must not probe nvcc"); };
+  for (const entry of manifest.platforms) {
+    assert.equal(resolveBuildVariant(entry, false, noCompiler, "prebuilt"), defaultReleaseVariant(entry));
+    assert.equal(resolveBuildVariant(entry, true, noCompiler, "prebuilt"), "cpu");
+  }
+});
+
 test("no-build uses the last successful variant rather than stale CUDA artifacts", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "zg-build-record-"));
   const previous = process.env.CARGO_TARGET_DIR;

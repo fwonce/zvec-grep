@@ -9,13 +9,13 @@ publish.workspace = true
 
 [dependencies]
 libloading = "0.8.9"
-llama-cpp-sys-2 = { version = "=0.1.154", default-features = false }
+llama-cpp-sys-2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 
 # The engine retains the workspace's unsafe-code prohibition. This small FFI
-# boundary uses the exact same sys version and registry as llama-cpp-2.
+# boundary uses the exact same sys revision and registry as llama-cpp-2.
 [lints.rust]
 unsafe_code = "allow"
 

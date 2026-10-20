@@ -45,6 +45,7 @@ import {
 import {
   rollbackVersion,
   installArtifactRelease,
+  rebuildArtifactRelease,
   smokeArtifactRelease,
   smokeRegistryRelease,
 } from "./npm-release-smoke.mjs";
@@ -74,6 +75,10 @@ function parseOptions(args) {
     }
     if (argument === "--cpu-only") {
       options.cpuOnly = true;
+      continue;
+    }
+    if (argument === "--expect-cpu") {
+      options.expectCpu = true;
       continue;
     }
     const fields = new Map([
@@ -396,12 +401,19 @@ async function main() {
   if (options.targets !== undefined && command !== "collect") {
     throw new Error("--targets is only supported by collect");
   }
-  if ((options.accelerator || options.prefixRoot) && !["smoke-artifacts", "install-artifacts"].includes(command)) {
+  const artifactCommands = ["smoke-artifacts", "install-artifacts", "rebuild-artifacts"];
+  if (options.expectCpu && !["smoke-artifacts", "install-artifacts"].includes(command)) {
+    throw new Error("--expect-cpu is only supported by artifact installation/verification");
+  }
+  if (command === "rebuild-artifacts" && options.accelerator) {
+    throw new Error("rebuild-artifacts always supplements the existing CPU installation with CUDA");
+  }
+  if ((options.accelerator || options.prefixRoot) && !artifactCommands.includes(command)) {
     throw new Error("--accelerator and --prefix-root are only supported by artifact installation/verification");
   }
   if (options.tarballDir) {
-    if (!["smoke-artifacts", "install-artifacts"].includes(command)) {
-      throw new Error("--tarball-dir is only supported by install-artifacts and smoke-artifacts");
+    if (!artifactCommands.includes(command)) {
+      throw new Error("--tarball-dir is only supported by artifact installation/verification/rebuild");
     }
     tarballRoot = options.tarballDir;
   }
@@ -433,15 +445,17 @@ async function main() {
     );
     return;
   }
-  if (command === "smoke-artifacts" || command === "install-artifacts") {
-    const install = command === "smoke-artifacts" ? smokeArtifactRelease : installArtifactRelease;
+  if (artifactCommands.includes(command)) {
+    const install = command === "smoke-artifacts" ? smokeArtifactRelease :
+      command === "rebuild-artifacts" ? rebuildArtifactRelease : installArtifactRelease;
     const result = await install({
       manifest: loadReleaseManifest(),
       release: JSON.parse(await readFile(join(tarballRoot, "release.json"), "utf8")),
       tarballRoot,
       prefixRoot: options.prefixRoot ?? join(releaseRoot, "artifact-smoke"),
       target: options.target,
-      accelerator: options.accelerator ?? "cpu",
+      accelerator: options.accelerator ?? "auto",
+      expectCpu: options.expectCpu ?? false,
     });
     if (process.env.GITHUB_OUTPUT) {
       await appendFile(process.env.GITHUB_OUTPUT,
@@ -490,7 +504,7 @@ async function main() {
     return;
   }
   throw new Error(
-    "usage: npm-release.mjs <build|verify|verify-publication|pack-platform|pack-meta|pack-current|install-artifacts|smoke-artifacts|collect|publish|promote|rollback-version|smoke-registry> [--target TARGET] [--targets TARGET,... (collect only)] [--binary PATH] [--lib-dir PATH] [--bundle-dir PATH] [--output-dir PATH] [--tarball-dir PATH] [--prefix-root PATH] [--accelerator cpu|auto|cuda (artifact installation/verification only)] [--cpu-only] [--no-build]",
+    "usage: npm-release.mjs <build|verify|verify-publication|pack-platform|pack-meta|pack-current|install-artifacts|smoke-artifacts|rebuild-artifacts|collect|publish|promote|rollback-version|smoke-registry> [--target TARGET] [--targets TARGET,... (collect only)] [--binary PATH] [--lib-dir PATH] [--bundle-dir PATH] [--output-dir PATH] [--tarball-dir PATH] [--prefix-root PATH] [--accelerator cpu|auto|cuda (artifact installation/verification only)] [--expect-cpu (default auto must not request CUDA)] [--cpu-only] [--no-build]",
   );
 }
 

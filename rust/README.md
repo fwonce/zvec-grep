@@ -376,20 +376,39 @@ bash scripts/check.sh
 
 ## Native and CUDA builds
 
+The safe llama API and the C5 FFI boundary share the same pinned
+`zvec-ai/llama-cpp-rs` revision (`5cdbe2b7d1b24174a1151f80b6e6bc44ff8f80c4`).
+Its sys crate automatically selects the SHA256-pinned `zvec-0.1.154-r1` SDK
+when target, features and native options match. Matching builds reuse native
+libraries and bindings without executing bindgen, CMake, C++ or CUDA compilation;
+Rust application code still compiles normally. The SDK covers the five release
+targets, including both x64 CUDA plugins. CPU-only Linux/Windows x64 and custom
+native configurations use source builds in default `auto` mode. A download or
+integrity failure is an error, not a silent source fallback.
+
+`LLAMA_CPP_BUILD_MODE=prebuilt` requires a matching SDK; `source` explicitly
+rebuilds llama.cpp. `LLAMA_CPP_RUNTIME_CACHE` controls the verified SDK cache
+(default `$CARGO_HOME/llama-cpp-runtimes`); `LLAMA_CPP_OFFLINE=1` requires it to
+be populated. These are **build-time** controls, unrelated to npm's runtime
+plugin installation. No local path patch or extra Cargo wrapper is required.
+
 Run commands below from `rust/`. The shared npm build/pack/install entry points
-prefer CUDA on Linux x64 and Windows x64. With no `nvcc` on PATH they build a
+prefer CUDA on Linux x64 and Windows x64. In default `auto` mode, with no `nvcc` on PATH they build a
 CPU-only package; `--cpu-only` selects that behavior explicitly. Other release
 targets keep their existing non-CUDA backends. Plain Cargo builds remain
-non-CUDA unless `--features cuda` is selected.
+non-CUDA unless `--features cuda` is selected. Explicit `prebuilt` mode selects
+the CUDA SDK on x64 without probing or requiring a CUDA compiler.
 
 ```sh
 npm run build
 npm run build -- --cpu-only
 npm run release:pack
 npm run release:pack -- --cpu-only
+# CUDA-capable x64 package without nvcc (PowerShell: set $env:LLAMA_CPP_BUILD_MODE):
+LLAMA_CPP_BUILD_MODE=prebuilt npm run build
 ```
 
-CUDA builds require Toolkit 13.1 on PATH and Toolkit 12.4 at `CUDA12_ROOT`
+CUDA **source** builds require Toolkit 13.1 on PATH and Toolkit 12.4 at `CUDA12_ROOT`
 (default `/usr/local/cuda-12.4` on Linux, or `CUDA_PATH_V12_4` on Windows).
 An installed but unsupported primary toolkit, missing fallback toolkit, or
 failed CUDA compilation is an error, not a silent CPU fallback. Building does
@@ -401,18 +420,25 @@ The direct CUDA entry points are `scripts/cuda/build.sh` and
 `scripts/cuda/build.ps1`. They create `target/release/zg-cuda/{bin,lib}` by
 default; the npm entry point isolates them under `target/cuda/` and CPU builds
 under `target/cpu/`. `CARGO_TARGET_DIR` changes the parent output directory.
-The CUDA 12.4 Windows fallback requires MSVC 14.38; the workflow switches
-toolsets before running `scripts/cuda/build-fallback.py`.
+Source-mode CUDA 12.4 on Windows requires MSVC 14.38 before running
+`scripts/cuda/build-fallback.py`. Matching SDK builds copy that plugin directly,
+so neither a second CMake build nor the fallback toolchain is needed.
 
-For reproducibility, CI uses the pinned CUDA 13.1.1/Ubuntu 24.04 builder in
-`scripts/cuda/cuda-builder.Dockerfile`, then the CUDA 12.4.1/Ubuntu 22.04 builder for
-the fallback plugin only. CUDA 13.1 distribution builds use
+Publish CI requires prebuilt SDKs on all five targets; CUDA Rust CI also requires
+prebuilt mode instead of recompiling only for its T4 GPU. Linux publish builds
+run on Ubuntu 24.04 without a CUDA compiler. Runtime libraries, driver checks,
+link audits and real CPU/GPU inference gates remain required. Runtime staging
+reads the current Cargo invocation's `GGML_BACKENDS_DIR`, not the newest directory
+under `target/build`; only runtime libraries, not SDK import archives or bindings,
+are packaged. CUDA 13.1 distribution builds use
 `75-real;80-real;86-real;89-real;90-real;90-virtual`. The CUDA 12.4 fallback uses
 `50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real` to reduce its
 size, retaining PTX for driver JIT compilation where compatible native code is
 unavailable. Override `CMAKE_CUDA_ARCHITECTURES` for the primary backend or
 `CUDA12_ARCHITECTURES` for the fallback only when deliberately customizing a
-build. The fallback does not inherit the primary backend's architecture list.
+source build (`LLAMA_CPP_BUILD_MODE=source`). The fallback does not inherit the
+primary backend's architecture list; a custom fallback list cannot be mixed
+silently with a prebuilt SDK.
 
 The package contains `bin/zg[.exe]`, with all shared libraries, plugins and
 dictionaries under `lib/`. GGUF loads the CUDA 13.1 plugin first, then the
@@ -612,9 +638,10 @@ All selected platforms get the installed CLI/daemon checks; Linux/Windows x64
 also get the CPU model/fallback checks. A GPU failure does not block CPU checks
 or candidate retention, but all required CPU/GPU checks must pass before npm
 publication. A downloadable candidate is not proof of runtime validation.
-CPU runners compile the default CUDA-capable bundles. Linux x64 uses the pinned
-Ubuntu 24.04 CUDA builder image; Linux ARM64 uses its native runner. Windows
-installs pinned CUDA 13.1 and 12.4 toolchains on the selected build runner. Ordinary PR CI
+CPU runners compile Rust and assemble the default CUDA-capable bundles using
+the pinned native SDK. Linux x64 uses an Ubuntu 24.04 builder without nvcc;
+Linux ARM64 uses its native runner. Windows needs the Rust/MSVC linker but
+does not install CUDA compilers for packaging. Ordinary PR CI
 does not compile CUDA packages. `rust-ci.yml` is the single entry point for
 workspace and real-model verification. Push/PR runs use ordinary runners on
 Linux, macOS and Windows. Each test job compiles the workspace tests once, runs
@@ -622,7 +649,8 @@ them with pinned cargo-nextest, and reuses the CLI and test binary for smoke
 checks and all three real models (Model2Vec, ORT and llama.cpp), without a separate
 build per model.
 For manual runs, `cuda_verify=true` switches Linux/Windows test jobs to GPU
-runners and enables `zg/cuda` from the first compilation. The same binaries
+runners and enables `zg/cuda` from the first compilation, requiring the matching
+prebuilt SDK. The same binaries
 then run the ordinary tests and real models, plus ORT/llama.cpp CUDA inference
 with actual GPU execution evidence and no CPU fallback. Both GPU jobs also run
 the C5 CPU-to-CUDA same-process and CPU-plugin override isolation tests from
@@ -637,11 +665,10 @@ Ubuntu 22.04's glibc and C++ runtime, so older Linux distributions are not
 covered by this release workflow.
 Packaging selects Cargo/CMake parallelism from available CPUs and total memory
 with a conservative 3 GiB per-job budget, a minimum of 1 and a maximum of 8.
-The same limits are passed into both Linux CUDA containers. This is a resource
-heuristic, not a guarantee against OOM. Linux x64 and Windows x64 allow up to
-180 minutes for both CUDA builds. Windows installs the CUDA 12.4-compatible
-MSVC 14.38 toolset before compilation begins; the primary build still uses the
-default toolset and the fallback switches to 14.38.
+The same limits are passed into the Linux builder. This is a resource
+heuristic, not a guarantee against OOM. The existing 180-minute limits remain
+upper bounds, not expected build durations. CUDA 13.1 and 12.4 native compilation
+now belongs to the fork's versioned SDK release, not every zg CI run.
 Intel macOS builds ONNX Runtime 1.28.0 with CoreML and the native zvec SDK from
 pinned source revisions because neither dependency supplies prebuilt Intel
 macOS libraries. Both SDKs are cached and their shared libraries are included

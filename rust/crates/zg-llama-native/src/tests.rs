@@ -21,14 +21,18 @@ fn selects_best_cpu_variant_without_opening_gpu_plugins() {
     plugin(root.path(), "cuda");
     plugin(root.path(), "vulkan");
     let mut opened = Vec::new();
-    let selected = select_cpu_backend(root.path(), |path| {
-        opened.push(path.to_path_buf());
-        Some(if path == fast {
-            10
-        } else {
-            i32::from(path == generic)
-        })
-    })
+    let selected = select_cpu_backend(
+        root.path(),
+        || {},
+        |path| {
+            opened.push(path.to_path_buf());
+            Some(if path == fast {
+                10
+            } else {
+                i32::from(path == generic)
+            })
+        },
+    )
     .expect("CPU backend");
     assert_eq!(selected, fast);
     assert_eq!(opened.len(), 3);
@@ -46,11 +50,11 @@ fn unsupported_or_unloadable_variants_fall_back_to_base_cpu() {
     let base = plugin(root.path(), "cpu");
     plugin(root.path(), "cpu-unsupported");
     assert_eq!(
-        select_cpu_backend(root.path(), |_| Some(0)).expect("base"),
+        select_cpu_backend(root.path(), || {}, |_| Some(0)).expect("base"),
         base
     );
     assert_eq!(
-        select_cpu_backend(root.path(), |_| None).expect("base"),
+        select_cpu_backend(root.path(), || {}, |_| None).expect("base"),
         base
     );
 }
@@ -59,11 +63,33 @@ fn unsupported_or_unloadable_variants_fall_back_to_base_cpu() {
 fn missing_cpu_does_not_load_a_gpu_as_substitute() {
     let root = tempfile::tempdir().expect("bundle");
     plugin(root.path(), "cuda");
-    assert!(select_cpu_backend(root.path(), |_| panic!("must not open GPU")).is_err());
+    assert!(select_cpu_backend(root.path(), || {}, |_| panic!("must not open GPU")).is_err());
 }
 
 #[test]
-fn failed_cpu_library_load_is_reported_before_core_initialization() {
+fn core_is_initialized_before_scoring_even_unloadable_or_unsupported_variants() {
+    let root = tempfile::tempdir().expect("bundle");
+    let base = plugin(root.path(), "cpu");
+    let broken = plugin(root.path(), "cpu-broken");
+    plugin(root.path(), "cpu-unsupported");
+    plugin(root.path(), "cuda");
+    let events = std::cell::RefCell::new(Vec::new());
+    let selected = select_cpu_backend(
+        root.path(),
+        || events.borrow_mut().push("core"),
+        |path| {
+            assert_eq!(events.borrow().first(), Some(&"core"));
+            events.borrow_mut().push("score");
+            (path != broken).then_some(0)
+        },
+    )
+    .expect("base CPU fallback");
+    assert_eq!(selected, base);
+    assert_eq!(*events.borrow(), ["core", "score", "score"]);
+}
+
+#[test]
+fn failed_cpu_library_load_is_reported() {
     let root = tempfile::tempdir().expect("bundle");
     plugin(root.path(), "cpu");
     assert!(lock_registry().load_cpu_backend(root.path()).is_err());

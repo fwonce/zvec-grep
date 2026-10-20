@@ -13,21 +13,22 @@ if ($env:OS -ne "Windows_NT") {
     throw "Windows CUDA builds require Windows"
 }
 
-foreach ($command in @("cargo", "cmake", "nvcc", "dumpbin", "python")) {
+$commands = @("cargo", "dumpbin", "python")
+if ($env:LLAMA_CPP_BUILD_MODE -ne "prebuilt") { $commands += @("cmake", "nvcc") }
+foreach ($command in $commands) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
         throw "required command is unavailable: $command"
     }
 }
 
-$nvccOutput = (& nvcc --version 2>&1 | Out-String)
-if ($LASTEXITCODE -ne 0) {
-    throw "nvcc --version failed"
+$cudaToolkitVersion = "13.1"
+if ($env:LLAMA_CPP_BUILD_MODE -ne "prebuilt") {
+    $nvccOutput = (& nvcc --version 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "nvcc --version failed" }
+    $versionMatch = [regex]::Match($nvccOutput, "release\s+([0-9]+(?:\.[0-9]+)*)")
+    if (-not $versionMatch.Success) { throw "unable to detect the CUDA toolkit version" }
+    $cudaToolkitVersion = $versionMatch.Groups[1].Value
 }
-$versionMatch = [regex]::Match($nvccOutput, "release\s+([0-9]+(?:\.[0-9]+)*)")
-if (-not $versionMatch.Success) {
-    throw "unable to detect the CUDA toolkit version"
-}
-$cudaToolkitVersion = $versionMatch.Groups[1].Value
 if ($cudaToolkitVersion -ne "13.1") {
     throw "the primary GGUF backend requires CUDA 13.1 (found $cudaToolkitVersion)"
 }
@@ -47,28 +48,17 @@ $targetDirectoryValue = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR))
     $env:CARGO_TARGET_DIR
 }
 $targetDirectory = [IO.Path]::GetFullPath($targetDirectoryValue)
-$buildConfiguration = "cuda_toolkit=$cudaToolkitVersion;ort=1.28.0-cuda12-dynamic;architectures=$env:CMAKE_CUDA_ARCHITECTURES"
-$buildConfigurationFile = Join-Path $targetDirectory ".zvec-grep-cuda-build-config"
-$previousBuildConfiguration = if (Test-Path -LiteralPath $buildConfigurationFile -PathType Leaf) {
-    (Get-Content -LiteralPath $buildConfigurationFile -TotalCount 1)
-} else {
-    ""
-}
-if ($previousBuildConfiguration -ne $buildConfiguration -and
-    (Test-Path -LiteralPath (Join-Path $targetDirectory "CACHEDIR.TAG") -PathType Leaf)) {
-    Write-Host "CUDA build configuration changed; rebuilding the target directory"
-    & cargo clean --target-dir $targetDirectory
-    if ($LASTEXITCODE -ne 0) {
-        throw "cargo clean failed with exit code $LASTEXITCODE"
-    }
-}
-
-& cargo build --locked --release --package zg --features cuda
+# The sys crate now invalidates only its native configuration. Keep unrelated
+# Rust output and the verified SDK cache when switching native build options.
+[IO.Directory]::CreateDirectory($targetDirectory) | Out-Null
+$messages = Join-Path $targetDirectory "cuda-build.json"
+# Preserve Cargo's UTF-8 bytes and exit code (including non-ASCII local paths)
+# instead of passing JSON through PowerShell 5's text/code-page conversion.
+& python -c 'import subprocess,sys; sys.exit(subprocess.run(sys.argv[2:], stdout=open(sys.argv[1], "wb")).returncode)' `
+    $messages cargo build --locked --release --package zg --features cuda --message-format=json-render-diagnostics
 if ($LASTEXITCODE -ne 0) {
     throw "cargo build failed with exit code $LASTEXITCODE"
 }
-[IO.Directory]::CreateDirectory($targetDirectory) | Out-Null
-[IO.File]::WriteAllText($buildConfigurationFile, "$buildConfiguration`n")
 
 $profileDirectory = Join-Path $targetDirectory "release"
 $bundleDirectory = Join-Path $profileDirectory "zg-cuda"
@@ -92,30 +82,9 @@ function Copy-RequiredFile {
 try {
     Copy-RequiredFile (Join-Path $profileDirectory "zg.exe") (Join-Path $binDirectory "zg.exe")
 
-    $backend = Get-ChildItem -LiteralPath (Join-Path $profileDirectory "build") `
-        -Recurse -File -Filter "ggml-cuda.dll" |
-        Where-Object { $_.FullName -match "[\\/]llama-cpp-sys-2-[^\\/]+[\\/]out[\\/]backends[\\/]" } |
-        Sort-Object LastWriteTimeUtc -Descending |
-        Select-Object -First 1
-    if ($null -eq $backend) {
-        throw "unable to locate the llama.cpp CUDA backend module"
-    }
-    $backendLibraries = @(Get-ChildItem -LiteralPath $backend.Directory.FullName -File -Filter "ggml-*.dll")
-    if ($backendLibraries.Count -eq 0) {
-        throw "llama.cpp backend DLLs are missing"
-    }
-    foreach ($library in $backendLibraries) {
-        Copy-Item -LiteralPath $library.FullName -Destination (Join-Path $libDirectory $library.Name)
-    }
-
-    foreach ($name in @(
-        "llama.dll",
-        "ggml.dll",
-        "ggml-base.dll",
-        "zvec_c_api.dll"
-    )) {
-        Copy-RequiredFile (Join-Path $profileDirectory $name) (Join-Path $libDirectory $name)
-    }
+    & python scripts/cuda/runtime.py --cargo-messages $messages --destination $libDirectory
+    if ($LASTEXITCODE -ne 0) { throw "Staging the selected llama runtime failed" }
+    Copy-RequiredFile (Join-Path $profileDirectory "zvec_c_api.dll") (Join-Path $libDirectory "zvec_c_api.dll")
 
     & python scripts/cuda/prepare-onnxruntime.py --platform win32 `
         --cache-dir (Join-Path $targetDirectory "ort-cuda12") --destination $libDirectory
@@ -131,10 +100,12 @@ try {
         # Incomplete CI output must not replace a complete local bundle.
         $bundleDirectory = Join-Path $profileDirectory "zg-cuda-staging"
     } else {
-        $cuda12Root = if ($env:CUDA12_ROOT) { $env:CUDA12_ROOT } else { $env:CUDA_PATH_V12_4 }
-        if (-not $cuda12Root) { throw "Set CUDA12_ROOT to the CUDA 12.4 toolkit directory" }
-        & python scripts/cuda/build-fallback.py --bundle $stagingDirectory --cuda-root $cuda12Root
-        if ($LASTEXITCODE -ne 0) { throw "Building the CUDA 12.4 fallback failed" }
+        if (-not (Test-Path -LiteralPath (Join-Path $libDirectory "cuda12/ggml-cuda.dll"))) {
+            $cuda12Root = if ($env:CUDA12_ROOT) { $env:CUDA12_ROOT } else { $env:CUDA_PATH_V12_4 }
+            if (-not $cuda12Root) { throw "Set CUDA12_ROOT to the CUDA 12.4 toolkit directory" }
+            & python scripts/cuda/build-fallback.py --bundle $stagingDirectory --cuda-root $cuda12Root
+            if ($LASTEXITCODE -ne 0) { throw "Building the CUDA 12.4 fallback failed" }
+        }
         if (-not $SkipAudit) {
             & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
                 -File (Join-Path $scriptDirectory "check.ps1") -Bundle $stagingDirectory
