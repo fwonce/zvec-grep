@@ -8,10 +8,11 @@ names and npm `os`, `cpu`, and `libc` selectors.
 The current published targets are macOS ARM64/x64, Linux x64/ARM64 with glibc,
 and Windows x64.
 
-After installation, the meta package contains the same complete runtime layout:
+After installation, the meta package retains the existing runtime paths. CUDA
+files are present only after successful plugin installation:
 
 ```text
-bin/zg[.exe]
+bin/zg.exe              # meta entry on every OS; command remains zg
 lib/libzvec_c_api.*       # storage runtime and lib/data dictionaries
 lib/lib{llama,ggml}*      # CUDA variant: shared llama.cpp core and CPU backend
 lib/*onnxruntime*        # ONNX Runtime core/providers, when dynamically linked
@@ -23,8 +24,8 @@ Source npm packages also carry `checksums.json` and, once reviewed inputs are
 available, `LICENSES/` and `SBOM.spdx.json`; these are package metadata rather
 than runtime files copied by the installer.
 
-The Linux x64 base package depends on `-ggml-cuda13`, `-ggml-cuda12`,
-`-ort-cuda-part1` and `-ort-cuda-part2` packages. Windows x64 depends on
+The Linux x64 base package's `plugins.json` references `-ggml-cuda13`, `-ggml-cuda12`,
+`-ort-cuda-part1` and `-ort-cuda-part2` packages. Windows x64 references
 `-ggml-cuda13`, `-ggml-cuda12` and `-ort-cuda`. These suffixes extend the base
 platform package name. macOS, Linux ARM64 and deliberate CPU-only builds remain
 single native packages. A default all-platform release contains 13 tarballs:
@@ -35,10 +36,33 @@ CUDA components contain whole GGML plugins or the ORT provider. The Linux ORT
 provider is split into two ordered byte ranges under `parts/`; postinstall
 streams them back into the original `.so` and verifies the original complete
 file's SHA256. No compiler, model execution or CUDA Toolkit installation is
-performed during npm installation. OS/CPU/libc selection does not detect GPU
-hardware: CPU-only hosts still download the CUDA components of the default
-CUDA-enabled distribution. Splitting limits each upload, not total download or
-installed size; component payloads and the assembled runtime both occupy disk.
+performed during npm installation. Meta still selects its base by OS/CPU/libc,
+but CUDA components are no longer npm dependencies. Postinstall first verifies
+and installs CPU, then uses bounded NVIDIA detection to decide whether to fetch
+the complete pinned CUDA set. CPU-only hosts make no CUDA component requests.
+GPU installs still download the whole set; splitting limits each upload, not
+their total size. Downloaded archives may occupy cache space in addition to the
+assembled libraries.
+Auto detection checks only whether `nvidia-smi` succeeds within five seconds
+and returns a GPU. It does not compare the reported driver version, validate
+CUDA/cuDNN dependencies, or select a per-backend subset of plugins. GGUF and ORT
+still choose their execution backends independently at runtime.
+
+Use `ZG_INSTALL_ACCELERATOR=cpu|auto|cuda` (default `auto`) with npm install or
+rebuild. `cpu` skips detection/downloads; `cuda` explicitly requests plugins even
+on a GPU-free builder and fails on any plugin error. Auto failures retain CPU
+with diagnostics. A forced plugin failure also leaves the CPU core intact.
+Later use `ZG_INSTALL_ACCELERATOR=cuda npm rebuild -g @zvec/zvec-grep` (omit `-g`
+for project-local installs). Stop zg first and restart the daemon afterwards.
+There is no extra setup command or runtime downloading.
+
+`ZG_PLUGIN_DIR` is an authoritative absolute directory of exact-version `.tgz`
+files. `ZG_INSTALL_OFFLINE=1`/npm offline forbids network requests;
+`ZG_PLUGIN_CACHE` overrides the content-addressed download cache. Missing local
+files never fall back to a registry version. npm handles registry, proxy, auth
+and custom CA settings for online transport, with component scripts disabled.
+Archives, payloads and reconstructed libraries are verified before activation;
+the cache is not a permanent runtime library path. See [installation and recovery](meta/README.md).
 
 Every compressed `.tgz` has a **350 MiB maximum**, enforced after `npm pack`,
 during collection, and again before publication/promotion. This leaves room
@@ -107,7 +131,15 @@ SM86 code, reducing installed size while retaining driver JIT compilation where
 compatible native code is unavailable. `CMAKE_CUDA_ARCHITECTURES` overrides the
 primary build; `CUDA12_ARCHITECTURES` overrides only the fallback, which does not
 inherit the primary list. These build targets do not imply hardware validation
-on every GPU generation.
+on every GPU generation. The current runtime device-enumeration check is not
+a PTX/driver compatibility check: this release does not add PTX-version rejection
+or subprocess crash isolation, and does not claim support for every older
+CUDA 12 driver. CPU/GPU CI validates its specific driver/runtime environments.
+
+The primary GGUF CUDA plugin remains directly under `lib/`; there is no new
+`lib/cuda13/` directory. Explicit CPU execution uses a selective CPU-plugin
+loader rather than scanning that directory for every backend, and ignores
+`GGML_BACKEND_PATH`. Optional GPU registration is separate from CPU initialization.
 
 On Windows, CUDA 13 runtime DLLs reside under the toolkit's `bin/x64`, while
 older toolkits use `bin`. The required host runtime directories must be visible
@@ -115,34 +147,41 @@ to the loader (for example, through PATH); the package's sibling `lib/` lookup
 does not install or locate missing NVIDIA runtime dependencies automatically.
 
 The meta package locks every platform package to its exact version through
-`optionalDependencies`. CUDA base packages use required, exact-version
-`dependencies` for their runtime components. Its `postinstall` selects the installed package,
-validates every component identity and payload checksum, assembles into a
-temporary directory, verifies the complete runtime manifest, and materializes the
-native `bin/` and `lib/` payload. The npm command is always named `zg`; the meta
+`optionalDependencies`. CUDA-capable bases use schema-3 base checksums plus a
+hash-bound `plugins.json` with exact versions, core identity, archive integrity,
+payload hashes and final reconstructed-library hashes. Plugin tarballs are packed
+first so the base pins their actual bytes. `variant`/`accelerators` describe
+compiled support; `bundledAccelerators` and `native-install.json` distinguish
+the CPU base from the installed plugin set. The core remains dynamically
+extensible: it is not replaced with a `--cpu-only` build. The npm command is always named `zg`; the meta
 package retains the cross-platform `bin/zg.exe` native entry point so npm's
 Windows shim and Unix symlink both enter the executable directly.
 
 The published meta package supports Node.js 14.14 and newer for installation
-only, not for CLI execution. The root workspace may require a newer Node version for
+only, not for CLI execution. Online plugin transport requires npm 7+ and
+extraction uses system `tar`; local archives need no network. The root workspace may require a newer Node version for
 development and package tests without reducing published compatibility.
 
 Release order:
 
 1. Build and package every native target; apply ad hoc signatures on macOS.
-2. Verify payload closure, checksums, licenses, and SBOMs.
+2. Collect the exact-version meta/native/component candidates once. Verify
+   payload closure and checksums, run CPU and requested GPU checks in parallel,
+   and require all publication gates including licenses and SBOMs to pass.
 3. Publish runtime components before their base native packages to `rust-canary`, then publish the meta package
    to `rust-canary` last. Candidate publication never changes `latest`.
-4. On every native runner, install the exact meta-package version from the
+4. On every platform's ordinary CPU runner, install the exact meta-package version from the
    registry alone, so npm must select its native optional dependency.
 5. Verify CLI startup, managed-rg, daemon startup and IPC, then update from a
-   distinct published baseline version and roll back to that version.
+   distinct published baseline version and roll back to that version. On the
+   CUDA targets also force a registry plugin installation and verify its hashes
+   and core identity; CPU fallback must not hide a plugin-fetch failure.
 6. Promote native `latest` tags and then the meta `latest` tag in a separate job,
    only after all five registry install/update/rollback jobs pass.
 
-`.github/workflows/rust-publish.yml` builds and installs the selected targets on
-their native runners in parallel, checks CLI startup, managed-rg and actual
-daemon IPC, and collects the candidates into a downloadable artifact. The manual
+`.github/workflows/rust-publish.yml` builds and packs the selected targets once on
+their native runners in parallel, collects the candidates into a downloadable
+artifact, then checks real installation, CLI startup, managed-rg and daemon IPC. The manual
 `platform` input defaults to `all`; each of the five target names can be selected
 individually.
 `publish=true` requires `platform=all`; a subset is a validation-only candidate,
@@ -155,8 +194,9 @@ or `publish=true`. Manual `cuda=true` runs add separate Linux/Windows x64 GPU
 jobs that download the exact native npm artifacts from the same workflow run
 and perform package-level GPU end-to-end validation, without rebuilding or
 repacking. Publishing also enables GPU validation unconditionally, even if
-`cuda` was not selected. GPU validation must pass before candidate collection
-and npm publication; a failure leaves the per-platform build artifacts available.
+`cuda` was not selected. Candidate collection precedes parallel CPU/GPU checks;
+it proves package completeness, not runtime success. A GPU failure does not skip
+CPU checks or remove the candidate, but blocks npm publication.
 Runs use branch-plus-platform concurrency groups, allowing different platform
 selections on the same branch to run concurrently without cancelling an
 in-progress run in the same group.
@@ -176,17 +216,28 @@ All-platform runs produce `rust-release-<version>`; subset runs produce
 `rust-candidate-<version>` with the selected native tarballs and all their components, the same
 exact-version meta tarball, checksums and a `release.json` marked `partial`.
 Publication and promotion reject partial candidates. After collection,
-independent CPU jobs for the selected Linux/Windows x64 targets download and install the
-exact native/component/meta tarballs offline, without rebuilding. They verify checksums,
-CLI startup, daemon IPC, and real GGUF/ONNX indexing and vector queries with
+independent CPU jobs for every selected target download and install the exact
+base/meta tarballs offline without installing any CUDA components, rebuilding or repacking. They verify
+checksums, CLI startup and daemon IPC. Linux/Windows x64 also verify real
+GGUF/ONNX indexing and vector queries with
 explicit CPU selection and default CPU fallback, without CUDA host libraries.
 These checks also run for unpublished candidates and must pass before npm
 publication; failures retain the candidate and `cpu-artifact-evidence-*` logs.
 
 The package GPU jobs use the hosted T4 runners with CUDA runtime libraries,
 not Rust/C++/CUDA compiler setup. They verify the downloaded native package's
-payload checksums, assemble components with the same installer used by npm,
-and exercise both CUDA 12 fallback and CUDA 13 primary paths.
+payload checksums, share the `install-artifacts` installation path with CPU smoke
+checks (real meta-package postinstall, no synthetic metadata). Installation runs
+inside each Linux CUDA container and after Windows runtime preparation, using
+fresh prefixes/caches and only this run's artifacts. Auto installation is tested
+in CUDA 12 and forced installation in CUDA 13, with explicit CPU installation on
+a GPU host also covered. Both CUDA 12 fallback and CUDA 13 primary paths require
+real inference evidence, not merely successful installation.
+Both verification paths use the current platform's native artifact plus the
+small `rust-verification-<version>` meta/inventory artifact; their installation
+reports identify the exact collected hashes. Registry checks run on CPU runners
+and validate downloaded component versions/hashes and the reconstructed runtime,
+so CPU fallback cannot mask missing or corrupt GPU payloads.
 Windows GPU jobs also prepare the pinned NVIDIA 591.59 driver when an older
 driver is active, verify the installer signature and CUDA initialization, and fail on a
 reboot requirement instead of rebooting. Both Rust CI and package GPU validation

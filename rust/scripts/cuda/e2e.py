@@ -136,6 +136,11 @@ def cpu_evidence(stderr, backend, device):
             or re.search(r"placed on \[CUDAExecutionProvider\]\. Number of nodes: [1-9]\d*", stderr)):
         raise AssertionError("CPU-only validation unexpectedly selected a GPU")
     evidence = []
+    if backend == "gguf" and device == "cpu":
+        # Explicit CPU must skip CUDA even on a GPU host, not merely offload
+        # zero model layers after initializing it. --debug retains native logs.
+        if re.search(r"ggml_cuda_init|loaded CUDA backend|llama\.cpp CUDA backend library selected", stderr):
+            raise AssertionError("Explicit CPU execution initialized a CUDA backend")
     if backend == "onnx":
         selected = "Transformers ONNX cpu embedding execution provider selected"
         require(stderr, selected)
@@ -257,10 +262,14 @@ def main():
     parser.add_argument("--expected-gguf-cuda", choices=("12.4", "13.1"))
     parser.add_argument("--cpu-only", action="store_true",
                         help="Require a clean CPU host; test explicit CPU and default automatic fallback")
+    parser.add_argument("--explicit-cpu", action="store_true",
+                        help="Test a CPU-only installation on a GPU host without initializing CUDA")
     args = parser.parse_args()
-    if args.cpu_only and args.expected_gguf_cuda:
+    if (args.cpu_only or args.explicit_cpu) and args.expected_gguf_cuda:
         parser.error("--cpu-only cannot be combined with --expected-gguf-cuda")
-    if not args.cpu_only and not args.expected_gguf_cuda:
+    if args.cpu_only and args.explicit_cpu:
+        parser.error("--cpu-only and --explicit-cpu are mutually exclusive")
+    if not args.cpu_only and not args.explicit_cpu and not args.expected_gguf_cuda:
         parser.error("GPU validation requires --expected-gguf-cuda")
     bundle = args.bundle.resolve()
     package_json = bundle / "package.json"
@@ -280,7 +289,7 @@ def main():
     args.model_cache.mkdir(parents=True, exist_ok=True)
     if args.cpu_only:
         verify_cpu_host(logs)
-    else:
+    elif not args.explicit_cpu:
         gpu = subprocess.check_output([
             "nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader",
         ], encoding="utf-8")
@@ -292,7 +301,9 @@ def main():
                                        args.expected_gguf_cuda.split(".")[0], logs,
                                        library_directories=(lib_dir,))
     results, failures = {}, []
-    devices = ("cpu", "default") if args.cpu_only else ("cuda",)
+    # Validate explicit CPU with GPU plugins and drivers present as well as
+    # actual CUDA inference. Each CLI invocation owns a fresh process.
+    devices = ("cpu",) if args.explicit_cpu else (("cpu", "default") if args.cpu_only else ("cpu", "cuda"))
     # Windows runners have a short RUNNER_TEMP; the user-profile temp directory
     # leaves too little room for zvec's nested index paths. Keep Linux unchanged.
     temporary_parent = (os.environ.get("RUNNER_TEMP") or None) if os.name == "nt" else None

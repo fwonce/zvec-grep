@@ -21,7 +21,7 @@ export async function verifyTarballSize(path) {
   return size;
 }
 
-// Dependencies must be published before their platform package; meta is last.
+// Pinned plugins must be published before their platform package; meta is last.
 export function nativePackageEntries(entry) {
   return [
     ...(entry.components ?? []).map((component) => ({
@@ -29,10 +29,6 @@ export function nativePackageEntries(entry) {
     })),
     { name: entry.package, target: entry.target },
   ];
-}
-
-export function componentDependencies(entry, version) {
-  return Object.fromEntries((entry.components ?? []).map((component) => [component.package, version]));
 }
 
 // Split by byte range, not by loading a potentially >512 MiB ORT library into
@@ -159,23 +155,30 @@ export function resolveBuildVariant(entry, cpuOnly, probe = () => run("nvcc", ["
   return "cuda";
 }
 
-export async function buildNative(entry, { cpuOnly = false } = {}) {
-  const variant = resolveBuildVariant(entry, cpuOnly);
+export async function buildNative(entry, { cpuOnly = false, runCommand = run } = {}) {
+  const variant = resolveBuildVariant(entry, cpuOnly,
+    () => runCommand("nvcc", ["--version"], { capture: true }));
   const root = cargoTargetDirectory();
   // CUDA and CPU must never reuse staged native libraries from one another.
   const target = defaultReleaseVariant(entry) === "cuda" ? join(root, variant) : root;
   const env = { ...process.env, CARGO_TARGET_DIR: target };
+  // Invalidate the old success record before any command can clean or overwrite
+  // its outputs. A failed/interrupted rebuild must not enable --no-build reuse.
+  await mkdir(root, { recursive: true });
+  await writeFile(join(root, "native-build.json"), `${JSON.stringify({
+    target: entry.target, variant, status: "building",
+  })}\n`);
   if (variant === "cuda") {
     if (entry.os === "linux") {
-      run("bash", ["scripts/cuda/build.sh"], { env });
+      runCommand("bash", ["scripts/cuda/build.sh"], { env });
     } else {
-      run("powershell.exe", ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/cuda/build.ps1"], { env });
+      runCommand("powershell.exe", ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/cuda/build.ps1"], { env });
     }
   } else {
     if (!cpuOnly && defaultReleaseVariant(entry) === "cuda") {
       console.log("CUDA toolkit not found; building CPU-only native artifacts");
     }
-    run("cargo", ["build", "--locked", "--release", "--package", "zg"], { env });
+    runCommand("cargo", ["build", "--locked", "--release", "--package", "zg"], { env });
   }
   const build = {
     target: entry.target,
@@ -183,7 +186,6 @@ export async function buildNative(entry, { cpuOnly = false } = {}) {
     profileDir: join(target, "release"),
     ...(variant === "cuda" ? { bundleDir: join(target, "release", "zg-cuda") } : {}),
   };
-  await mkdir(root, { recursive: true });
   await writeFile(join(root, "native-build.json"), `${JSON.stringify(build, null, 2)}\n`);
   return build;
 }
@@ -194,6 +196,9 @@ export async function existingNativeBuild(entry, { cpuOnly = false } = {}) {
     build = JSON.parse(await readFile(join(cargoTargetDirectory(), "native-build.json"), "utf8"));
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
+  }
+  if (build?.status === "building") {
+    throw new Error("The previous native build did not complete; rebuild successfully before using --no-build");
   }
   if (build?.target === entry.target && (!cpuOnly || build.variant === "cpu")) return build;
   if (cpuOnly && defaultReleaseVariant(entry) === "cuda") {

@@ -4,6 +4,8 @@ const assert = require("node:assert/strict");
 const { createHash } = require("node:crypto");
 const {
   chmodSync,
+  cpSync,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -12,11 +14,14 @@ const {
   statSync,
   writeFileSync,
 } = require("node:fs");
-const { join } = require("node:path");
+const { dirname, join } = require("node:path");
 const { tmpdir } = require("node:os");
 const test = require("node:test");
+const { spawn, spawnSync } = require("node:child_process");
+const { createServer } = require("node:http");
 
-const { materialize, selectPlatform, verifyPayload } = require("./install.cjs");
+const { materialize, selectPlatform, verifyPayload, verifyInstallation } = require("./install.cjs");
+const { coreIdentity, packageFilename, componentArchive, settings } = require("./plugins.cjs");
 
 const entry = {
   target: "darwin-arm64",
@@ -207,3 +212,342 @@ for (const failure of ["missing", "version", "corrupt", "swapped", "untracked", 
     assert.equal(readFileSync(join(paths.metaRoot, "lib/previous.so"), "utf8"), "previous installation");
   });
 }
+
+function optionalFixture(t, target = "linux-x64-gnu") {
+  const paths = splitFixture(target);
+  t.after(() => rmSync(paths.root, { recursive: true, force: true }));
+  const checksums = JSON.parse(readFileSync(join(paths.platformRoot, "checksums.json")));
+  const files = {};
+  for (const file of paths.originals.keys()) { files[file] = checksums.files[file]; delete checksums.files[file]; }
+  checksums.schemaVersion = 3;
+  delete checksums.components;
+  checksums.coreId = coreIdentity(paths.entry.target, "0.0.1", checksums.files);
+  const directory = join(paths.root, "archives");
+  mkdirSync(directory);
+  const components = paths.entry.components.map((component, index) => {
+    const source = join(paths.root, "node_modules", component.package);
+    const packing = join(paths.root, "packing", String(index));
+    cpSync(source, join(packing, "package"), { recursive: true });
+    const tarball = packageFilename(component.package, "0.0.1");
+    const result = spawnSync("tar", ["-czf", join(directory, tarball), "-C", packing, "package"],
+      { env: { ...process.env, COPYFILE_DISABLE: "1" } });
+    assert.equal(result.status, 0);
+    const bytes = readFileSync(join(directory, tarball));
+    return { ...component, version: "0.0.1", tarball, archiveBytes: bytes.length,
+      integrity: `sha512-${createHash("sha512").update(bytes).digest("base64")}`,
+      checksum: JSON.parse(readFileSync(join(source, "checksums.json"))).files[component.payload] };
+  });
+  // No installed component packages may be needed for CPU or later CUDA installation.
+  rmSync(join(paths.root, "node_modules"), { recursive: true });
+  const plugins = { schemaVersion: 1, target, version: "0.0.1", coreId: checksums.coreId, components, files };
+  const raw = JSON.stringify(plugins);
+  checksums.pluginsSha256 = sha256(raw);
+  writeFileSync(join(paths.platformRoot, "plugins.json"), raw);
+  writeFileSync(join(paths.platformRoot, "checksums.json"), JSON.stringify(checksums));
+  writeFileSync(join(paths.platformRoot, "package.json"), JSON.stringify({ name: paths.entry.package, version: "0.0.1" }));
+  return { ...paths, expectedVersion: "0.0.1", plugins,
+    config: { mode: "cpu", directory, cache: join(paths.root, "cache"), offline: true } };
+}
+
+test("CPU installation needs no GPU detection or component requests", (t) => {
+  const fixture = optionalFixture(t);
+  materialize({ ...fixture, detectNvidia: () => assert.fail("must not probe GPU"),
+    fetchArchive: () => assert.fail("must not request CUDA") });
+  assert.deepEqual(verifyInstallation(fixture).components, []);
+  for (const file of fixture.originals.keys()) assert.equal(existsSync(join(fixture.metaRoot, file)), false);
+  assert.throws(() => verifyInstallation({ ...fixture, requireCuda: true }), /required CUDA plugins missing/);
+});
+
+test("automatic CPU-host install makes zero component requests", (t) => {
+  const fixture = optionalFixture(t);
+  materialize({ ...fixture, config: { ...fixture.config, mode: "auto" }, detectNvidia: () => false,
+    fetchArchive: () => assert.fail("must not request CUDA") });
+  assert.deepEqual(verifyInstallation(fixture).components, []);
+});
+
+for (const target of ["linux-x64-gnu", "win32-x64-msvc"]) {
+  test(`CPU then offline CUDA installation preserves the same binary and layout: ${target}`, (t) => {
+    const fixture = optionalFixture(t, target);
+    materialize(fixture);
+    const binary = readFileSync(join(fixture.metaRoot, "bin/zg.exe"));
+    materialize({ ...fixture, config: { ...fixture.config, mode: "cuda" },
+      detectNvidia: () => assert.fail("forced install must work on a GPU-free image builder") });
+    assert.deepEqual(readFileSync(join(fixture.metaRoot, "bin/zg.exe")), binary);
+    for (const [file, content] of fixture.originals) assert.deepEqual(readFileSync(join(fixture.metaRoot, file)), content);
+    assert.equal(verifyInstallation({ ...fixture, requireCuda: true }).components.length, fixture.plugins.components.length);
+    materialize({ ...fixture, config: { ...fixture.config, mode: "cuda" }, fetchArchive: () => assert.fail("idempotent rebuild") });
+  });
+}
+
+for (const mode of ["auto", "cuda"]) {
+  for (const failure of ["missing", "corrupt"]) {
+    test(`${mode} ${failure} plugin attempt leaves a complete CPU installation`, (t) => {
+      const fixture = optionalFixture(t);
+      materialize(fixture);
+      const base = installedBaseSnapshot(fixture);
+      const path = join(fixture.config.directory, fixture.plugins.components.at(-1).tarball);
+      const archive = readFileSync(path);
+      if (failure === "missing") rmSync(path); else writeFileSync(path, "corrupt");
+      const action = () => materialize({ ...fixture, config: { ...fixture.config, mode }, detectNvidia: () => true });
+      if (mode === "cuda") assert.throws(action, /ENOENT|integrity mismatch/); else action();
+      assert.deepEqual(installedBaseSnapshot(fixture), base);
+      assert.deepEqual(verifyInstallation(fixture).components, []);
+      for (const file of fixture.originals.keys()) assert.equal(existsSync(join(fixture.metaRoot, file)), false);
+      writeFileSync(path, archive);
+      materialize({ ...fixture, config: { ...fixture.config, mode: "cuda" } });
+      assert.equal(verifyInstallation({ ...fixture, requireCuda: true }).components.length, fixture.plugins.components.length);
+    });
+  }
+}
+
+function installedBaseSnapshot(fixture) {
+  const checksums = JSON.parse(readFileSync(join(fixture.platformRoot, "checksums.json")));
+  return Object.fromEntries(Object.keys(checksums.files).map((file) => {
+    const installed = file === `bin/${fixture.entry.binary}` ? "bin/zg.exe" : file;
+    return [installed, readFileSync(join(fixture.metaRoot, installed))];
+  }));
+}
+
+function interruptedPluginAttempt(fixture, phase, kill, mode = "cuda") {
+  // Instrument only this child process's filesystem calls. Exercise the real
+  // installer without adding production failpoints or extra helper scripts.
+  const script = `
+    const fs = require('node:fs');
+    const { join } = require('node:path');
+    const { options, installer, phase, kill, mode } = JSON.parse(process.argv[1]);
+    let injected = false;
+    function interrupt() {
+      injected = true;
+      fs.writeSync(1, 'interrupted:' + phase + '\\n');
+      if (kill) process.kill(process.pid, 'SIGKILL');
+      throw new Error('injected plugin failure: ' + phase);
+    }
+    const rename = fs.renameSync;
+    const files = JSON.parse(fs.readFileSync(join(options.platformRoot, 'plugins.json'))).files;
+    const destinations = Object.keys(files).map(file => join(options.metaRoot, file));
+    let activated = 0;
+    fs.renameSync = (source, destination) => {
+      if (!injected && phase === 'activation' && destinations.includes(destination) && ++activated === 2) interrupt();
+      if (!injected && phase === 'receipt' && destination === join(options.metaRoot, 'native-install.json')) interrupt();
+      return rename(source, destination);
+    };
+    const { materialize } = require(installer);
+    const { componentArchive } = require(join(require('node:path').dirname(installer), 'plugins.cjs'));
+    const config = { ...options.config, mode };
+    const fetchArchive = phase === 'download' ? (component, manifest) =>
+      componentArchive(component, manifest, { ...config, directory: undefined, offline: false }, (item, directory) => {
+        fs.writeFileSync(join(directory, item.tarball), 'incomplete download');
+        interrupt();
+      }) : undefined;
+    materialize({ ...options, config, fetchArchive, detectNvidia: () => true });
+  `;
+  return spawnSync(process.execPath, ["-e", script, JSON.stringify({
+    options: { metaRoot: fixture.metaRoot, platformRoot: fixture.platformRoot,
+      entry: fixture.entry, expectedVersion: fixture.expectedVersion, config: fixture.config },
+    installer: join(__dirname, "install.cjs"), phase, kill, mode,
+  })], { encoding: "utf8", timeout: 15000 });
+}
+
+for (const target of ["linux-x64-gnu", "win32-x64-msvc"]) {
+  for (const phase of ["download", "activation", "receipt"]) {
+    test(`killed CUDA ${phase} preserves the CPU payload and permits retry: ${target}`, (t) => {
+      const fixture = optionalFixture(t, target);
+      materialize(fixture);
+      const base = installedBaseSnapshot(fixture);
+      const result = interruptedPluginAttempt(fixture, phase, true);
+      assert.ifError(result.error);
+      assert.match(result.stdout, new RegExp(`interrupted:${phase}`), result.stderr);
+      assert.notEqual(result.status, 0);
+      assert.equal(existsSync(join(fixture.metaRoot, ".native-install.lock")), true);
+      assert.deepEqual(installedBaseSnapshot(fixture), base);
+      assert.deepEqual(JSON.parse(readFileSync(join(fixture.metaRoot, "native-install.json"))).components, []);
+      // Even if activation was interrupted, no truncated or unverified library
+      // becomes visible. CPU bytes remain intact before any recovery is run.
+      for (const [file, content] of fixture.originals) {
+        if (existsSync(join(fixture.metaRoot, file))) assert.deepEqual(readFileSync(join(fixture.metaRoot, file)), content);
+      }
+      const config = { ...fixture.config, mode: "cuda",
+        ...(phase === "download" ? { directory: undefined, offline: false } : {}) };
+      const fetchArchive = phase === "download" ? (component, manifest, settings) =>
+        componentArchive(component, manifest, settings, (item, directory) => {
+          const path = join(directory, item.tarball);
+          cpSync(join(fixture.config.directory, item.tarball), path);
+          return path;
+        }) : undefined;
+      // Retry CUDA directly, without an intermediate CPU repair command. A
+      // killed download also retries the same cache key, not a different source.
+      materialize({ ...fixture, config, fetchArchive });
+      assert.equal(verifyInstallation({ ...fixture, requireCuda: true }).components.length, fixture.plugins.components.length);
+      assert.deepEqual(installedBaseSnapshot(fixture), base);
+      assert.equal(existsSync(join(fixture.metaRoot, ".native-install.lock")), false);
+    });
+  }
+}
+
+for (const mode of ["auto", "cuda"]) {
+  for (const phase of ["activation", "receipt"]) {
+    test(`${mode} CUDA ${phase} error rolls back plugins without replacing CPU files`, (t) => {
+      const fixture = optionalFixture(t);
+      materialize(fixture);
+      const base = installedBaseSnapshot(fixture);
+      const binary = statSync(join(fixture.metaRoot, "bin/zg.exe"));
+      const result = interruptedPluginAttempt(fixture, phase, false, mode);
+      assert.ifError(result.error);
+      assert.match(result.stdout, new RegExp(`interrupted:${phase}`), result.stderr);
+      if (mode === "auto") assert.equal(result.status, 0, result.stderr);
+      else assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /injected plugin failure/);
+      assert.deepEqual(verifyInstallation(fixture).components, []);
+      assert.deepEqual(installedBaseSnapshot(fixture), base);
+      assert.equal(statSync(join(fixture.metaRoot, "bin/zg.exe")).ino, binary.ino);
+      materialize({ ...fixture, config: { ...fixture.config, mode: "cuda" } });
+      assert.equal(verifyInstallation({ ...fixture, requireCuda: true }).components.length, fixture.plugins.components.length);
+    });
+  }
+}
+
+test("corrupt base is fatal even in automatic mode", (t) => {
+  const fixture = optionalFixture(t);
+  writeFileSync(join(fixture.platformRoot, "bin/zg"), "corrupted");
+  assert.throws(() => materialize({ ...fixture, config: { ...fixture.config, mode: "auto" } }), /checksum mismatch/);
+  assert.equal(readFileSync(join(fixture.metaRoot, "bin/zg.exe"), "utf8"), "placeholder\n");
+});
+
+test("plugin core/ABI and manifest changes are rejected before installation", (t) => {
+  const fixture = optionalFixture(t);
+  const path = join(fixture.platformRoot, "plugins.json");
+  writeFileSync(path, JSON.stringify({ ...fixture.plugins, coreId: "0".repeat(64) }));
+  assert.throws(() => materialize(fixture), /manifest binding/);
+});
+
+test("content-addressed archives support offline reuse but never another core", (t) => {
+  const fixture = optionalFixture(t);
+  const component = fixture.plugins.components[0];
+  const config = { ...fixture.config, directory: undefined, offline: false };
+  let requests = 0;
+  const fetch = (_, directory) => {
+    requests++;
+    const path = join(directory, component.tarball);
+    cpSync(join(fixture.config.directory, component.tarball), path);
+    return path;
+  };
+  componentArchive(component, fixture.plugins, config, fetch);
+  componentArchive(component, fixture.plugins, { ...config, offline: true }, fetch);
+  assert.equal(requests, 1);
+  assert.throws(() => componentArchive(component, { ...fixture.plugins, coreId: "a".repeat(64) },
+    { ...config, offline: true }, fetch), /offline plugin cache miss/);
+});
+
+test("concurrent installation is rejected without touching the CPU runtime", (t) => {
+  const fixture = optionalFixture(t);
+  materialize(fixture);
+  writeFileSync(join(fixture.metaRoot, ".native-install.lock"), String(process.pid));
+  assert.throws(() => materialize(fixture), /installation is in progress/);
+  assert.deepEqual(verifyInstallation(fixture).components, []);
+});
+
+test("relocating the completed install does not depend on its cache", (t) => {
+  const fixture = optionalFixture(t);
+  materialize({ ...fixture, config: { ...fixture.config, mode: "cuda" } });
+  const relocated = join(fixture.root, "relocated");
+  renameSync(fixture.metaRoot, relocated);
+  rmSync(fixture.config.directory, { recursive: true });
+  assert.equal(verifyInstallation({ ...fixture, metaRoot: relocated, requireCuda: true }).components.length, 4);
+});
+
+test("installation settings reject unknown modes and honor npm offline", () => {
+  assert.throws(() => settings({ ZG_INSTALL_ACCELERATOR: "gpu" }), /must be auto, cpu or cuda/);
+  assert.equal(settings({ npm_config_offline: "true" }).offline, true);
+});
+
+test("real npm install/rebuild supports CPU bootstrap, offline plugins and pinned registry downloads", async (t) => {
+  const fixture = optionalFixture(t, process.platform === "win32" ? "win32-x64-msvc" : "linux-x64-gnu");
+  const meta = join(fixture.root, "meta-source", "package");
+  mkdirSync(join(meta, "bin"), { recursive: true });
+  writeFileSync(join(meta, "bin/zg.exe"), "uninstalled placeholder");
+  for (const file of ["install.cjs", "plugins.cjs"]) cpSync(join(__dirname, file), join(meta, file));
+  writeFileSync(join(meta, "platforms.json"), JSON.stringify([{ ...fixture.entry, os: process.platform, cpu: process.arch,
+    libc: process.platform === "linux" ? "glibc" : undefined }]));
+  writeFileSync(join(meta, "package.json"), JSON.stringify({ name: "@zvec/zvec-grep", version: "0.0.1",
+    scripts: { postinstall: "node install.cjs" }, optionalDependencies: { [fixture.entry.package]: "0.0.1" } }));
+  const base = join(fixture.root, "base-source", "package");
+  cpSync(fixture.platformRoot, base, { recursive: true });
+  for (const [source, name] of [[meta, "meta"], [base, "base"]]) {
+    const result = spawnSync("tar", ["-czf", join(fixture.root, `${name}.tgz`), "-C", dirname(source), "package"],
+      { env: { ...process.env, COPYFILE_DISABLE: "1" } });
+    assert.equal(result.status, 0);
+  }
+  const prefix = join(fixture.root, "prefix");
+  const installedMeta = join(prefix, ...(process.platform === "win32" ? [] : ["lib"]), "node_modules/@zvec/zvec-grep");
+  const installedBase = join(prefix, ...(process.platform === "win32" ? [] : ["lib"]), "node_modules", fixture.entry.package);
+  const npm = (args, mode) => {
+    const npmCli = process.env.npm_execpath || join(dirname(process.execPath), "node_modules/npm/bin/npm-cli.js");
+    const windows = process.platform === "win32";
+    const result = spawnSync(windows ? process.execPath : "npm", windows ? [npmCli, ...args] : args, {
+      encoding: "utf8", timeout: 60000, cwd: fixture.root,
+      env: { ...process.env, npm_config_cache: join(fixture.root, "npm-cache"),
+        npm_config_offline: "true", ZG_INSTALL_ACCELERATOR: mode, ZG_PLUGIN_DIR: fixture.config.directory,
+        ZG_PLUGIN_CACHE: fixture.config.cache, ZG_INSTALL_OFFLINE: "1" },
+    });
+    assert.equal(result.status, 0, `${result.error?.message || ""} ${result.signal || ""}\n${result.stdout}${result.stderr}`);
+  };
+  npm(["install", "-g", "--prefix", prefix, "--offline", "--ignore-scripts", "--no-audit", "--no-fund",
+    join(fixture.root, "base.tgz"), join(fixture.root, "meta.tgz")], "cpu");
+  assert.equal(readFileSync(join(installedMeta, "bin/zg.exe"), "utf8"), "uninstalled placeholder");
+  const rebuild = ["rebuild", "-g", "--prefix", prefix, "@zvec/zvec-grep", "--ignore-scripts=false",
+    "--allow-scripts=@zvec/zvec-grep", "--foreground-scripts"];
+  npm(rebuild, "cpu");
+  const options = { ...fixture, metaRoot: installedMeta, platformRoot: installedBase };
+  assert.deepEqual(verifyInstallation(options).components, []);
+  npm(rebuild, "cuda");
+  assert.equal(verifyInstallation({ ...options, requireCuda: true }).components.length, fixture.plugins.components.length);
+  // Downloaded components never became npm dependencies or project lock entries.
+  for (const component of fixture.plugins.components) assert.equal(existsSync(join(dirname(installedBase), component.package.split("/").at(-1))), false);
+
+  // Serve only the pinned test archives. The online path must use this registry,
+  // never a public/published version, and it must not execute component scripts.
+  const requests = [];
+  const server = createServer((request, response) => {
+    requests.push(request.url);
+    const path = decodeURIComponent(request.url);
+    const component = fixture.plugins.components.find((c) => path === `/${c.package}` || path === `/tarballs/${c.tarball}`);
+    if (!component) { response.writeHead(404); response.end(); return; }
+    if (path.startsWith("/tarballs/")) {
+      response.end(readFileSync(join(fixture.config.directory, component.tarball)));
+      return;
+    }
+    response.setHeader("Content-Type", "application/json");
+    response.end(JSON.stringify({ name: component.package, "dist-tags": { latest: "0.0.1" }, versions: {
+      "0.0.1": { name: component.package, version: "0.0.1", dist: {
+        tarball: `http://127.0.0.1:${server.address().port}/tarballs/${component.tarball}`, integrity: component.integrity,
+      } },
+    } }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const onlinePrefix = join(fixture.root, "online-prefix");
+  npm(["install", "-g", "--prefix", onlinePrefix, "--offline", "--ignore-scripts=false", "--allow-scripts=@zvec/zvec-grep",
+    "--no-audit", "--no-fund", join(fixture.root, "base.tgz"), join(fixture.root, "meta.tgz")], "cpu");
+  assert.equal(requests.length, 0);
+  const npmCli = process.env.npm_execpath || join(dirname(process.execPath), "node_modules/npm/bin/npm-cli.js");
+  const args = rebuild.map((arg) => arg === prefix ? onlinePrefix : arg);
+  await new Promise((resolve, reject) => {
+    const child = spawn(process.platform === "win32" ? process.execPath : "npm",
+      process.platform === "win32" ? [npmCli, ...args] : args, {
+        cwd: fixture.root, timeout: 60000,
+        env: { ...process.env, npm_config_registry: `http://127.0.0.1:${server.address().port}`,
+          npm_config_cache: join(fixture.root, "online-npm-cache"), npm_config_offline: "false",
+          ZG_INSTALL_ACCELERATOR: "cuda", ZG_INSTALL_OFFLINE: "0", ZG_PLUGIN_DIR: "",
+          ZG_PLUGIN_CACHE: join(fixture.root, "online-plugin-cache") },
+      });
+    let output = "";
+    child.stdout.on("data", (data) => { output += data; });
+    child.stderr.on("data", (data) => { output += data; });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve() : reject(new Error(output)));
+  });
+  assert.equal(requests.filter((path) => path.startsWith("/tarballs/")).length, fixture.plugins.components.length);
+  assert.equal(verifyInstallation({ ...options, metaRoot: installedMeta.replace(prefix, onlinePrefix),
+    platformRoot: installedBase.replace(prefix, onlinePrefix), requireCuda: true }).components.length,
+  fixture.plugins.components.length);
+});

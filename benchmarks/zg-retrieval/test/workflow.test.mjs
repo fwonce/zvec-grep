@@ -73,7 +73,12 @@ test("Retrieval-only retains its reusable and manual candidate/embedding inputs"
   const files = await readdir(new URL(".github/workflows/", repository));
   assert.deepEqual(
     files.filter((file) => /^retrieval.*\.ya?ml$/.test(file)).sort(),
-    ["retrieval-comparison.yml", "retrieval-only.yml", "retrieval-pr.yml"],
+    [
+      "retrieval-comparison.yml",
+      "retrieval-only.yml",
+      "retrieval-pr-comment.yml",
+      "retrieval-pr.yml",
+    ],
   );
   assert.deepEqual(Object.keys(jobs), [
     "authorize",
@@ -103,7 +108,7 @@ test("PR updates run Retrieval-only at the fork head SHA with local embedding an
   const job = block(prWorkflow, "retrieval", 2);
   assert.equal(
     [...block(prWorkflow, "jobs", 0).matchAll(/^ {2}([\w-]+):$/gm)].length,
-    1,
+    2,
   );
   assert.match(job, /uses: \.\/\.github\/workflows\/retrieval-comparison\.yml/);
   assert.equal(block(prWorkflow, "permissions", 4).trim(), "contents: read");
@@ -286,8 +291,9 @@ test("the selected source is built from rust/ and exact-commit package caching b
   assert.match(rustAction, /ref: \$\{\{ inputs\.candidate_ref \}\}/);
   assert.match(rustAction, /path: candidate/);
   assert.match(rustAction, /working-directory: candidate\/rust/);
-  assert.match(rustAction, /candidate\/rust\/target\//);
-  assert.match(rustAction, /candidate\/rust\/Cargo\.lock/);
+  // PR-scoped Cargo caches are never restored by other PRs, so only the
+  // commit-bound package is cached.
+  assert.doesNotMatch(rustAction, /candidate\/rust\/target\//);
   assert.match(
     rustAction,
     /\$\{\{ inputs\.cache_namespace \}\}-package-v1-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ steps\.source\.outputs\.commit \}\}/,

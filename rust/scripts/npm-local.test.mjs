@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  buildNative,
   defaultReleaseVariant,
   MAX_NPM_TARBALL_BYTES,
   existingNativeBuild,
@@ -357,6 +358,30 @@ test("no-build uses the last successful variant rather than stale CUDA artifacts
   assert.equal((await existingNativeBuild(entry, { cpuOnly: true })).bundleDir, undefined);
   await writeFile(join(root, "native-build.json"), JSON.stringify(cpu));
   assert.deepEqual(await existingNativeBuild(entry), cpu);
+});
+
+test("a failed CUDA rebuild invalidates reuse until a complete build succeeds", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "zg-failed-build-"));
+  const previous = process.env.CARGO_TARGET_DIR;
+  process.env.CARGO_TARGET_DIR = root;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.CARGO_TARGET_DIR;
+    else process.env.CARGO_TARGET_DIR = previous;
+    await rm(root, { recursive: true, force: true });
+  });
+  for (const entry of manifest.platforms.filter((entry) => entry.defaultVariant === "cuda")) {
+    await writeFile(join(root, "native-build.json"), JSON.stringify({ target: entry.target, variant: "cuda" }));
+    await assert.rejects(buildNative(entry, { runCommand(command) {
+      if (command === "nvcc") return "release 13.1, V13.1.1";
+      throw new Error("fallback build or linkage audit failed");
+    } }), /fallback build or linkage audit failed/);
+    await assert.rejects(existingNativeBuild(entry), /previous native build did not complete/);
+    await assert.rejects(existingNativeBuild(entry, { cpuOnly: true }), /previous native build did not complete/);
+    const build = await buildNative(entry, { runCommand(command) {
+      if (command === "nvcc") return "release 13.1, V13.1.1";
+    } });
+    assert.deepEqual(await existingNativeBuild(entry), build);
+  }
 });
 
 test("rejects platforms without a local release target", () => {

@@ -128,14 +128,16 @@ while IFS= read -r -d '' file; do
 done < <(find "${staging_dir}/lib" -maxdepth 1 -type f -print0)
 
 chmod 0755 "${staging_dir}"
+# CI can build the fallback in a separate CUDA 12.4 container before auditing.
+# Primary-only output is explicitly staging, never a complete local bundle.
+if [[ "${1:-}" != "--primary-only" ]]; then
+  python3 scripts/cuda/build-fallback.py --bundle "${staging_dir}" \
+    --cuda-root "${CUDA12_ROOT:-/usr/local/cuda-12.4}"
+  bash scripts/cuda/check.sh "${staging_dir}"
+else
+  bundle_dir="${profile_dir}/zg-cuda-staging"
+fi
 rm -rf -- "${bundle_dir}"
 mv -- "${staging_dir}" "${bundle_dir}"
 trap - EXIT
-
-# CI can build the fallback in a separate CUDA 12.4 container before auditing.
-if [[ "${1:-}" != "--primary-only" ]]; then
-  python3 scripts/cuda/build-fallback.py --bundle "${bundle_dir}" \
-    --cuda-root "${CUDA12_ROOT:-/usr/local/cuda-12.4}"
-  bash scripts/cuda/check.sh "${bundle_dir}"
-fi
 echo "CUDA bundle: ${bundle_dir}"

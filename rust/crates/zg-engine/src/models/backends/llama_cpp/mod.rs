@@ -1,4 +1,3 @@
-#[cfg(any(feature = "cuda", test))]
 mod backend_loading;
 mod model;
 

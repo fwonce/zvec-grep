@@ -133,7 +133,7 @@ jobs:
       - name: Validate Cargo metadata
         run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
       - name: Test npm packaging
-        run: node --test scripts/npm-local.test.mjs npm/meta/install.test.cjs
+        run: node --test scripts/npm-local.test.mjs scripts/npm-release-*.test.mjs npm/meta/install.test.cjs
 
   test:
     name: rust test (${{ matrix.os }}${{ matrix.cuda && ', CUDA' || '' }})
@@ -249,6 +249,17 @@ jobs:
           prefix-key: rust-ci-v3-test
           workspaces: rust -> target
           save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-nextest@0.9.148
+      # Keep Windows tests on the fast workspace drive, including GPU runners.
+      - name: Keep test temp files on the workspace drive
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Cache CUDA test dependencies and build output
         if: matrix.cuda
         uses: actions/cache@v5
@@ -281,11 +292,13 @@ jobs:
             --volume "${GITHUB_WORKSPACE}:/work" \
             --volume "$HOME/.cargo/registry:/root/.cargo/registry" \
             --volume "$HOME/.cargo/git:/root/.cargo/git" \
+            --volume "$(command -v cargo-nextest):/usr/local/bin/cargo-nextest:ro" \
             --env CARGO_INCREMENTAL --env CARGO_PROFILE_DEV_DEBUG --env CARGO_PROFILE_TEST_DEBUG \
             --env CARGO_BUILD_JOBS --env CMAKE_BUILD_PARALLEL_LEVEL --env CMAKE_CUDA_ARCHITECTURES \
             --env RUST_BACKTRACE --env CARGO_TERM_COLOR \
             --env ORT_DYLIB_PATH=/work/rust/target/debug/libonnxruntime.so.1 \
             zvec-grep-cuda-ci bash -euo pipefail -c '
+              cargo nextest --version
               cuda_ci_nvcc_version="$(nvcc --version)"
               echo "$cuda_ci_nvcc_version"
               grep -Eq "release 13\.1," <<< "$cuda_ci_nvcc_version"
@@ -295,9 +308,9 @@ jobs:
                 --message-format=json > target/ci-tests.json
               python3 scripts/cuda/prepare-onnxruntime.py --platform linux \
                 --cache-dir target/ort-cuda12 --destination target/debug
-              cargo test --locked --workspace --all-targets --features zg/cuda
               native_dirs="$(find /work/rust/target/debug -name "*.so*" -printf "%h\n" | sort -u | paste -sd :)"
               export LD_LIBRARY_PATH="${native_dirs}:${LD_LIBRARY_PATH:-}"
+              cargo nextest run --locked --workspace --all-targets --features zg/cuda --no-fail-fast
               ./target/debug/zg --rg "zvec-grep Rust rewrite" README.md
             '
       - name: Compile workspace tests once
@@ -306,6 +319,8 @@ jobs:
         run: |
           import os, pathlib, subprocess
           pathlib.Path("target").mkdir(exist_ok=True)
+          # Keep targets/features/profile identical to nextest; this JSON also
+          # identifies the active model tests and plugins for no-build GPU checks.
           command = ["cargo", "test", "--locked", "--workspace", "--all-targets", "--no-run", "--message-format=json"]
           if os.environ["CUDA_VERIFY"] == "true":
               command += ["--features", "zg/cuda"]
@@ -349,7 +364,7 @@ jobs:
         shell: python
         run: |
           import os, subprocess
-          command = ["cargo", "test", "--locked", "--workspace", "--all-targets"]
+          command = ["cargo", "nextest", "run", "--locked", "--workspace", "--all-targets", "--no-fail-fast"]
           if os.environ["CUDA_VERIFY"] == "true":
               command += ["--features", "zg/cuda"]
           subprocess.run(command, check=True)
@@ -449,6 +464,72 @@ jobs:
             fi
           done
           exit "$failed"
+      - name: Verify CPU isolation and CPU-to-CUDA in fresh test processes
+        if: matrix.cuda
+        shell: python
+        run: |
+          import json, os, pathlib, re, subprocess, sys
+          records = [json.loads(line) for line in pathlib.Path("target/ci-tests.json").read_text(encoding="utf-8").splitlines()]
+          def test_binary(name):
+              binaries = {record["executable"] for record in records
+                          if record.get("reason") == "compiler-artifact"
+                          and record["target"]["name"] == name
+                          and record["profile"]["test"] and record.get("executable")}
+              assert len(binaries) == 1, f"Expected one {name} test executable: {binaries}"
+              return binaries.pop()
+          directories = {str(pathlib.Path(record["out_dir"]) / "backends") for record in records
+                         if record.get("reason") == "build-script-executed"
+                         and "llama-cpp-sys-2" in record.get("package_id", "")}
+          assert len(directories) == 1, f"Expected one active llama.cpp backend directory: {directories}"
+          directory = directories.pop()
+          windows = sys.platform == "win32"
+          plugin = str(pathlib.Path(directory) / ("ggml-cuda.dll" if windows else "libggml-cuda.so"))
+          cases = [
+              ("cpu-override", test_binary("zg_llama_native"), "tests::real_cpu_plugin_ignores_gpu_override"),
+              ("cpu-then-cuda", test_binary("zg_engine"),
+               "models::backends::llama_cpp::model::tests::cached_embeddinggemma_uses_cuda"),
+          ]
+          logs = pathlib.Path("model-logs")
+          logs.mkdir(exist_ok=True)
+          failures = []
+          for name, binary, test in cases:
+              environment = dict(os.environ)
+              environment.pop("GGML_BACKEND_PATH", None)
+              environment.update(ZVEC_GREP_NATIVE_LIB_DIR=directory,
+                                 ZVEC_GREP_TEST_MODEL_CACHE=os.environ["ZVEC_GREP_MODEL_CACHE"])
+              if name == "cpu-override":
+                  environment["GGML_BACKEND_PATH"] = plugin
+              command = [binary, test, "--ignored", "--exact", "--nocapture"]
+              if not windows:
+                  # Reuse the compiled tests in the same CUDA 13 runtime as the
+                  # GGUF smoke, reusing its model cache without another build.
+                  command = ["docker", "run", "--rm", "--gpus", "all", "--platform", "linux/amd64",
+                             "--volume", f"{os.environ['GITHUB_WORKSPACE']}:/work:ro",
+                             "--volume", f"{os.environ['ZVEC_GREP_MODEL_CACHE']}:/model-cache",
+                             "--workdir", "/work/rust", "--env", "RUST_BACKTRACE",
+                             "--env", f"ZVEC_GREP_NATIVE_LIB_DIR={directory}",
+                             "--env", "ZVEC_GREP_TEST_MODEL_CACHE=/model-cache",
+                             *(["--env", f"GGML_BACKEND_PATH={plugin}"] if name == "cpu-override" else []),
+                             "nvidia/cuda:13.1.1-runtime-ubuntu24.04@sha256:12e26235ebe186000d71f8e457a9ad2aed6c0cb743a7935f0443bacef206aa34",
+                             "bash", "-euo", "pipefail", "-c",
+                             'native_dirs="$(find /work/rust/target/debug -name "*.so*" -printf "%h\\n" | sort -u | paste -sd :)"; '
+                             'export LD_LIBRARY_PATH="${native_dirs}:${LD_LIBRARY_PATH:-}"; '
+                             'exec timeout 900 "$@"', "c5-test", *command]
+              log_path = logs / f"c5-{name}.log"
+              try:
+                  with log_path.open("w", encoding="utf-8") as log:
+                      subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT,
+                                     timeout=960, check=True)
+                  # libtest exits successfully for an unknown exact filter too.
+                  if not re.search(r"test result: ok\. 1 passed; 0 failed;", log_path.read_text(encoding="utf-8", errors="replace")):
+                      raise RuntimeError("Expected exactly one passing C5 test, not a skipped or empty selection")
+              except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+                  failures.append(f"{name}: {error}")
+              finally:
+                  print(f"=== C5 {name} ===", flush=True)
+                  print(log_path.read_text(encoding="utf-8", errors="replace"), flush=True)
+          if failures:
+              raise RuntimeError("\n".join(failures))
       - name: Require actual CUDA execution without CPU fallback
         if: matrix.cuda
         shell: python

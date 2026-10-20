@@ -88,9 +88,9 @@ the npm packaging tests without a separate CUDA mock-test suite.
 workspace and real-model verification. Push/PR runs use ordinary Linux, macOS
 and Windows runners. The independent non-CUDA quality job runs formatting,
 per-package checks, Clippy and npm packaging tests. Each test job compiles the
-workspace tests once, runs the tests and CLI smoke check, and reuses the compiled
-`zg-engine` test binary for all three real models without a separate Cargo build
-per model.
+workspace tests once, runs them with pinned cargo-nextest 0.9.148 and checks the
+CLI. It reuses the compiled `zg-engine` test binary for all three real models
+without a separate Cargo build per model.
 
 For manual `workflow_dispatch`, set `cuda_verify=true` to move the selected
 Linux/Windows test jobs to `gpu-linux-t4` and `gpu-windows-t4` in `gpu-runners`.
@@ -115,6 +115,15 @@ graph placement or positive GGUF layer offload without CPU fallback. Logs are
 retained as `real-model-evidence-<platform>-<cuda|default>`, including on failure.
 Any failed model case or CUDA evidence assertion fails the platform job.
 
+Both GPU jobs then explicitly run the ignored C5 tests from those same compiled
+test binaries, each in a fresh process: `cached_embeddinggemma_uses_cuda` verifies
+CPU inference followed by CUDA inference in one process, while
+`real_cpu_plugin_ignores_gpu_override` verifies that a real CPU plugin remains
+the only registered backend even with `GGML_BACKEND_PATH` pointing at a present
+CUDA plugin. They reuse the model cache and Cargo-reported backend directory;
+no extra build is performed. Each selection must report exactly one passing
+test, and `c5-*.log` files are retained with the other real-model evidence.
+
 ### Package validation
 
 `Publish Rust packages` (`.github/workflows/rust-publish.yml`) handles
@@ -126,9 +135,10 @@ to npm. Compilation always stays on CPU runners, including when `cuda=true` or
 Set `cuda=true,publish=false` to add GPU validation without publishing.
 Separate GPU jobs download the exact native npm artifacts from the same run and
 invoke `.github/actions/cuda-cli-e2e`, without rebuilding or repacking. Publication
-always requires these GPU checks, even when `cuda` is unchecked. Requested GPU
-validation must pass before collection; failures retain uploaded native packages
-but block collection and publication.
+always requires these GPU checks, even when `cuda` is unchecked. Collection runs
+first; CPU and requested GPU validation then run independently in parallel.
+Failures retain candidates and do not skip the other validation path, but every
+required check must pass before publication. Collection alone is not approval.
 
 The manual `platform` input selects `all` (the default) or one of `darwin-arm64`,
 `darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`, and `win32-x64-msvc`.
@@ -139,16 +149,25 @@ validation-only and cannot be published or promoted; `publish=true` requires
 `platform=all`. Each collected artifact includes the selected native tarballs,
 the exact-version meta tarball, checksums and installation instructions.
 
-After collection, separate CPU jobs for the selected Linux/Windows x64 targets
-download that artifact, verify tarball SHA256 values, and install native plus
-meta tarballs offline into a fresh prefix without rebuilding or repacking. They verify CLI and
-daemon IPC, then run `scripts/cuda/e2e.py --cpu-only` against the installed meta
+After collection, separate CPU jobs for every selected target download their
+native artifact plus the collected meta/inventory artifact, verify tarball SHA256
+values, and install only base/meta tarballs offline into a fresh prefix without
+rebuilding or repacking. They verify CLI and daemon IPC. Linux/Windows x64 then
+run `scripts/cuda/e2e.py --cpu-only` against the installed meta
 package. This checks both explicit `--device cpu` and default automatic CPU
 fallback for real GGUF/ONNX indexing and vector queries. Linux uses a plain
 Ubuntu 24.04 container; Windows excludes toolkit paths. Both require CUDA host
 libraries to be unavailable and retain `cpu-artifact-evidence-*` logs on failure.
 CPU artifact validation runs even when `publish=false`; failure blocks npm
 publication, while the downloaded candidate remains available for diagnosis.
+
+CUDA component downloads are tested through the actual postinstall, not a
+workspace-only assembly shortcut. Linux installs inside each CUDA runtime
+container; Windows installs after the relevant runtime is prepared. Each case
+uses a fresh prefix/cache and this run's local plugin archives. Auto and forced
+CUDA installation must activate every verified plugin before GPU inference;
+explicit CPU installation on a GPU host must request none. Registry smoke also
+forces plugin fetching so optional CPU fallback cannot hide unavailable assets.
 
 Both platforms run the same CLI index, readiness and vector-search test with
 GGUF `local/embeddinggemma-300m` and ONNX `local/all-minilm-l6-v2`, explicitly

@@ -7,6 +7,22 @@ and [user documentation](../docs/README.md) describe that implementation.
 Run the development commands below from `rust/` (`cd rust` from the repository
 root). See the [contributor guide](CONTRIBUTING.md) for checks and conventions.
 
+The Rust CLI joins positional words into one hybrid query:
+`zg connection pool timeout` is equivalent to `zg "connection pool timeout"`.
+Separately quoted positional arguments also merge: both
+`zg "connection pool" "timeout"` and `zg "connection pool" "socket timeout"`
+produce one query. When at least two nonempty positional arguments include a
+phrase with internal whitespace, a warning on stderr explains the merge and
+recommends explicit queries, such as
+`zg --hybrid "connection pool" --hybrid "socket timeout"`.
+Shell quote characters are not available to the CLI, so separately quoted single
+words behave like unquoted words without a warning. Each positional argument is
+trimmed, empty arguments are ignored, and the remaining parts are joined with one
+space while preserving internal whitespace. Existing scripts relying on multiple
+positional query groups should switch to repeated `--hybrid` flags. Explicit
+`--hybrid`, `--fts`, and `--vector` queries stay separate. Direct and Server modes
+use the same parsing; managed `--rg` retains its pattern/path syntax.
+
 This workspace preserves its own crates, scripts, compatibility fixtures, and
 benchmarks. The application API is centered on one reusable `ZvecGrep` engine
 value:
@@ -65,6 +81,18 @@ every detected Stable and Insiders user profile, using `VSCODE_USER_DIR`,
 `VSCODE_PORTABLE`, or `VSCODE_APPDATA` when set. It also registers the server in
 Copilot's home because the shared instructions are read by both clients.
 Uninstall preserves that shared server until both integrations are removed.
+
+`zg --install --target pi` configures Pi's built-in user-level MCP in
+`${PI_CODING_AGENT_DIR:-~/.pi/agent}/mcp.json` and adds guidance to the active
+global context file, including `AGENTS.override.md` when present. Both stdio
+and HTTP use the shared daemon; new entries have direct exposure and a timeout
+in seconds. Reinstall preserves Pi UI choices and existing HTTP authentication
+unless an explicit token environment option replaces it. Uninstall uses a
+stable ownership marker, so changing the daemon URL does not leave stale
+managed entries. Use `/reload` or a new session. Native filesystem paths are
+required for the directory override; file URIs and Windows shell drive paths
+are rejected. Pi's built-in MCP currently needs user-managed `zg --auth grant`
+authorization for Remote Embedding; see the [integration guide](../docs/01-agents.md).
 
 `ZvecGrep` is normally shared for the lifetime of a process. Workspace root is
 request state, so the same instance can serve multiple workspaces. It exposes
@@ -393,7 +421,11 @@ ONNX uses the hash-verified official ORT 1.28.0 CUDA 12 core/providers.
 NVIDIA driver, CUDA runtime, cuBLAS and cuDNN 9 remain host dependencies.
 CUDA-enabled x64 builds default to automatic device selection and fall back
 to CPU when a GPU/backend is unavailable. `--device cpu` or
-`ZVEC_GREP_DEVICE=cpu` explicitly selects CPU.
+`ZVEC_GREP_DEVICE=cpu` explicitly selects CPU. In CUDA-enabled GGUF builds,
+explicit CPU execution loads only CPU plugins, ignores `GGML_BACKEND_PATH`,
+and supplies an empty GPU device list. Optional GPU registration is separate:
+a later GPU request in the same process can still use preinstalled plugins.
+GPU requests retain the upstream `GGML_BACKEND_PATH` override behavior.
 
 See [npm distribution](npm/README.md) for the complete layout, OS/backend
 support matrix, runtime dependencies, and publication policy.
@@ -462,22 +494,41 @@ npm run release:verify
 npm run release:pack
 ```
 
-The default published Linux x64 and Windows x64 artifacts are complete CPU/CUDA
-bundles assembled from a base package and exact-version CUDA component packages,
-so installation requires no CUDA compiler. Linux ORT is transported as two
+The default published Linux x64 and Windows x64 bases contain a complete CPU
+runtime and retain dynamic CUDA support. Optional exact-version CUDA components
+are pinned in `plugins.json`, not mandatory npm dependencies. Postinstall installs
+CPU first and, by default, fetches the complete CUDA component set when NVIDIA
+detection succeeds. `ZG_INSTALL_ACCELERATOR=cpu` skips detection/downloads;
+`cuda` forces installation, including on GPU-free builders. Installation requires
+no CUDA compiler. Linux ORT is transported as two
 fragments and reconstructed with a full-library SHA256 check. The installed
 `bin/`, `lib/` and `lib/cuda12/` layout is unchanged. Local packaging follows the
 build policy above: no toolkit produces a CPU-only package. Use
 `npm run release:cpu` to explicitly produce a CPU-only package; CI supplies and
 audits a complete CUDA bundle before packaging the default x64 releases.
 
-The release tarballs are written under `dist/npm/release/tarballs/`. Run a real
-meta/base/component tarball install in an isolated npm prefix and verify the materialized binary
-with:
+Later add CUDA with `ZG_INSTALL_ACCELERATOR=cuda npm rebuild -g @zvec/zvec-grep`
+(omit `-g` for project-local installs). `ZG_PLUGIN_DIR` selects an absolute local
+artifact directory; `ZG_INSTALL_OFFLINE=1` prevents network access. Stop zg before
+adding plugins and restart any daemon afterwards. There is no `zg-setup` command
+or download during indexing/query execution. Auto plugin failures retain CPU;
+forced failures return an error. See [npm installation details](npm/meta/README.md),
+including recovery when installation scripts were skipped.
+
+The release tarballs are written under `dist/npm/release/tarballs/`.
+For release validation, produce the native packages once with `release:platform`,
+then run `release:collect -- --targets <target>` to pack the meta package and
+record the exact tarball hashes in `release.json`. Install those collected bytes
+in an isolated npm prefix and verify the materialized binary with:
 
 ```sh
 npm run release:smoke
 ```
+
+`release:smoke` (also named `release:artifact-smoke`) only verifies existing
+collected artifacts; it never builds or packs packages. CUDA release targets
+require their complete default bundle. A failed local rebuild invalidates
+`native-build.json`, so `--no-build` refuses reuse until a build completes.
 
 CI can package a previously built target artifact without rebuilding it:
 
@@ -555,23 +606,29 @@ Windows CUDA library lookup includes both toolkit `bin` and CUDA 13 `bin/x64`
 directories. Workspace and package GPU checks independently load the selected
 GGUF plugin and its dependencies before inference; this CI setup does not change
 the package's host CUDA runtime requirements.
-Publishing always requires GPU validation regardless of `cuda`. When requested,
-GPU validation must pass before artifact collection and npm publication; the
-per-platform artifacts are retained even if GPU validation fails.
+Publishing always requires GPU validation regardless of `cuda`. Candidate
+collection happens first, followed by parallel CPU and requested GPU validation.
+All selected platforms get the installed CLI/daemon checks; Linux/Windows x64
+also get the CPU model/fallback checks. A GPU failure does not block CPU checks
+or candidate retention, but all required CPU/GPU checks must pass before npm
+publication. A downloadable candidate is not proof of runtime validation.
 CPU runners compile the default CUDA-capable bundles. Linux x64 uses the pinned
 Ubuntu 24.04 CUDA builder image; Linux ARM64 uses its native runner. Windows
 installs pinned CUDA 13.1 and 12.4 toolchains on the selected build runner. Ordinary PR CI
 does not compile CUDA packages. `rust-ci.yml` is the single entry point for
 workspace and real-model verification. Push/PR runs use ordinary runners on
-Linux, macOS and Windows. Each test job compiles the workspace tests once and
-reuses the CLI and test binary for smoke checks and all three real models
-(Model2Vec, ORT and llama.cpp), without a separate build per model.
+Linux, macOS and Windows. Each test job compiles the workspace tests once, runs
+them with pinned cargo-nextest, and reuses the CLI and test binary for smoke
+checks and all three real models (Model2Vec, ORT and llama.cpp), without a separate
+build per model.
 For manual runs, `cuda_verify=true` switches Linux/Windows test jobs to GPU
 runners and enables `zg/cuda` from the first compilation. The same binaries
 then run the ordinary tests and real models, plus ORT/llama.cpp CUDA inference
-with actual GPU execution evidence and no CPU fallback. Model2Vec stays on CPU;
-macOS and the separate non-CUDA quality job remain unchanged. Quality, default
-tests and CUDA tests have separate build caches. `platform` defaults to `all`;
+with actual GPU execution evidence and no CPU fallback. Both GPU jobs also run
+the C5 CPU-to-CUDA same-process and CPU-plugin override isolation tests from
+existing binaries, retaining `c5-*.log` evidence. Model2Vec stays on CPU; macOS
+and the separate non-CUDA quality job remain unchanged. Quality, default tests
+and CUDA tests have separate build caches. `platform` defaults to `all`;
 select `linux` or `windows` to limit test platforms. Optional `ref` selects the
 reviewed source; otherwise the workflow's selected commit is used. All jobs
 check out the same resolved SHA. This workflow does no npm packaging or publishing.
@@ -614,7 +671,7 @@ it cannot be published or promoted as a complete release.
 
 Selected Linux/Windows x64 candidates also go through separate CPU artifact jobs.
 These download the collected `.tgz` files, verify their hashes and default CUDA
-variant, install them offline without rebuilding, and exercise CLI/daemon IPC.
+capabilities, install only base/meta offline without rebuilding, and exercise CLI/daemon IPC.
 With CUDA host libraries unavailable, the installed meta package must also pass
 real GGUF/ONNX indexing and vector queries using both explicit CPU selection and
 default automatic CPU fallback. Logs are retained as `cpu-artifact-evidence-*`.
@@ -650,6 +707,17 @@ all five platform versions, so its installation behavior is unchanged.
 `release:artifact-smoke` installs the current platform's exact collected native
 component and meta tarballs from `dist/npm/release/tarballs`, verifies the installation and
 CLI/daemon operation, and does not compile, repack or publish anything.
+CPU and GPU jobs share `install-artifacts`, the real npm installation entry point, and retain its
+`artifact-smoke/installation.json` report. They download only their platform
+artifact plus `rust-verification-<version>` (the collected meta tarball and
+inventory), so full-platform CUDA payloads are not repeatedly downloaded.
+`install-artifacts` verifies identity and payloads without executing zg; GPU jobs
+then execute in the designated runtime environment. `smoke-artifacts` adds the
+CLI/daemon probe on the matching CPU runner.
+Registry install/update/rollback runs on ordinary CPU runners and explicitly
+checks exact component versions, payload hashes and the assembled runtime in
+addition to registry tarball integrity; a CPU-only CLI success cannot hide a
+missing CUDA component. Real GPU execution is validated before publication.
 `release:publish` validates the collected files before publishing native packages
 and then the meta package under `rust-canary` with npm provenance. An already published version is
 reused only when its tarball integrity matches, allowing a partial publication

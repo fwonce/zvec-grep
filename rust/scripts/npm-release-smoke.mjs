@@ -1,6 +1,7 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { homedir } from "node:os";
 import {
   defaultReleaseVariant,
   nativePackageEntries,
@@ -8,8 +9,10 @@ import {
   run,
   selectPlatform,
   sha256File,
+  workspaceDir,
 } from "./npm-package-core.mjs";
 import { checkPublishedPackage } from "./npm-release-registry.mjs";
+import { resolvePlatformRoot, verifyInstallation } from "../npm/meta/install.cjs";
 
 export function installedPackageRoot(prefix, packageName) {
   const modules =
@@ -17,6 +20,21 @@ export function installedPackageRoot(prefix, packageName) {
       ? join(prefix, "node_modules")
       : join(prefix, "lib", "node_modules");
   return join(modules, ...packageName.split("/"));
+}
+
+export async function verifyInstalledRelease({ manifest, entry, version, prefix, requireCuda = false }) {
+  const metaRoot = installedPackageRoot(prefix, manifest.metaPackage);
+  // Registry-only meta installs can nest dependencies; artifact installs may
+  // put them beside meta. Resolve exactly as the real installer does.
+  const platformRoot = resolvePlatformRoot(metaRoot, entry);
+  for (const [root, name] of [[metaRoot, manifest.metaPackage], [platformRoot, entry.package]]) {
+    const metadata = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+    if (metadata.name !== name || metadata.version !== version ||
+        (name === entry.package && metadata.zvecGrep?.variant !== defaultReleaseVariant(entry))) {
+      throw new Error(`installed artifact identity or variant mismatch: ${name}`);
+    }
+  }
+  return verifyInstallation({ metaRoot, platformRoot, entry, expectedVersion: version, requireCuda });
 }
 
 async function availablePort() {
@@ -40,7 +58,7 @@ export async function smokeInstalledPackage({
   fixtureRoot,
 }) {
   const installedMeta = installedPackageRoot(prefix, manifest.metaPackage);
-  const installedPlatform = installedPackageRoot(prefix, entry.package);
+  const installedPlatform = resolvePlatformRoot(installedMeta, entry);
   const binary = join(installedMeta, "bin", "zg.exe");
   if (
     (await sha256File(binary)) !==
@@ -121,13 +139,15 @@ export async function smokeInstalledPackage({
   );
 }
 
-export async function smokeArtifactRelease({
+export async function installArtifactRelease({
   manifest,
   release,
   tarballRoot,
   prefixRoot,
+  target,
+  accelerator = "cpu",
   runNpm = run,
-  probe = smokeInstalledPackage,
+  verifyInstalled = verifyInstalledRelease,
 }) {
   if (
     release.schemaVersion !== 1 || !Array.isArray(release.packages) ||
@@ -141,11 +161,14 @@ export async function smokeArtifactRelease({
     process.arch,
     process.report?.getReport().header ?? {},
   );
+  if (target && target !== entry.target) throw new Error(`artifact target ${target} does not match host ${entry.target}`);
+  if (!["cpu", "auto", "cuda"].includes(accelerator)) throw new Error("invalid installation accelerator");
   const tarballs = [];
-  for (const { name, target } of [
+  for (const { name, target, component } of [
     ...nativePackageEntries(entry),
     { name: manifest.metaPackage, target: "meta" },
   ]) {
+    if (component && accelerator === "cpu") continue;
     const matches = release.packages.filter((candidate) => candidate.name === name);
     const candidate = matches[0];
     const file = `${name.replace(/^@/, "").replaceAll("/", "-")}-${release.version}.tgz`;
@@ -159,10 +182,20 @@ export async function smokeArtifactRelease({
     if ((await sha256File(path)) !== candidate.sha256) {
       throw new Error(`artifact tarball checksum mismatch: ${file}`);
     }
-    tarballs.push(path);
+    if (!component) tarballs.push(path);
   }
   // Use the exact downloaded bytes, a fresh prefix/cache and no registry fallback.
-  // Unlike smoke-current, this must never rebuild or repack a native package.
+  // Verification must never build or repack a package.
+  const destination = resolve(prefixRoot);
+  const artifacts = relative(destination, resolve(tarballRoot));
+  if (destination === dirname(destination) || destination === resolve(homedir()) ||
+      destination === workspaceDir || (!artifacts.startsWith("..") && !isAbsolute(artifacts))) {
+    throw new Error("artifact installation needs a dedicated prefix directory outside its inputs");
+  }
+  const existing = await readdir(destination).catch((error) => { if (error.code === "ENOENT") return []; throw error; });
+  if (existing.some((name) => !["prefix", "cache", "plugin-cache", "workspace", "installation.json"].includes(name))) {
+    throw new Error("refusing to replace a directory not owned by artifact installation");
+  }
   await rm(prefixRoot, { recursive: true, force: true });
   const prefix = join(prefixRoot, "prefix");
   await runNpm(
@@ -172,25 +205,32 @@ export async function smokeArtifactRelease({
       "--offline", "--no-audit", "--no-fund",
       `--allow-scripts=${tarballs.at(-1)}`, ...tarballs,
     ],
-    { env: npmEnvironment(join(prefixRoot, "cache")) },
+    { env: { ...npmEnvironment(join(prefixRoot, "cache")), ZG_INSTALL_ACCELERATOR: accelerator,
+      ZG_PLUGIN_DIR: tarballRoot, ZG_PLUGIN_CACHE: join(prefixRoot, "plugin-cache"), ZG_INSTALL_OFFLINE: "1" } },
   );
-  const metadata = JSON.parse(
-    await readFile(join(installedPackageRoot(prefix, entry.package), "package.json"), "utf8"),
-  );
-  if (
-    metadata.name !== entry.package || metadata.version !== release.version ||
-    metadata.zvecGrep?.variant !== defaultReleaseVariant(entry)
-  ) {
-    throw new Error(`installed artifact identity or variant mismatch: ${entry.target}`);
+  const installation = await verifyInstalled({ manifest, entry, version: release.version, prefix,
+    requireCuda: Boolean(entry.components?.length && accelerator !== "cpu") });
+  if (accelerator === "cpu" && installation.coreId && installation.components.length) {
+    throw new Error("CPU artifact installation unexpectedly installed CUDA plugins");
   }
-  await probe({
-    manifest,
-    entry,
-    version: release.version,
-    prefix,
-    fixtureRoot: join(prefixRoot, "workspace"),
+  const bundle = installedPackageRoot(prefix, manifest.metaPackage);
+  await writeFile(join(prefixRoot, "installation.json"), `${JSON.stringify({
+    ...installation, bundle, accelerator, commit: release.commit,
+    packages: release.packages.filter((pkg) => pkg.target === entry.target || pkg.target === "meta"),
+  }, null, 2)}\n`);
+  return { entry, prefix, bundle };
+}
+
+export async function smokeArtifactRelease(options) {
+  const result = await installArtifactRelease(options);
+  await (options.probe ?? smokeInstalledPackage)({
+    manifest: options.manifest,
+    entry: result.entry,
+    version: options.release.version,
+    prefix: result.prefix,
+    fixtureRoot: join(options.prefixRoot, "workspace"),
   });
-  return { entry, prefix, bundle: installedPackageRoot(prefix, manifest.metaPackage) };
+  return result;
 }
 
 export async function rollbackVersion(
@@ -237,6 +277,7 @@ export async function smokeRegistryRelease({
   runNpm = run,
   probe = smokeInstalledPackage,
   probePrevious,
+  verifyInstalled = verifyInstalledRelease,
 }) {
   if (
     !/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(baseline ?? "") ||
@@ -258,7 +299,8 @@ export async function smokeRegistryRelease({
     process.arch,
     process.report?.getReport().header ?? {},
   );
-  const environment = npmEnvironment(join(prefixRoot, "cache"));
+  const environment = { ...npmEnvironment(join(prefixRoot, "cache")), ZG_INSTALL_ACCELERATOR: "cpu",
+    ZG_PLUGIN_DIR: "", ZG_PLUGIN_CACHE: join(prefixRoot, "plugin-cache"), ZG_INSTALL_OFFLINE: "0" };
   // Resolve optional dependencies from the public registry, without installing
   // a platform tarball explicitly or reusing a local candidate's npm cache.
   const install = (prefix, version) =>
@@ -304,7 +346,9 @@ export async function smokeRegistryRelease({
   const fresh = join(prefixRoot, "fresh");
   const update = join(prefixRoot, "update");
   await rm(prefixRoot, { recursive: true, force: true });
-  install(fresh, release.version);
+  await install(fresh, release.version);
+  const installation = await verifyInstalled({ manifest, entry, version: release.version, prefix: fresh });
+  await writeFile(join(prefixRoot, "installation.json"), `${JSON.stringify(installation, null, 2)}\n`);
   await probe({
     manifest,
     entry,
@@ -312,9 +356,18 @@ export async function smokeRegistryRelease({
     prefix: fresh,
     fixtureRoot: join(prefixRoot, "fresh-workspace"),
   });
-  install(update, baseline);
+  if (entry.components?.length) {
+    // Explicit registry fetch on a CPU runner: auto fallback cannot conceal a
+    // missing artifact, wrong ABI, integrity error or authentication failure.
+    await runNpm("npm", ["rebuild", "--global", "--prefix", fresh,
+      "--registry=https://registry.npmjs.org", `--allow-scripts=${manifest.metaPackage}`, manifest.metaPackage, "--foreground-scripts"],
+    { env: { ...environment, ZG_INSTALL_ACCELERATOR: "cuda" } });
+    await verifyInstalled({ manifest, entry, version: release.version, prefix: fresh, requireCuda: true });
+  }
+  await install(update, baseline);
   await verifyPrevious(update);
-  install(update, release.version);
+  await install(update, release.version);
+  await verifyInstalled({ manifest, entry, version: release.version, prefix: update });
   await probe({
     manifest,
     entry,
@@ -322,7 +375,7 @@ export async function smokeRegistryRelease({
     prefix: update,
     fixtureRoot: join(prefixRoot, "update-workspace"),
   });
-  install(update, baseline);
+  await install(update, baseline);
   await verifyPrevious(update);
   console.log(
     `registry install/update/rollback passed: ${baseline} -> ${release.version} -> ${baseline} (${entry.target})`,

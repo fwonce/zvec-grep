@@ -8,6 +8,7 @@ const {
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -15,8 +16,10 @@ const {
   renameSync,
   rmSync,
   writeSync,
+  writeFileSync,
 } = require("fs");
 const { dirname, isAbsolute, join, normalize, relative, resolve, sep } = require("path");
+const plugins = require("./plugins.cjs");
 
 function copyTreeSync(source, destination) {
   const metadata = lstatSync(source);
@@ -95,7 +98,7 @@ function verifyPayload(platformRoot, entry, expectedVersion) {
   const packageJson = verifyPackageIdentity(platformRoot, entry.package, expectedVersion);
   const checksumPath = join(platformRoot, "checksums.json");
   const checksums = JSON.parse(readFileSync(checksumPath, "utf8"));
-  if (![1, 2].includes(checksums.schemaVersion) || checksums.target !== entry.target) {
+  if (![1, 2, 3].includes(checksums.schemaVersion) || checksums.target !== entry.target) {
     throw new Error(`invalid native checksum manifest for ${entry.package}`);
   }
   const expectedBinary = `bin/${entry.binary}`;
@@ -123,7 +126,26 @@ function verifyPayload(platformRoot, entry, expectedVersion) {
   }
   verifyFiles(platformRoot, Object.fromEntries(
     Object.entries(checksums.files).filter(([file]) => !externalFiles.has(file))));
+  if (checksums.schemaVersion === 3) readPlugins(platformRoot, entry, expectedVersion, checksums);
   return checksums;
+}
+
+function readPlugins(platformRoot, entry, version, checksums) {
+  const metadata = verifyPackageIdentity(platformRoot, entry.package, version);
+  if (Object.keys(metadata.dependencies || {}).length ||
+      Object.keys(metadata.optionalDependencies || {}).length ||
+      checksums.coreId !== plugins.coreIdentity(entry.target, version, checksums.files) ||
+      digest(join(platformRoot, "plugins.json")) !== checksums.pluginsSha256) {
+    throw new Error("invalid base/plugin manifest binding");
+  }
+  const manifest = plugins.validatePlugins(JSON.parse(readFileSync(join(platformRoot, "plugins.json"), "utf8")),
+    entry, version, checksums.coreId);
+  for (const file of Object.keys(manifest.files)) {
+    checkedPayloadPath(platformRoot, file);
+    if (!file.startsWith("lib/") || checksums.files[file]) throw new Error("plugin may not replace a base file");
+  }
+  for (const component of manifest.components) checkedPayloadPath(platformRoot, component.payload);
+  return manifest;
 }
 
 function verifyFiles(root, files) {
@@ -133,7 +155,9 @@ function verifyFiles(root, files) {
     .flatMap((directory) => listPayloadFiles(root, join(root, directory)))
     .sort();
   if (JSON.stringify(actualFiles) !== JSON.stringify(declaredFiles)) {
-    throw new Error("native payload files do not match the checksum manifest");
+    const missing = declaredFiles.filter((file) => !actualFiles.includes(file));
+    const unexpected = actualFiles.filter((file) => !declaredFiles.includes(file));
+    throw new Error(`native payload files do not match the checksum manifest (missing: ${missing.join(", ")}; unexpected: ${unexpected.join(", ")})`);
   }
 
   for (const [payloadPath, expected] of Object.entries(files)) {
@@ -148,7 +172,45 @@ function verifyFiles(root, files) {
   }
 }
 
-function materialize({ metaRoot, platformRoot, entry, expectedVersion }) {
+function verifyComponentPayload(metaRoot, platformRoot, entry, component, expectedVersion) {
+  const root = resolvePackageRoot(metaRoot, component.package, platformRoot);
+  verifyPackageIdentity(root, component.package, expectedVersion);
+  const part = JSON.parse(readFileSync(join(root, "checksums.json"), "utf8"));
+  if (part.schemaVersion !== 1 || part.target !== entry.target || part.component !== component.package ||
+      JSON.stringify(Object.keys(part.files ?? {})) !== JSON.stringify([component.payload])) {
+    throw new Error(`invalid native component manifest: ${component.package}`);
+  }
+  verifyFiles(root, part.files);
+  return checkedPayloadPath(root, component.payload);
+}
+
+// Also used by release verification: a successful CPU CLI must not hide missing
+// or corrupt GPU components, even when no GPU is present on the verification host.
+function verifyInstallation({ metaRoot, platformRoot, entry, expectedVersion, requireCuda = false }) {
+  const checksums = verifyPayload(platformRoot, entry, expectedVersion);
+  if (checksums.schemaVersion === 3) {
+    const manifest = readPlugins(platformRoot, entry, expectedVersion, checksums);
+    const receipt = JSON.parse(readFileSync(join(metaRoot, "native-install.json"), "utf8"));
+    if (receipt.target !== entry.target || receipt.version !== expectedVersion || receipt.coreId !== manifest.coreId ||
+        !Array.isArray(receipt.components) ||
+        (receipt.components.length && JSON.stringify(receipt.components) !== JSON.stringify(manifest.components.map((c) => c.package))) ||
+        (requireCuda && receipt.components.length !== manifest.components.length)) {
+      throw new Error("installed plugin identity/core ABI mismatch or required CUDA plugins missing");
+    }
+    verifyFiles(metaRoot, installedFiles(entry, { ...checksums.files,
+      ...(receipt.components.length ? manifest.files : {}) }));
+    return { ...receipt, plugins: receipt.components.length ? manifest.components : [] };
+  }
+  const components = checksums.schemaVersion === 2 ? entry.components : [];
+  for (const component of components) {
+    verifyComponentPayload(metaRoot, platformRoot, entry, component, expectedVersion);
+  }
+  verifyFiles(metaRoot, Object.fromEntries(Object.entries(checksums.files).map(([file, value]) =>
+    [file === `bin/${entry.binary}` ? "bin/zg.exe" : file, value])));
+  return { target: entry.target, version: expectedVersion, components: components.map((component) => component.package) };
+}
+
+function materializeLegacy({ metaRoot, platformRoot, entry, expectedVersion }) {
   const checksums = verifyPayload(platformRoot, entry, expectedVersion);
 
   const temporaryRoot = join(metaRoot, `.native-${process.pid}.tmp`);
@@ -173,15 +235,7 @@ function materialize({ metaRoot, platformRoot, entry, expectedVersion }) {
     for (const file of new Set(components.map((component) => component.file))) {
       const sources = [];
       for (const component of components.filter((candidate) => candidate.file === file)) {
-        const root = resolvePackageRoot(metaRoot, component.package, platformRoot);
-        verifyPackageIdentity(root, component.package, expectedVersion);
-        const part = JSON.parse(readFileSync(join(root, "checksums.json"), "utf8"));
-        if (part.schemaVersion !== 1 || part.target !== entry.target || part.component !== component.package ||
-            JSON.stringify(Object.keys(part.files ?? {})) !== JSON.stringify([component.payload])) {
-          throw new Error(`invalid native component manifest: ${component.package}`);
-        }
-        verifyFiles(root, part.files);
-        sources.push(checkedPayloadPath(root, component.payload));
+        sources.push(verifyComponentPayload(metaRoot, platformRoot, entry, component, expectedVersion));
       }
       const destination = checkedPayloadPath(temporaryRoot, file);
       mkdirSync(dirname(destination), { recursive: true });
@@ -212,22 +266,138 @@ function materialize({ metaRoot, platformRoot, entry, expectedVersion }) {
 
     mkdirSync(metaBin, { recursive: true });
     const metaLib = join(metaRoot, "lib");
-    rmSync(metaLib, { recursive: true, force: true });
-    renameSync(stagedLib, metaLib);
-
     const finalBinary = join(metaBin, "zg.exe");
     const temporaryBinary = join(metaBin, `.zg-${process.pid}.tmp`);
     copyFileSync(join(stagedBin, entry.binary), temporaryBinary);
     if (process.platform !== "win32") {
       chmodSync(temporaryBinary, 0o755);
     }
-    if (process.platform === "win32") {
-      rmSync(finalBinary, { force: true });
+    const previousLib = join(temporaryRoot, "previous-lib");
+    const previousBinary = join(temporaryRoot, "previous-binary");
+    let movedLib = false;
+    let movedBinary = false;
+    let installedLib = false;
+    try {
+      if (existsSync(metaLib)) { renameSync(metaLib, previousLib); movedLib = true; }
+      if (existsSync(finalBinary)) { renameSync(finalBinary, previousBinary); movedBinary = true; }
+      renameSync(stagedLib, metaLib);
+      installedLib = true;
+      renameSync(temporaryBinary, finalBinary);
+    } catch (error) {
+      if (installedLib) rmSync(metaLib, { recursive: true, force: true });
+      if (movedLib) renameSync(previousLib, metaLib);
+      if (movedBinary) renameSync(previousBinary, finalBinary);
+      throw error;
+    } finally {
+      rmSync(temporaryBinary, { force: true });
     }
-    renameSync(temporaryBinary, finalBinary);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
+}
+
+function installedFiles(entry, files) {
+  return Object.fromEntries(Object.entries(files).map(([file, value]) =>
+    [file === `bin/${entry.binary}` ? "bin/zg.exe" : file, value]));
+}
+
+function writeReceipt(metaRoot, receipt) {
+  const temporary = join(metaRoot, `.native-install-${process.pid}.json`);
+  writeFileSync(temporary, `${JSON.stringify({ schemaVersion: 1, target: receipt.target,
+    version: receipt.version, coreId: receipt.coreId, components: receipt.components }, null, 2)}\n`);
+  renameSync(temporary, join(metaRoot, "native-install.json"));
+}
+
+function installLock(metaRoot, action) {
+  mkdirSync(metaRoot, { recursive: true });
+  const path = join(metaRoot, ".native-install.lock");
+  if (existsSync(path)) {
+    const pid = Number(readFileSync(path, "utf8"));
+    if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("invalid installation lock; inspect .native-install.lock before retrying");
+    let alive = true;
+    try { process.kill(pid, 0); } catch (error) { if (error.code === "ESRCH") alive = false; }
+    if (alive) throw new Error("another native installation is in progress; retry after it finishes");
+    rmSync(path);
+  }
+  const fd = openSync(path, "wx");
+  try {
+    writeFileSync(fd, String(process.pid));
+    return action();
+  } finally { closeSync(fd); rmSync(path, { force: true }); }
+}
+
+function assemblePlugins(manifest, config, temporary, fetchArchive) {
+  for (const [index, component] of manifest.components.entries()) {
+    const archive = fetchArchive(component, manifest, config);
+    const part = join(temporary, `part-${index}`);
+    plugins.extractPayload(archive, component, manifest, part);
+    const destination = checkedPayloadPath(temporary, component.file);
+    mkdirSync(dirname(destination), { recursive: true });
+    const input = openSync(part, "r");
+    const output = openSync(destination, "a", 0o644);
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    try {
+      let count;
+      while ((count = readSync(input, buffer, 0, buffer.length, null))) {
+        let offset = 0;
+        while (offset < count) offset += writeSync(output, buffer, offset, count - offset);
+      }
+    } finally { closeSync(input); closeSync(output); rmSync(part); }
+  }
+  verifyFiles(temporary, manifest.files);
+}
+
+function materialize(options) {
+  const { metaRoot, platformRoot, entry, expectedVersion } = options;
+  const config = options.config || plugins.settings();
+  // Base corruption and invalid metadata are never optional failures.
+  const checksums = verifyPayload(platformRoot, entry, expectedVersion);
+  return installLock(metaRoot, () => {
+    if (checksums.schemaVersion !== 3) {
+      materializeLegacy(options);
+      if (config.mode === "cuda" && checksums.schemaVersion !== 2) throw new Error("this native package has no CUDA plugin support");
+      return verifyInstallation(options);
+    }
+    const manifest = readPlugins(platformRoot, entry, expectedVersion, checksums);
+    let installed;
+    try { installed = verifyInstallation(options); } catch { /* bootstrap or repair from the verified base */ }
+    if (!installed) {
+      materializeLegacy(options);
+      installed = { schemaVersion: 1, target: entry.target, version: expectedVersion,
+        coreId: manifest.coreId, components: [] };
+      writeReceipt(metaRoot, installed);
+    }
+    if (config.mode === "cpu") return installed;
+    if (installed.components.length) return installed;
+    const wantsCuda = config.mode === "cuda" || (options.detectNvidia || plugins.detectNvidia)();
+    if (!wantsCuda) {
+      console.log("zvec-grep: CPU runtime installed; CUDA can be added with ZG_INSTALL_ACCELERATOR=cuda npm rebuild");
+      return installed;
+    }
+    const temporary = mkdtempSync(join(metaRoot, ".plugins-"));
+    const activated = [];
+    try {
+      assemblePlugins(manifest, config, temporary, options.fetchArchive || plugins.componentArchive);
+      // Every complete library is verified before activation. Core files are
+      // untouched. Stop zg/daemon before installing; locked Windows DLLs fail.
+      for (const file of Object.keys(manifest.files)) {
+        const destination = checkedPayloadPath(metaRoot, file);
+        mkdirSync(dirname(destination), { recursive: true });
+        if (existsSync(destination)) throw new Error(`plugin destination is occupied: ${file}; stop zg and retry`);
+        renameSync(checkedPayloadPath(temporary, file), destination);
+        activated.push(destination);
+      }
+      writeReceipt(metaRoot, { ...installed, components: manifest.components.map((c) => c.package) });
+      console.log("zvec-grep: verified CUDA plugins installed; restart any running zg daemon. Host CUDA libraries/drivers are still required.");
+      return verifyInstallation({ ...options, requireCuda: true });
+    } catch (error) {
+      for (const path of activated.reverse()) rmSync(path, { force: true });
+      writeReceipt(metaRoot, installed);
+      if (config.mode === "cuda") throw error;
+      console.warn(`zvec-grep: optional CUDA installation failed: ${error.message}; CPU remains usable. Retry with ZG_INSTALL_ACCELERATOR=cuda npm rebuild.`);
+      return installed;
+    } finally { rmSync(temporary, { recursive: true, force: true }); }
+  });
 }
 
 function resolvePackageRoot(metaRoot, packageName, platformRoot = metaRoot) {
@@ -280,6 +450,8 @@ module.exports = {
   resolvePlatformRoot,
   selectPlatform,
   verifyPayload,
+  verifyInstallation,
+  readPlugins,
 };
 
 if (require.main === module) {

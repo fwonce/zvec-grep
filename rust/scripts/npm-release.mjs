@@ -17,7 +17,6 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   cargoPackageVersion,
-  componentDependencies,
   buildNative,
   existingNativeBuild,
   loadReleaseManifest,
@@ -26,6 +25,7 @@ import {
   run,
   selectPlatform,
   sha256File,
+  hashFile,
   stageRuntimeBundle,
   stageComponentPayload,
   stageZvecRuntime,
@@ -34,6 +34,7 @@ import {
 } from "./npm-package-core.mjs";
 import {
   collectRelease,
+  stageVerificationMetadata,
   promoteRelease,
   publishRelease,
 } from "./npm-release-registry.mjs";
@@ -43,10 +44,11 @@ import {
 } from "./npm-release-compliance.mjs";
 import {
   rollbackVersion,
+  installArtifactRelease,
   smokeArtifactRelease,
-  smokeInstalledPackage,
   smokeRegistryRelease,
 } from "./npm-release-smoke.mjs";
+import { coreIdentity, packageFilename } from "../npm/meta/plugins.cjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 let releaseRoot = join(workspaceDir, "dist", "npm", "release");
@@ -81,6 +83,9 @@ function parseOptions(args) {
       ["--target", "target"],
       ["--targets", "targets"],
       ["--output-dir", "outputDir"],
+      ["--tarball-dir", "tarballDir"],
+      ["--prefix-root", "prefixRoot"],
+      ["--accelerator", "accelerator"],
     ]);
     const field = fields.get(argument);
     if (field) {
@@ -91,7 +96,7 @@ function parseOptions(args) {
       options[field] =
         field === "targets"
           ? value.split(",").map((target) => target.trim())
-          : field === "target"
+          : ["target", "accelerator"].includes(field)
             ? value
             : resolve(value);
       index += 1;
@@ -207,6 +212,7 @@ async function packPlatform(options) {
   const destination = join(stagingRoot, entry.target);
   const components = bundleDir ? entry.components ?? [] : [];
   const componentDirectories = [];
+  const tarballs = [];
   await replaceDirectory(destination, async (temporary) => {
     const binDir = join(temporary, "bin");
     const libDir = join(temporary, "lib");
@@ -254,11 +260,28 @@ async function packPlatform(options) {
       componentDirectories.push(directory);
     }
     if (components.length) {
-      checksums.schemaVersion = 2;
-      checksums.components = components.map((component) => component.package);
+      const pluginFiles = {};
       for (const file of new Set(components.map((component) => component.file))) {
+        pluginFiles[file] = checksums.files[file];
+        delete checksums.files[file];
         await rm(join(temporary, file));
       }
+      checksums.schemaVersion = 3;
+      checksums.coreId = coreIdentity(entry.target, version, checksums.files);
+      const pinned = [];
+      for (const [index, directory] of componentDirectories.entries()) {
+        const component = components[index];
+        const tarball = await packDirectory(directory);
+        tarballs.push(tarball);
+        const payload = JSON.parse(await readFile(join(directory, "checksums.json"), "utf8"));
+        pinned.push({ ...component, version, tarball: packageFilename(component.package, version),
+          archiveBytes: (await stat(tarball)).size,
+          integrity: `sha512-${await hashFile(tarball, "sha512", "base64")}`,
+          checksum: payload.files[component.payload] });
+      }
+      await writeFile(join(temporary, "plugins.json"), `${JSON.stringify({ schemaVersion: 1,
+        target: entry.target, version, coreId: checksums.coreId, components: pinned, files: pluginFiles }, null, 2)}\n`);
+      checksums.pluginsSha256 = await sha256File(join(temporary, "plugins.json"));
     }
     await stageCompliance(
       join(workspaceDir, "npm", "compliance", entry.target),
@@ -273,14 +296,16 @@ async function packPlatform(options) {
       repository: "https://github.com/zvec-ai/zvec-grep",
       os: [entry.os],
       cpu: [entry.cpu],
-      files: ["bin", "lib", "checksums.json", "README.md", "LICENSES", "SBOM.spdx.json"],
+      files: ["bin", "lib", "checksums.json", "plugins.json", "README.md", "LICENSES", "SBOM.spdx.json"],
       publishConfig: { access: "public", provenance: true },
-      ...(components.length ? { dependencies: componentDependencies(entry, version) } : {}),
       zvecGrep: {
+        // variant describes compiled capabilities, never installed plugins.
         variant: bundleDir ? "cuda" : "cpu",
         accelerators: bundleDir ? ["cpu", "cuda"]
           : entry.os === "darwin" ? ["cpu", "metal"]
           : entry.os === "win32" ? ["cpu", "directml"] : ["cpu"],
+        ...(components.length ? { bundledAccelerators: ["cpu"], pluginManifest: "plugins.json",
+          coreId: checksums.coreId } : {}),
       },
     };
     if (entry.libc) {
@@ -299,8 +324,6 @@ async function packPlatform(options) {
       `# ${entry.package}\n\nNative ${bundleDir ? "CPU/CUDA" : "CPU"} zvec-grep payload for ${entry.target}. Install @zvec/zvec-grep instead.\n`,
     );
   });
-  const tarballs = [];
-  for (const directory of componentDirectories) tarballs.push(await packDirectory(directory));
   const tarball = await packDirectory(destination);
   tarballs.push(tarball);
   console.log(`packed ${entry.package}@${version}: ${tarball}`);
@@ -327,7 +350,7 @@ async function packMeta() {
       license: "Apache-2.0",
       repository: "https://github.com/zvec-ai/zvec-grep",
       bin: { zg: "bin/zg.exe" },
-      files: ["bin", "install.cjs", "platforms.json", "README.md"],
+      files: ["bin", "install.cjs", "plugins.cjs", "platforms.json", "README.md"],
       scripts: { postinstall: "node install.cjs" },
       engines: { node: manifest.nodeEngine },
       optionalDependencies,
@@ -361,36 +384,6 @@ async function verifyManifest() {
   );
 }
 
-async function smokeCurrent(options) {
-  const platform = await packPlatform(options);
-  const meta = await packMeta();
-  const prefix = join(releaseRoot, "smoke-prefix");
-  await rm(prefix, { recursive: true, force: true });
-  run(
-    "npm",
-    [
-      "install",
-      "--global",
-      "--prefix",
-      prefix,
-      "--no-audit",
-      "--no-fund",
-      `--allow-scripts=${meta.tarball}`,
-      ...platform.tarballs,
-      meta.tarball,
-    ],
-    { env: npmEnvironment(cacheRoot) },
-  );
-
-  await smokeInstalledPackage({
-    manifest: loadReleaseManifest(),
-    entry: platform.entry,
-    version: platform.version,
-    prefix,
-    fixtureRoot: join(releaseRoot, "smoke-workspace"),
-  });
-}
-
 async function main() {
   const command = process.argv[2];
   const options = parseOptions(process.argv.slice(3));
@@ -402,6 +395,15 @@ async function main() {
   }
   if (options.targets !== undefined && command !== "collect") {
     throw new Error("--targets is only supported by collect");
+  }
+  if ((options.accelerator || options.prefixRoot) && !["smoke-artifacts", "install-artifacts"].includes(command)) {
+    throw new Error("--accelerator and --prefix-root are only supported by artifact installation/verification");
+  }
+  if (options.tarballDir) {
+    if (!["smoke-artifacts", "install-artifacts"].includes(command)) {
+      throw new Error("--tarball-dir is only supported by install-artifacts and smoke-artifacts");
+    }
+    tarballRoot = options.tarballDir;
   }
   if (command === "build") {
     await buildNative(currentPlatform(loadReleaseManifest()), options);
@@ -431,27 +433,31 @@ async function main() {
     );
     return;
   }
-  if (command === "smoke-current") {
-    await smokeCurrent(options);
-    return;
-  }
-  if (command === "smoke-artifacts") {
-    await smokeArtifactRelease({
+  if (command === "smoke-artifacts" || command === "install-artifacts") {
+    const install = command === "smoke-artifacts" ? smokeArtifactRelease : installArtifactRelease;
+    const result = await install({
       manifest: loadReleaseManifest(),
       release: JSON.parse(await readFile(join(tarballRoot, "release.json"), "utf8")),
       tarballRoot,
-      prefixRoot: join(releaseRoot, "artifact-smoke"),
+      prefixRoot: options.prefixRoot ?? join(releaseRoot, "artifact-smoke"),
+      target: options.target,
+      accelerator: options.accelerator ?? "cpu",
     });
+    if (process.env.GITHUB_OUTPUT) {
+      await appendFile(process.env.GITHUB_OUTPUT,
+        `bundle=${relative(workspaceDir, result.bundle).split(sep).join("/")}\n`);
+    }
     return;
   }
   if (command === "collect") {
     await packMeta();
-    await collectRelease({
+    const release = await collectRelease({
       manifest: loadReleaseManifest(),
       version: cargoPackageVersion(),
       tarballRoot,
       targets: options.targets,
     });
+    await stageVerificationMetadata({ release, tarballRoot, destination: join(releaseRoot, "verification") });
     return;
   }
   if (command === "publish") {
@@ -484,7 +490,7 @@ async function main() {
     return;
   }
   throw new Error(
-    "usage: npm-release.mjs <build|verify|verify-publication|pack-platform|pack-meta|pack-current|smoke-current|smoke-artifacts|collect|publish|promote|rollback-version|smoke-registry> [--target TARGET] [--targets TARGET,... (collect only)] [--binary PATH] [--lib-dir PATH] [--bundle-dir PATH] [--output-dir PATH] [--cpu-only] [--no-build]",
+    "usage: npm-release.mjs <build|verify|verify-publication|pack-platform|pack-meta|pack-current|install-artifacts|smoke-artifacts|collect|publish|promote|rollback-version|smoke-registry> [--target TARGET] [--targets TARGET,... (collect only)] [--binary PATH] [--lib-dir PATH] [--bundle-dir PATH] [--output-dir PATH] [--tarball-dir PATH] [--prefix-root PATH] [--accelerator cpu|auto|cuda (artifact installation/verification only)] [--cpu-only] [--no-build]",
   );
 }
 

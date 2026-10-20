@@ -91,7 +91,7 @@ jobs:
             throw new Error('npm publishing requires platform=all; subsets are validation-only candidates');
           }
           const selected = platforms.filter(p => platform === 'all' || p.target === platform);
-          const cpu = selected.filter(p => p.gpu_runner).map(({ target, runner }) => ({ target, runner }));
+          const cpu = selected.map(({ target, runner, gpu_runner }) => ({ target, runner, cuda_package: Boolean(gpu_runner) }));
           const gpu = selected.filter(p => p.gpu_runner).map(({ target, gpu_runner }) => ({ target, runner: gpu_runner }));
           const outputs = {
             matrix: JSON.stringify({ include: selected }),
@@ -149,7 +149,7 @@ jobs:
   artifact-gpu-smoke:
     name: Verify CPU-built CUDA package on GPU (${{ matrix.target }})
     if: needs.source.outputs.run_cuda == 'true'
-    needs: [source, build]
+    needs: [source, collect]
     runs-on:
       group: gpu-runners
       labels: ${{ matrix.runner }}
@@ -183,6 +183,11 @@ jobs:
         with:
           name: rust-native-${{ matrix.target }}
           path: rust/dist/npm/release/tarballs
+      - name: Download the collected meta package and release inventory
+        uses: actions/download-artifact@v8
+        with:
+          name: rust-verification-${{ needs.source.outputs.version }}
+          path: rust/dist/npm/release/tarballs
       - name: Verify GGUF and ONNX CUDA without rebuilding
         uses: ./.github/actions/cuda-cli-e2e
         with:
@@ -190,12 +195,8 @@ jobs:
 
   collect:
     name: Collect selected downloadable packages
-    # A deliberately skipped GPU job is allowed only when GPU validation was not requested.
-    if: >-
-      ${{ !cancelled() && needs.source.result == 'success' && needs.build.result == 'success' &&
-          ((needs.source.outputs.run_cuda == 'true' && needs.artifact-gpu-smoke.result == 'success') ||
-           (needs.source.outputs.run_cuda == 'false' && needs.artifact-gpu-smoke.result == 'skipped')) }}
-    needs: [source, build, artifact-gpu-smoke]
+    # Collection proves completeness/identity, not runtime validation or publication approval.
+    needs: [source, build]
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -227,9 +228,16 @@ jobs:
           path: rust/dist/npm/release/tarballs/
           if-no-files-found: error
           retention-days: 14
+      - name: Upload shared verification inputs without duplicating native payloads
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-verification-${{ needs.source.outputs.version }}
+          path: rust/dist/npm/release/verification/
+          if-no-files-found: error
+          retention-days: 14
 
   artifact-cpu-smoke:
-    name: Verify CUDA artifacts on CPU (${{ matrix.target }})
+    name: Verify installed artifacts on CPU (${{ matrix.target }})
     if: >-
       ${{ !cancelled() && needs.source.result == 'success' && needs.collect.result == 'success' &&
           needs.source.outputs.has_cpu == 'true' }}
@@ -259,15 +267,20 @@ jobs:
         run: npm install --global npm@11.21.0
       - uses: actions/download-artifact@v8
         with:
-          name: ${{ needs.source.outputs.artifact_name }}
+          name: rust-native-${{ matrix.target }}
+          path: rust/dist/npm/release/tarballs
+      - uses: actions/download-artifact@v8
+        with:
+          name: rust-verification-${{ needs.source.outputs.version }}
           path: rust/dist/npm/release/tarballs
       - name: Restore the real model cache
+        if: matrix.cuda_package
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/zvec-grep-model-cache
           key: cuda-cli-models-v1-${{ runner.os }}-${{ hashFiles('rust/crates/zg-engine/src/models/catalog/**', 'rust/scripts/cuda/e2e.py') }}
       - name: Install and exercise the downloaded artifacts without Linux CUDA libraries
-        if: runner.os == 'Linux'
+        if: matrix.target == 'linux-x64-gnu'
         shell: bash
         working-directory: ${{ github.workspace }}
         run: |
@@ -301,24 +314,32 @@ jobs:
             --bundle dist/npm/release/artifact-smoke/prefix/node_modules/@zvec/zvec-grep `
             --model-cache "$env:RUNNER_TEMP/zvec-grep-model-cache" --logs ../cpu-logs
       - name: Restore Linux model cache and log ownership
-        if: ${{ always() && runner.os == 'Linux' }}
+        if: ${{ always() && matrix.target == 'linux-x64-gnu' }}
         shell: bash
         working-directory: ${{ github.workspace }}
         run: |
           mkdir -p cpu-logs "${RUNNER_TEMP}/zvec-grep-model-cache"
           sudo chown -R "$(id -u):$(id -g)" cpu-logs "${RUNNER_TEMP}/zvec-grep-model-cache"
+      - name: Install and exercise the macOS and Linux ARM64 artifacts
+        if: ${{ !matrix.cuda_package }}
+        run: npm run release:artifact-smoke
       - name: Retain CPU artifact execution evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
           name: cpu-artifact-evidence-${{ matrix.target }}
-          path: cpu-logs/
+          path: |
+            cpu-logs/
+            rust/dist/npm/release/artifact-smoke/installation.json
           if-no-files-found: warn
           retention-days: 7
 
   publish:
     name: Publish verified candidates to rust-canary
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    if: >-
+      ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.publish &&
+          needs.source.result == 'success' && needs.collect.result == 'success' &&
+          needs.artifact-cpu-smoke.result == 'success' && needs.artifact-gpu-smoke.result == 'success' }}
     needs: [source, collect, artifact-cpu-smoke, artifact-gpu-smoke]
     runs-on: ubuntu-22.04
     permissions:
@@ -356,7 +377,7 @@ jobs:
     name: Verify registry install/update/rollback (${{ matrix.target }})
     if: github.event_name == 'workflow_dispatch' && inputs.publish
     needs: [source, publish]
-    runs-on: ${{ matrix.runner_group != '' && matrix.runner_group != null && fromJSON(format('{{"group":"{0}","labels":"{1}"}}', matrix.runner_group, matrix.runner)) || matrix.runner }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -369,13 +390,11 @@ jobs:
           - target: darwin-arm64
             runner: macos-14
           - target: linux-x64-gnu
-            runner: gpu-linux-t4
-            runner_group: gpu-runners
+            runner: ubuntu-24.04
           - target: linux-arm64-gnu
             runner: ubuntu-24.04-arm
           - target: win32-x64-msvc
-            runner: gpu-windows-t4
-            runner_group: gpu-runners
+            runner: windows-2022
     steps:
       - uses: actions/checkout@v6
         with:

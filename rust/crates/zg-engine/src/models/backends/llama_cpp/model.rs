@@ -4,7 +4,7 @@ use std::{
     num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, PoisonError,
+        Arc, Condvar, Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -43,7 +43,36 @@ use crate::models::{
     },
 };
 
-static LLAMA_BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
+static LLAMA_BACKEND: super::backend_loading::BackendInitialization<InitializedBackend> =
+    super::backend_loading::BackendInitialization::new();
+// ggml's global registry is not synchronized against native readers. Serialize
+// optional plugin registration with model/context creation, not inference.
+#[cfg(not(feature = "cuda"))]
+static LLAMA_BACKEND_ACCESS: StdMutex<()> = StdMutex::new(());
+
+#[cfg(feature = "cuda")]
+type BackendRegistryGuard = zg_llama_native::RegistryGuard;
+#[cfg(not(feature = "cuda"))]
+type BackendRegistryGuard = StdMutexGuard<'static, ()>;
+
+fn lock_backend_registry() -> BackendRegistryGuard {
+    #[cfg(feature = "cuda")]
+    {
+        zg_llama_native::lock_registry()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        LLAMA_BACKEND_ACCESS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+struct InitializedBackend {
+    backend: LlamaBackend,
+    #[cfg(feature = "cuda")]
+    directory: PathBuf,
+}
 
 pub(crate) struct LlamaCppEmbeddingModel {
     entry: LlamaCppConfig,
@@ -242,7 +271,11 @@ impl LlamaCppEmbeddingModel {
         drop(failed);
         let loaded = Arc::new(
             self.compute_runtime
-                .run(move || load_cpu_model(&path))
+                .run(move || {
+                    let registry = lock_backend_registry();
+                    let backend = initialize_llama_backend(false, &registry)?;
+                    load_cpu_model(backend, &path)
+                })
                 .await??,
         );
         *state = Some(Arc::clone(&loaded));
@@ -325,12 +358,13 @@ fn load_model_with_fallback(
     device: Option<Device>,
     reporter: &ModelDownloadProgressReporter,
 ) -> Result<LoadedLlamaModel, ModelError> {
-    llama_backend()?;
     let device = resolve_device(device);
     let wants_gpu = !matches!(device, None | Some(Device::Cpu));
+    let registry = lock_backend_registry();
+    let backend = initialize_llama_backend(wants_gpu, &registry)?;
     if wants_gpu {
         if let Some(selected) = select_gpu_device(device) {
-            match load_gpu_model(path, selected.index) {
+            match load_gpu_model(backend, path, selected.index) {
                 Ok(model) => {
                     tracing::debug!(
                         requested_device = requested_device_name(device),
@@ -359,7 +393,7 @@ fn load_model_with_fallback(
         }
     }
 
-    load_cpu_model(path)
+    load_cpu_model(backend, path)
 }
 
 const fn resolve_device(device: Option<Device>) -> Option<Device> {
@@ -370,14 +404,18 @@ const fn resolve_device(device: Option<Device>) -> Option<Device> {
     }
 }
 
-fn load_gpu_model(path: &Path, device_index: usize) -> Result<LoadedLlamaModel, ModelError> {
+fn load_gpu_model(
+    backend: &LlamaBackend,
+    path: &Path,
+    device_index: usize,
+) -> Result<LoadedLlamaModel, ModelError> {
     let params = LlamaModelParams::default()
         .with_devices(&[device_index])
         .map_err(|error| {
             ModelError::internal("Unable to select llama.cpp GPU device").with_cause(error)
         })?
         .with_n_gpu_layers(u32::MAX);
-    LlamaModel::load_from_file(llama_backend()?, path, &params)
+    LlamaModel::load_from_file(backend, path, &params)
         .map(|model| loaded_llama_model(model, path, true))
         .map_err(|error| {
             ModelError::storage_failure("Unable to load llama.cpp GPU embedding model")
@@ -385,13 +423,22 @@ fn load_gpu_model(path: &Path, device_index: usize) -> Result<LoadedLlamaModel, 
         })
 }
 
-fn load_cpu_model(path: &Path) -> Result<LoadedLlamaModel, ModelError> {
-    let params = LlamaModelParams::default().with_n_gpu_layers(0);
-    LlamaModel::load_from_file(llama_backend()?, path, &params)
+fn load_cpu_model(backend: &LlamaBackend, path: &Path) -> Result<LoadedLlamaModel, ModelError> {
+    let params = cpu_model_params()?;
+    LlamaModel::load_from_file(backend, path, &params)
         .map(|model| loaded_llama_model(model, path, false))
         .map_err(|error| {
             ModelError::storage_failure("Unable to load llama.cpp embedding model")
                 .with_cause(error)
+        })
+}
+
+fn cpu_model_params() -> Result<LlamaModelParams, ModelError> {
+    LlamaModelParams::default()
+        .with_devices(&[])
+        .map(|params| params.with_n_gpu_layers(0))
+        .map_err(|error| {
+            ModelError::internal("Unable to select llama.cpp CPU-only execution").with_cause(error)
         })
 }
 
@@ -766,6 +813,7 @@ fn create_llama_context(
     model: &LlamaModel,
     profile: LlamaContextProfile,
 ) -> Result<LlamaContext<'_>, ModelError> {
+    let registry = lock_backend_registry();
     let params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(profile.context_size))
         .with_n_batch(profile.batch_capacity)
@@ -774,7 +822,7 @@ fn create_llama_context(
         .with_n_threads_batch(profile.threads)
         .with_embeddings(true);
     model
-        .new_context(llama_backend()?, params)
+        .new_context(initialize_llama_backend(false, &registry)?, params)
         .map_err(|error| {
             ModelError::internal("Unable to create llama.cpp embedding context").with_cause(error)
         })
@@ -840,23 +888,45 @@ fn embed_error(entry: LlamaCppConfig, cause: ModelError) -> ModelError {
     )
 }
 
-fn llama_backend() -> Result<&'static LlamaBackend, ModelError> {
-    match LLAMA_BACKEND.get_or_init(|| {
-        #[cfg(feature = "cuda")]
-        load_packaged_llama_backends()?;
-        LlamaBackend::init()
-            .map_err(|error| error.to_string())
-            .map(|mut backend| {
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    // Preserve native offload evidence for --debug / GPU CI.
-                    llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default());
-                } else {
-                    backend.void_logs();
-                }
-                backend
-            })
-    }) {
-        Ok(backend) => Ok(backend),
+// Called only while the registry guard is held. Explicit CPU ignores
+// GGML_BACKEND_PATH: it must not load an arbitrary out-of-tree GPU plugin.
+// GPU requests retain the upstream loader's override behavior.
+fn initialize_llama_backend(
+    wants_gpu: bool,
+    registry: &BackendRegistryGuard,
+) -> Result<&'static LlamaBackend, ModelError> {
+    #[cfg(not(feature = "cuda"))]
+    let _ = registry;
+    let result = LLAMA_BACKEND.initialize(
+        wants_gpu,
+        || {
+            #[cfg(feature = "cuda")]
+            let directory = load_packaged_cpu_backend(registry)?;
+            LlamaBackend::init()
+                .map_err(|error| error.to_string())
+                .map(|mut backend| {
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        // Preserve native offload evidence for --debug / GPU CI.
+                        llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default());
+                    } else {
+                        backend.void_logs();
+                    }
+                    InitializedBackend {
+                        backend,
+                        #[cfg(feature = "cuda")]
+                        directory,
+                    }
+                })
+        },
+        |core| {
+            #[cfg(not(feature = "cuda"))]
+            let _ = core;
+            #[cfg(feature = "cuda")]
+            super::backend_loading::load(&core.directory);
+        },
+    );
+    match result {
+        Ok(core) => Ok(&core.backend),
         Err(error) => {
             Err(ModelError::internal("Unable to initialize llama.cpp backend").with_cause(error))
         }
@@ -864,7 +934,7 @@ fn llama_backend() -> Result<&'static LlamaBackend, ModelError> {
 }
 
 #[cfg(feature = "cuda")]
-fn load_packaged_llama_backends() -> Result<(), String> {
+fn load_packaged_cpu_backend(registry: &BackendRegistryGuard) -> Result<PathBuf, String> {
     let mut candidates = Vec::new();
     if let Some(path) = env::var_os("ZVEC_GREP_NATIVE_LIB_DIR") {
         candidates.push(PathBuf::from(path));
@@ -888,8 +958,9 @@ fn load_packaged_llama_backends() -> Result<(), String> {
         if directory.to_str().is_none() || !contains_ggml_backend(&directory) {
             continue;
         }
-        super::backend_loading::load(&directory);
-        return Ok(());
+        registry.load_cpu_backend(&directory)?;
+        tracing::debug!(path = %directory.display(), "llama.cpp CPU backend library loaded");
+        return Ok(directory);
     }
 
     Err("Unable to locate packaged llama.cpp backend modules; keep them under ../lib relative to zg or set ZVEC_GREP_NATIVE_LIB_DIR".to_owned())

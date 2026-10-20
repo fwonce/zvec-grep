@@ -127,6 +127,23 @@ try {
     }
     Copy-Item -LiteralPath $dataDirectory -Destination (Join-Path $libDirectory "data") -Recurse
 
+    if ($PrimaryOnly) {
+        # Incomplete CI output must not replace a complete local bundle.
+        $bundleDirectory = Join-Path $profileDirectory "zg-cuda-staging"
+    } else {
+        $cuda12Root = if ($env:CUDA12_ROOT) { $env:CUDA12_ROOT } else { $env:CUDA_PATH_V12_4 }
+        if (-not $cuda12Root) { throw "Set CUDA12_ROOT to the CUDA 12.4 toolkit directory" }
+        & python scripts/cuda/build-fallback.py --bundle $stagingDirectory --cuda-root $cuda12Root
+        if ($LASTEXITCODE -ne 0) { throw "Building the CUDA 12.4 fallback failed" }
+        if (-not $SkipAudit) {
+            & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+                -File (Join-Path $scriptDirectory "check.ps1") -Bundle $stagingDirectory
+            if ($LASTEXITCODE -ne 0) {
+                throw "Windows CUDA linkage audit failed with exit code $LASTEXITCODE"
+            }
+        }
+    }
+
     if (Test-Path -LiteralPath $bundleDirectory) {
         Remove-Item -LiteralPath $bundleDirectory -Recurse -Force
     }
@@ -137,18 +154,4 @@ try {
     }
 }
 
-if (-not $PrimaryOnly) {
-    $cuda12Root = if ($env:CUDA12_ROOT) { $env:CUDA12_ROOT } else { $env:CUDA_PATH_V12_4 }
-    if (-not $cuda12Root) { throw "Set CUDA12_ROOT to the CUDA 12.4 toolkit directory" }
-    & python scripts/cuda/build-fallback.py --bundle $bundleDirectory --cuda-root $cuda12Root
-    if ($LASTEXITCODE -ne 0) { throw "Building the CUDA 12.4 fallback failed" }
-}
-if (-not $SkipAudit -and -not $PrimaryOnly) {
-    & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
-        -File (Join-Path $scriptDirectory "check.ps1") `
-        -Bundle $bundleDirectory
-    if ($LASTEXITCODE -ne 0) {
-        throw "Windows CUDA linkage audit failed with exit code $LASTEXITCODE"
-    }
-}
 Write-Host "CUDA bundle: $bundleDirectory"

@@ -2,14 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, truncate, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { componentDependencies, loadReleaseManifest, MAX_NPM_TARBALL_BYTES, nativePackageEntries, run, sha256File } from "./npm-package-core.mjs";
+import { cargoPackageVersion, loadReleaseManifest, MAX_NPM_TARBALL_BYTES, nativePackageEntries, run, sha256File } from "./npm-package-core.mjs";
+import { coreIdentity } from "../npm/meta/plugins.cjs";
+import { materialize, verifyInstallation } from "../npm/meta/install.cjs";
 import {
   checkPublishedPackage,
   collectRelease,
+  stageVerificationMetadata,
   promoteRelease,
   publishRelease,
 } from "./npm-release-registry.mjs";
@@ -81,22 +84,31 @@ async function releaseFixture(
               ]),
             ),
           }
-        : { os: [platform.os], cpu: [platform.cpu], ...(platform.libc ? { libc: [platform.libc] } : {}),
-            ...(!platform.component && platform.components?.length
-              ? { dependencies: componentDependencies(platform, entry.version) } : {}) }),
+        : { os: [platform.os], cpu: [platform.cpu], ...(platform.libc ? { libc: [platform.libc] } : {}) }),
     };
     mutateMetadata?.(platform.target, metadata);
     await writeFile(join(directory, "package.json"), JSON.stringify(metadata));
     if (platform.target !== "meta") {
       const component = platform.components?.find((candidate) => candidate.package === platform.component);
-      const checksums = { schemaVersion: !component && platform.components?.length ? 2 : 1,
+      const empty = { bytes: 0, sha256: createHash("sha256").update("").digest("hex") };
+      const checksums = { schemaVersion: !component && platform.components?.length ? 3 : 1,
         target: platform.target,
-        ...(component ? { component: component.package, files: { [component.payload]: {} } }
-          : platform.components?.length ? {
-              components: platform.components.map((candidate) => candidate.package),
-              files: Object.fromEntries(platform.components.map((candidate) => [candidate.file, {}])),
-            } : {}),
+        ...(component ? { component: component.package, files: { [component.payload]: empty } }
+          : { files: { [`bin/${platform.binary}`]: empty } }),
       };
+      if (!component && platform.components?.length) {
+        checksums.coreId = coreIdentity(platform.target, entry.version, checksums.files);
+        const plugins = { schemaVersion: 1, target: platform.target, version: entry.version,
+          coreId: checksums.coreId, files: Object.fromEntries(platform.components.map((c) => [c.file, empty])),
+          components: platform.components.map((component) => {
+            const pkg = packages.find((pkg) => pkg.name === component.package);
+            return { ...component, version: entry.version, checksum: empty,
+              tarball: pkg.file, archiveBytes: pkg.bytes, integrity: pkg.integrity };
+          }) };
+        const raw = JSON.stringify(plugins);
+        checksums.pluginsSha256 = createHash("sha256").update(raw).digest("hex");
+        await writeFile(join(directory, "plugins.json"), raw);
+      }
       mutateChecksums?.(platform.target, checksums);
       await writeFile(
         join(directory, "checksums.json"),
@@ -139,6 +151,7 @@ async function releaseFixture(
       ...(platform.component ? { component: platform.component } : {}),
       version: entry.version,
       file,
+      bytes: (await readFile(path)).length,
       sha256: await sha256File(path),
       integrity: `sha512-${createHash("sha512")
         .update(await readFile(path))
@@ -233,6 +246,21 @@ test("default collection still requires every platform and treats all targets as
     collectRelease({ ...fixture, version: entry.version }),
     /do not cover exactly/,
   );
+});
+
+test("verification metadata copies collected bytes without repacking native artifacts", async (t) => {
+  const targets = ["linux-x64-gnu"];
+  const fixture = await releaseFixture(t, { targets });
+  const release = await collectRelease({ ...fixture, version: entry.version, targets });
+  const destination = join(fixture.tarballRoot, "verification");
+  await stageVerificationMetadata({ ...fixture, release, destination });
+  const meta = release.packages.find((pkg) => pkg.target === "meta");
+  assert.deepEqual((await readdir(destination)).sort(), [meta.file, "release.json", "SHA256SUMS", "README.md"].sort());
+  assert.equal(await sha256File(join(destination, meta.file)), meta.sha256);
+  assert.equal(await readFile(join(destination, "release.json"), "utf8"), await readFile(join(fixture.tarballRoot, "release.json"), "utf8"));
+  for (const pkg of release.packages) assert.equal(await sha256File(join(fixture.tarballRoot, pkg.file)), pkg.sha256);
+  await writeFile(join(fixture.tarballRoot, meta.file), "changed after collection");
+  await assert.rejects(stageVerificationMetadata({ ...fixture, release, destination }), /invalid collected meta package/);
 });
 
 test("collection rejects empty, duplicate, and unknown target selections", async (t) => {
@@ -483,14 +511,14 @@ test("oversized candidates fail collection and publication before any npm mutati
   }
 });
 
-test("collection requires every component and exact dependency versions", async (t) => {
+test("collection requires every referenced component and rejects mandatory CUDA dependencies", async (t) => {
   const targets = ["linux-x64-gnu"];
   const missing = await releaseFixture(t, { targets });
   const component = missing.packages.find((pkg) => pkg.component?.endsWith("ort-cuda-part2"));
   await rm(join(missing.tarballRoot, component.file));
   await assert.rejects(collectRelease({ ...missing, version: entry.version, targets }), /do not cover exactly/);
   const wrongVersion = await releaseFixture(t, { targets, mutateMetadata: (_, metadata) => {
-    if (metadata.dependencies) metadata.dependencies[Object.keys(metadata.dependencies)[0]] = "0.0.2";
+    if (metadata.name === "@zvec/zvec-grep-linux-x64-gnu") metadata.dependencies = { "@zvec/zvec-grep-linux-x64-gnu-ggml-cuda13": "0.0.2" };
   } });
   await assert.rejects(collectRelease({ ...wrongVersion, version: entry.version, targets }), /does not lock every runtime component/);
 });
@@ -509,3 +537,37 @@ test("components publish before the base package that depends on them", async (t
     }
   }
 });
+
+for (const target of ["linux-x64-gnu", "win32-x64-msvc"]) {
+  test(`actual npm packing pins plugin bytes and collects an installable ${target} candidate`, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), "zg-plugin-pack-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const platform = loadReleaseManifest().platforms.find((p) => p.target === target);
+    const bundle = join(root, "bundle");
+    const files = [`bin/${platform.binary}`, `lib/${platform.os === "win32" ? "zvec_c_api.dll" : "libzvec_c_api.so"}`,
+      "lib/data/jieba_dict/jieba.dict.utf8", "lib/data/jieba_dict/hmm_model.utf8",
+      ...new Set(platform.components.map((c) => c.file))];
+    for (const file of files) {
+      await mkdir(join(bundle, file, ".."), { recursive: true });
+      await writeFile(join(bundle, file), `fixture only, never executed: ${file}\n`);
+    }
+    const output = join(root, "release");
+    const script = fileURLToPath(new URL("./npm-release.mjs", import.meta.url));
+    run(process.execPath, [script, "pack-platform", "--target", target, "--no-build",
+      "--bundle-dir", bundle, "--output-dir", output], { capture: true });
+    run(process.execPath, [script, "collect", "--targets", target, "--output-dir", output], { capture: true });
+    const release = JSON.parse(await readFile(join(output, "tarballs/release.json"), "utf8"));
+    assert.equal(release.partial, true);
+    assert.equal(release.packages.length, platform.components.length + 2);
+    const platformRoot = join(output, "staging", target);
+    const metadata = JSON.parse(await readFile(join(platformRoot, "package.json"), "utf8"));
+    assert.equal(metadata.dependencies, undefined);
+    assert.deepEqual(metadata.zvecGrep.bundledAccelerators, ["cpu"]);
+    const options = { entry: platform, expectedVersion: cargoPackageVersion(), platformRoot, metaRoot: join(root, "installed"),
+      config: { mode: "cpu", directory: join(output, "tarballs"), cache: join(root, "cache"), offline: true } };
+    materialize(options);
+    assert.deepEqual(verifyInstallation(options).components, []);
+    materialize({ ...options, config: { ...options.config, mode: "cuda" } });
+    assert.equal(verifyInstallation({ ...options, requireCuda: true }).components.length, platform.components.length);
+  });
+}

@@ -123,9 +123,8 @@ jobs:
             rust/target/release/
             rust/target/ggml-cuda12/
             rust/target/.zvec-grep-cuda-build-config
-          key: rust-release-v2-${{ inputs.target }}-${{ inputs.runner }}-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml') }}-${{ github.sha }}
-          restore-keys: |
-            rust-release-v2-${{ inputs.target }}-${{ inputs.runner }}-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml') }}-
+          # Per-commit keys would exhaust the 10 GB repository cache quota and evict Rust CI caches.
+          key: rust-release-v3-${{ inputs.target }}-${{ inputs.runner }}-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml') }}
       - name: Restore the CUDA 12 ONNX Runtime archives
         if: inputs.target == 'win32-x64-msvc' || inputs.target == 'linux-x64-gnu'
         uses: actions/cache@v5
@@ -202,8 +201,8 @@ jobs:
             --env CARGO_TARGET_DIR=/work-target \
             --env CARGO_BUILD_JOBS --env CMAKE_BUILD_PARALLEL_LEVEL \
             zvec-grep-cuda12-builder bash -euo pipefail -c '
-              python3 scripts/cuda/build-fallback.py --bundle /work-target/release/zg-cuda
-              bash scripts/cuda/check.sh /work-target/release/zg-cuda
+              python3 scripts/cuda/build-fallback.py --bundle /work-target/release/zg-cuda-staging
+              bash scripts/cuda/check.sh /work-target/release/zg-cuda-staging
             '
       - name: Restore ownership of Linux build output
         if: ${{ always() && inputs.target == 'linux-x64-gnu' }}
@@ -214,7 +213,7 @@ jobs:
         run: |
           docker run --rm --platform linux/amd64 \
             --volume "${GITHUB_WORKSPACE}:/workspace:ro" \
-            --volume "${GITHUB_WORKSPACE}/rust/target/release/zg-cuda:/opt/zg:ro" \
+            --volume "${GITHUB_WORKSPACE}/rust/target/release/zg-cuda-staging:/opt/zg:ro" \
             ubuntu:24.04 bash -euo pipefail -c '
               apt-get update >/dev/null
               apt-get install --yes --no-install-recommends libstdc++6 >/dev/null
@@ -252,7 +251,7 @@ jobs:
           toolset: "14.38"
       - name: Build the Windows CUDA 12.4 fallback plugin
         if: inputs.target == 'win32-x64-msvc'
-        run: python scripts/cuda/build-fallback.py --bundle target/release/zg-cuda --cuda-root "$env:CUDA_PATH"
+        run: python scripts/cuda/build-fallback.py --bundle target/release/zg-cuda-staging --cuda-root "$env:CUDA_PATH"
       - name: Build the native target
         if: inputs.target != 'linux-x64-gnu' && inputs.target != 'win32-x64-msvc'
         run: npm run build
@@ -274,7 +273,7 @@ jobs:
         run: >-
           powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass
           -File scripts/cuda/check.ps1
-          -Bundle target/release/zg-cuda
+          -Bundle target/release/zg-cuda-staging
       - name: Apply local macOS signatures after building
         if: runner.os == 'macOS'
         run: |
@@ -285,13 +284,11 @@ jobs:
             fi
           done
       - name: Package the native target
-        run: npm run release:platform -- --no-build --target ${{ inputs.target }} ${{ (inputs.target == 'linux-x64-gnu' || inputs.target == 'win32-x64-msvc') && '--bundle-dir target/release/zg-cuda' || '' }}
-      - name: Install the tarballs and run the packaged CLI
-        run: npm run release:smoke -- --no-build --target ${{ inputs.target }} ${{ (inputs.target == 'linux-x64-gnu' || inputs.target == 'win32-x64-msvc') && '--bundle-dir target/release/zg-cuda' || '' }}
+        run: npm run release:platform -- --no-build --target ${{ inputs.target }} ${{ (inputs.target == 'linux-x64-gnu' || inputs.target == 'win32-x64-msvc') && '--bundle-dir target/release/zg-cuda-staging' || '' }}
       - name: Upload the platform package
         uses: actions/upload-artifact@v7
         with:
           name: rust-native-${{ inputs.target }}
-          path: rust/dist/npm/release/tarballs/zvec-zvec-grep-${{ inputs.target }}-*.tgz
+          path: rust/dist/npm/release/tarballs/*.tgz
           if-no-files-found: error
           retention-days: 14

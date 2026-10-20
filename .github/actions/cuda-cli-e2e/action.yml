@@ -5,61 +5,14 @@ inputs:
     description: Native npm target downloaded from the current workflow run.
     required: true
   package_directory:
-    description: Workspace-relative directory containing the platform and every component tarball.
+    description: Workspace-relative directory containing release.json, meta, platform and component tarballs.
     default: rust/dist/npm/release/tarballs
 runs:
   using: composite
   steps:
-    - name: Install and assemble the actual native npm components
-      shell: python
-      env:
-        TARGET: ${{ inputs.target }}
-        PACKAGE_DIRECTORY: ${{ inputs.package_directory }}
-      working-directory: ${{ github.workspace }}
-      run: |
-        import json, os, pathlib, re, subprocess, tarfile
-        pattern = "zvec-zvec-grep-" + os.environ["TARGET"] + "-*.tgz"
-        packages = list(pathlib.Path(os.environ["PACKAGE_DIRECTORY"]).glob(pattern))
-        base_pattern = re.compile(r"zvec-zvec-grep-" + re.escape(os.environ["TARGET"]) + r"-\d.*\.tgz$")
-        bases = [p for p in packages if base_pattern.fullmatch(p.name)]
-        assert len(bases) == 1, "Expected exactly one base platform tarball"
-        with tarfile.open(bases[0], "r:gz") as archive:
-            metadata = json.load(archive.extractfile("package/package.json"))
-        manifest = json.loads(pathlib.Path("rust/npm/platforms.json").read_text())
-        entry = next(e for e in manifest["platforms"] if e["target"] == os.environ["TARGET"])
-        names = [c["package"] for c in entry.get("components", [])] + [entry["package"]]
-        expected = {n.removeprefix("@").replace("/", "-") + "-" + metadata["version"] + ".tgz" for n in names}
-        assert {p.name for p in packages} == expected, "Missing or extra native component tarballs"
-        subprocess.run(["npm.cmd" if os.name == "nt" else "npm", "install", "--prefix",
-                        "gpu-install", "--offline", "--no-audit", "--no-fund", "--ignore-scripts",
-                        *[str(p.resolve()) for p in packages]], check=True)
-        package = pathlib.Path("gpu-install/node_modules/@zvec") / ("zvec-grep-" + os.environ["TARGET"])
-        subprocess.run(["node", "-e", """
-        const assert = require('node:assert/strict');
-        const { lstatSync, readFileSync, writeFileSync } = require('node:fs');
-        const { basename, join } = require('node:path');
-        const { materialize } = require('./rust/npm/meta/install.cjs');
-        const manifest = require('./rust/npm/platforms.json');
-        const entry = manifest.platforms.find(entry => entry.target === process.env.TARGET);
-        assert(entry && entry.defaultVariant === 'cuda', 'Expected a supported CUDA target');
-        const packageRoot = process.argv[1];
-        const metadata = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
-        assert.equal(metadata.name, entry.package);
-        assert.deepEqual(metadata.os, [entry.os]);
-        assert.deepEqual(metadata.cpu, [entry.cpu]);
-        assert.equal(metadata.zvecGrep?.variant, 'cuda', 'Expected CUDA npm package');
-        assert.deepEqual(metadata.zvecGrep.accelerators, ['cpu', 'cuda']);
-        assert.equal(basename(process.argv[2]),
-          `${entry.package.replace(/^@/, '').replaceAll('/', '-')}-${metadata.version}.tgz`);
-        for (const directory of ['bin', 'lib']) {
-          assert(lstatSync(join(packageRoot, directory)).isDirectory(),
-            `${directory} must be a real directory, not a symlink`);
-        }
-        const bundle = 'gpu-install/assembled';
-        materialize({ metaRoot: bundle, platformRoot: packageRoot, entry, expectedVersion: metadata.version });
-        writeFileSync(join(bundle, 'package.json'), JSON.stringify({ bin: { zg: 'bin/zg.exe' } }));
-        console.log('Verified assembled native payload:', metadata.name, metadata.version, metadata.zvecGrep);
-        """, str(package), str(bases[0])], check=True)
+    - name: Install the release npm version
+      shell: bash
+      run: npm install --global npm@11.21.0
     - name: Cache the two public test models
       uses: actions/cache@v5
       with:
@@ -107,7 +60,15 @@ runs:
         }) -join ';'
         python -c "import os,pathlib; assert not any((pathlib.Path(p)/'cublas64_13.dll').is_file() for p in os.environ['PATH'].split(os.pathsep) if p), 'CUDA 13 must be hidden for the fallback test'"
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        python rust/scripts/cuda/e2e.py --bundle gpu-install/assembled --model-cache "$env:RUNNER_TEMP/zvec-grep-model-cache" --logs gpu-logs/cuda12 --expected-gguf-cuda 12.4
+        New-Item -ItemType Directory -Force gpu-logs | Out-Null
+        node rust/scripts/npm-release.mjs install-artifacts --target "${{ inputs.target }}" --tarball-dir "${{ inputs.package_directory }}" --prefix-root "$env:RUNNER_TEMP/zg-icpu" --accelerator cpu
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        python rust/scripts/cuda/e2e.py --explicit-cpu --bundle "$env:RUNNER_TEMP/zg-icpu/prefix/node_modules/@zvec/zvec-grep" --model-cache "$env:RUNNER_TEMP/zvec-grep-model-cache" --logs gpu-logs/cpu-base
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        node rust/scripts/npm-release.mjs install-artifacts --target "${{ inputs.target }}" --tarball-dir "${{ inputs.package_directory }}" --prefix-root "$env:RUNNER_TEMP/zg-i12" --accelerator auto
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Copy-Item "$env:RUNNER_TEMP/zg-i12/installation.json" gpu-logs/cuda12-installation.json
+        python rust/scripts/cuda/e2e.py --bundle "$env:RUNNER_TEMP/zg-i12/prefix/node_modules/@zvec/zvec-grep" --model-cache "$env:RUNNER_TEMP/zvec-grep-model-cache" --logs gpu-logs/cuda12 --expected-gguf-cuda 12.4
     - name: Install Windows CUDA 13.1 runtime alongside CUDA 12
       if: runner.os == 'Windows'
       uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
@@ -130,24 +91,35 @@ runs:
       shell: powershell
       working-directory: ${{ github.workspace }}
       run: |
-        python rust/scripts/cuda/e2e.py --bundle gpu-install/assembled --model-cache "$env:RUNNER_TEMP/zvec-grep-model-cache" --logs gpu-logs/cuda13 --expected-gguf-cuda 13.1
+        node rust/scripts/npm-release.mjs install-artifacts --target "${{ inputs.target }}" --tarball-dir "${{ inputs.package_directory }}" --prefix-root "$env:RUNNER_TEMP/zg-i13" --accelerator cuda
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Copy-Item "$env:RUNNER_TEMP/zg-i13/installation.json" gpu-logs/cuda13-installation.json
+        python rust/scripts/cuda/e2e.py --bundle "$env:RUNNER_TEMP/zg-i13/prefix/node_modules/@zvec/zvec-grep" --model-cache "$env:RUNNER_TEMP/zvec-grep-model-cache" --logs gpu-logs/cuda13 --expected-gguf-cuda 13.1
     - name: Run Linux GGUF fallback and ONNX on CUDA 12 only
       if: runner.os == 'Linux'
       shell: bash
       working-directory: ${{ github.workspace }}
       run: |
         mkdir -p gpu-logs "${RUNNER_TEMP}/zvec-grep-model-cache"
+        node_root="$(node -p 'require("node:path").dirname(require("node:path").dirname(process.execPath))')"
         docker run --rm --gpus all --platform linux/amd64 \
           --volume "${GITHUB_WORKSPACE}:/work:ro" \
+          --volume "${node_root}:/opt/node:ro" \
           --volume "${GITHUB_WORKSPACE}/gpu-logs:/logs" \
           --volume "${RUNNER_TEMP}/zvec-grep-model-cache:/model-cache" \
           --env DEBIAN_FRONTEND=noninteractive \
+          --env PATH=/opt/node/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
           nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04@sha256:ac55d124da4882b497f732d8dfd9a702d5447a5f29d08d56da6f64f0a1eb34bc \
           bash -euo pipefail -c '
             apt-get update -qq
             apt-get install --yes --no-install-recommends python3 ca-certificates >/dev/null
+            cd /work/rust
+            node scripts/npm-release.mjs install-artifacts --target "${{ inputs.target }}" --tarball-dir "/work/${{ inputs.package_directory }}" --prefix-root /tmp/zg-icpu --accelerator cpu
+            python3 scripts/cuda/e2e.py --explicit-cpu --bundle /tmp/zg-icpu/prefix/lib/node_modules/@zvec/zvec-grep --model-cache /model-cache --logs /logs/cpu-base
+            node scripts/npm-release.mjs install-artifacts --target "${{ inputs.target }}" --tarball-dir "/work/${{ inputs.package_directory }}" --prefix-root /tmp/zg-i12 --accelerator auto
+            cp /tmp/zg-i12/installation.json /logs/cuda12-installation.json
             python3 /work/rust/scripts/cuda/e2e.py \
-              --bundle /work/gpu-install/assembled \
+              --bundle /tmp/zg-i12/prefix/lib/node_modules/@zvec/zvec-grep \
               --model-cache /model-cache --logs /logs/cuda12 --expected-gguf-cuda 12.4
           '
     - name: Run Linux GGUF primary on CUDA 13.1
@@ -155,17 +127,23 @@ runs:
       shell: bash
       working-directory: ${{ github.workspace }}
       run: |
+        node_root="$(node -p 'require("node:path").dirname(require("node:path").dirname(process.execPath))')"
         docker run --rm --gpus all --platform linux/amd64 \
           --volume "${GITHUB_WORKSPACE}:/work:ro" \
+          --volume "${node_root}:/opt/node:ro" \
           --volume "${GITHUB_WORKSPACE}/gpu-logs:/logs" \
           --volume "${RUNNER_TEMP}/zvec-grep-model-cache:/model-cache" \
           --env DEBIAN_FRONTEND=noninteractive \
+          --env PATH=/opt/node/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
           nvidia/cuda:13.1.1-runtime-ubuntu24.04@sha256:12e26235ebe186000d71f8e457a9ad2aed6c0cb743a7935f0443bacef206aa34 \
           bash -euo pipefail -c '
             apt-get update -qq
             apt-get install --yes --no-install-recommends python3 ca-certificates >/dev/null
+            cd /work/rust
+            node scripts/npm-release.mjs install-artifacts --target "${{ inputs.target }}" --tarball-dir "/work/${{ inputs.package_directory }}" --prefix-root /tmp/zg-i13 --accelerator cuda
+            cp /tmp/zg-i13/installation.json /logs/cuda13-installation.json
             python3 /work/rust/scripts/cuda/e2e.py \
-              --bundle /work/gpu-install/assembled \
+              --bundle /tmp/zg-i13/prefix/lib/node_modules/@zvec/zvec-grep \
               --model-cache /model-cache --logs /logs/cuda13 --backend gguf --expected-gguf-cuda 13.1
           '
     - name: Make Linux cache and logs readable
@@ -180,6 +158,8 @@ runs:
       uses: actions/upload-artifact@v7
       with:
         name: cuda-cli-evidence-${{ inputs.target }}
-        path: gpu-logs/
+        path: |
+          gpu-logs/
+          rust/dist/npm/release/artifact-smoke/installation.json
         if-no-files-found: warn
         retention-days: 7

@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { copyFile, cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
-import { defaultReleaseVariant, loadReleaseManifest, nativePackageEntries, selectPlatform, sha256File } from "./npm-package-core.mjs";
-import { installedPackageRoot, rollbackVersion, smokeArtifactRelease, smokeRegistryRelease } from "./npm-release-smoke.mjs";
+import { defaultReleaseVariant, loadReleaseManifest, nativePackageEntries, run, selectPlatform, sha256File } from "./npm-package-core.mjs";
+import { installArtifactRelease, installedPackageRoot, rollbackVersion, smokeArtifactRelease, smokeRegistryRelease, verifyInstalledRelease } from "./npm-release-smoke.mjs";
+import { materialize } from "../npm/meta/install.cjs";
 
 const manifest = loadReleaseManifest();
 const release = {
@@ -28,6 +30,9 @@ async function artifactFixture(t, withComponents = false) {
     entry.components = linux.components.map((component) => ({
       ...component, package: component.package.replace(linux.package, entry.package),
     }));
+  } else {
+    delete entry.components;
+    delete entry.defaultVariant;
   }
   const fixtureManifest = { ...manifest, platforms: manifest.platforms.map((platform) =>
     platform.target === entry.target ? entry : platform) };
@@ -43,10 +48,36 @@ async function artifactFixture(t, withComponents = false) {
 
 async function installedArtifact(fixture, prefix, variant = defaultReleaseVariant(fixture.entry)) {
   const directory = installedPackageRoot(prefix, fixture.entry.package);
-  await mkdir(directory, { recursive: true });
+  const metaRoot = installedPackageRoot(prefix, fixture.manifest.metaPackage);
+  const components = fixture.entry.components ?? [];
+  const checksum = (content) => ({ bytes: Buffer.byteLength(content), sha256: createHash("sha256").update(content).digest("hex") });
+  const write = async (root, file, content) => {
+    await mkdir(dirname(join(root, file)), { recursive: true });
+    await writeFile(join(root, file), content);
+  };
+  const binary = `bin/${fixture.entry.binary}`;
+  await write(directory, binary, "fixture-executable");
+  await write(directory, "lib/base-library", "base");
+  const files = { [binary]: checksum("fixture-executable"), "lib/base-library": checksum("base") };
+  const external = new Map();
+  for (const component of components) {
+    const root = installedPackageRoot(prefix, component.package);
+    const content = `fixture component ${component.package}`;
+    await write(root, component.payload, content);
+    await write(root, "package.json", JSON.stringify({ name: component.package, version: fixture.release.version }));
+    await write(root, "checksums.json", JSON.stringify({ schemaVersion: 1, target: fixture.entry.target,
+      component: component.package, files: { [component.payload]: checksum(content) } }));
+    external.set(component.file, (external.get(component.file) ?? "") + content);
+  }
+  for (const [file, content] of external) files[file] = checksum(content);
+  await write(directory, "checksums.json", JSON.stringify({ schemaVersion: components.length ? 2 : 1,
+    target: fixture.entry.target, files, components: components.map((component) => component.package) }));
   await writeFile(join(directory, "package.json"), JSON.stringify({
     name: fixture.entry.package, version: fixture.release.version, zvecGrep: { variant },
+    dependencies: Object.fromEntries(components.map((component) => [component.package, fixture.release.version])),
   }));
+  await write(metaRoot, "package.json", JSON.stringify({ name: fixture.manifest.metaPackage, version: fixture.release.version }));
+  materialize({ metaRoot, platformRoot: directory, entry: fixture.entry, expectedVersion: fixture.release.version });
 }
 
 test("artifact smoke installs the exact local tarballs offline and probes the installed package", async (t) => {
@@ -74,6 +105,79 @@ test("artifact smoke installs the exact local tarballs offline and probes the in
   assert.equal(installs, 1);
   assert.equal(probes, 1);
   assert.equal(result.bundle, installedPackageRoot(result.prefix, manifest.metaPackage));
+  const report = JSON.parse(await readFile(join(fixture.prefixRoot, "installation.json"), "utf8"));
+  assert.deepEqual(report.packages, fixture.release.packages);
+  assert.equal(report.bundle, result.bundle);
+});
+
+test("the shared installer uses real offline npm postinstall without running the native executable", async (t) => {
+  const fixture = await artifactFixture(t);
+  const source = join(fixture.tarballRoot, "source");
+  await installedArtifact(fixture, source);
+  const metaRoot = installedPackageRoot(source, manifest.metaPackage);
+  await rm(join(metaRoot, "lib"), { recursive: true });
+  await writeFile(join(metaRoot, "bin/zg.exe"), "uninstalled placeholder");
+  await copyFile(new URL("../npm/meta/install.cjs", import.meta.url), join(metaRoot, "install.cjs"));
+  await copyFile(new URL("../npm/meta/plugins.cjs", import.meta.url), join(metaRoot, "plugins.cjs"));
+  await writeFile(join(metaRoot, "platforms.json"), JSON.stringify([fixture.entry]));
+  await writeFile(join(metaRoot, "package.json"), JSON.stringify({ name: manifest.metaPackage,
+    version: fixture.release.version, scripts: { postinstall: "node install.cjs" },
+    optionalDependencies: { [fixture.entry.package]: fixture.release.version } }));
+  for (const pkg of fixture.release.packages) {
+    const staging = join(fixture.tarballRoot, "packing", pkg.name.replaceAll("/", "-"));
+    await cp(installedPackageRoot(source, pkg.name), join(staging, "package"), { recursive: true });
+    run("tar", ["-czf", join(fixture.tarballRoot, pkg.file), "-C", staging, "package"],
+      { env: { ...process.env, COPYFILE_DISABLE: "1" } });
+    pkg.sha256 = await sha256File(join(fixture.tarballRoot, pkg.file));
+  }
+  const result = await installArtifactRelease(fixture);
+  // This is deliberately not an executable: installation must not invoke it.
+  assert.equal(await readFile(join(result.bundle, "bin/zg.exe"), "utf8"), "fixture-executable");
+  const report = JSON.parse(await readFile(join(fixture.prefixRoot, "installation.json"), "utf8"));
+  assert.deepEqual(report.components, []);
+  for (const pkg of fixture.release.packages) assert.equal(await sha256File(join(fixture.tarballRoot, pkg.file)), pkg.sha256);
+});
+
+test("artifact smoke rejects a target that does not match the verification host", async (t) => {
+  const fixture = await artifactFixture(t);
+  await assert.rejects(smokeArtifactRelease({ ...fixture, target: "another-target",
+    runNpm: () => assert.fail("must not install") }), /does not match host/);
+});
+
+test("registry verification resolves native dependencies nested under the meta package", async (t) => {
+  const fixture = await artifactFixture(t, true);
+  const prefix = fixture.prefixRoot;
+  await installedArtifact(fixture, prefix);
+  const metaRoot = installedPackageRoot(prefix, manifest.metaPackage);
+  for (const { name } of nativePackageEntries(fixture.entry)) {
+    const destination = join(metaRoot, "node_modules", name);
+    await mkdir(dirname(destination), { recursive: true });
+    await rename(installedPackageRoot(prefix, name), destination);
+  }
+  const report = await verifyInstalledRelease({ ...fixture, version: fixture.release.version, prefix });
+  assert.deepEqual(report.components, fixture.entry.components.map((component) => component.package));
+});
+
+test("missing installed GPU components fail before a CPU CLI probe can mask them", async (t) => {
+  const fixture = await artifactFixture(t, true);
+  await assert.rejects(smokeArtifactRelease({ ...fixture,
+    runNpm: async (_, args) => {
+      const prefix = args[args.indexOf("--prefix") + 1];
+      await installedArtifact(fixture, prefix);
+      await rm(installedPackageRoot(prefix, fixture.entry.components[0].package), { recursive: true });
+    }, probe: () => assert.fail("must not accept CPU fallback"),
+  }), /ENOENT|missing @zvec/);
+});
+
+test("corrupt assembled libraries fail even when the executable is intact", async (t) => {
+  const fixture = await artifactFixture(t, true);
+  await assert.rejects(smokeArtifactRelease({ ...fixture,
+    runNpm: async (_, args) => {
+      const prefix = args[args.indexOf("--prefix") + 1];
+      await installedArtifact(fixture, prefix);
+      await writeFile(join(installedPackageRoot(prefix, manifest.metaPackage), fixture.entry.components[0].file), "corrupted");
+    }, probe: () => assert.fail("must not run an incomplete installation"),
+  }), /native payload checksum mismatch/);
 });
 
 test("artifact checksum failures block installation before executing any candidate", async (t) => {
@@ -84,17 +188,17 @@ test("artifact checksum failures block installation before executing any candida
   }), /artifact tarball checksum mismatch/);
 });
 
-test("artifact smoke includes all CUDA components and rejects an omitted fragment", async (t) => {
+test("CUDA artifact smoke verifies every component but only passes meta/base to npm", async (t) => {
   const fixture = await artifactFixture(t, true);
-  await smokeArtifactRelease({ ...fixture,
+  await smokeArtifactRelease({ ...fixture, accelerator: "cuda",
     runNpm: async (_, args) => {
-      assert.equal(args.filter((arg) => arg.endsWith(".tgz") && !arg.startsWith("--")).length, 6);
+      assert.equal(args.filter((arg) => arg.endsWith(".tgz") && !arg.startsWith("--")).length, 2);
       assert.ok(args.includes(`--allow-scripts=${args.at(-1)}`));
       await installedArtifact(fixture, args[args.indexOf("--prefix") + 1]);
     }, probe: async () => {},
   });
   fixture.release.packages.splice(3, 1);
-  await assert.rejects(smokeArtifactRelease({ ...fixture,
+  await assert.rejects(smokeArtifactRelease({ ...fixture, accelerator: "cuda",
     runNpm: () => assert.fail("must not install an incomplete set"),
   }), /artifact package identity mismatch/);
 });
@@ -135,17 +239,27 @@ test("registry smoke installs only the meta package and exercises a distinct upd
     runNpm: (_, args) => {
       assert.ok(args.includes("--registry=https://registry.npmjs.org"));
       assert.ok(!args.some((arg) => arg.endsWith(".tgz")));
-      events.push(args.at(-1));
+      events.push(args[0] === "rebuild" ? "explicit registry plugin fetch" : args.at(-1));
+    },
+    verifyInstalled: async ({ version }) => {
+      await mkdir(prefixRoot, { recursive: true });
+      assert.equal(version, release.version);
+      events.push("installed components verified");
+      return { version, components: [] };
     },
     probe: async () => events.push("candidate IPC verified"),
     probePrevious: async () => events.push("baseline verified"),
   });
   assert.deepEqual(events, [
     "@zvec/zvec-grep@0.0.1",
+    "installed components verified",
     "candidate IPC verified",
+    ...(selectPlatform(manifest, process.platform, process.arch, process.report?.getReport().header ?? {}).components?.length
+      ? ["explicit registry plugin fetch", "installed components verified"] : []),
     "@zvec/zvec-grep@0.2.2",
     "baseline verified",
     "@zvec/zvec-grep@0.0.1",
+    "installed components verified",
     "candidate IPC verified",
     "@zvec/zvec-grep@0.2.2",
     "baseline verified",

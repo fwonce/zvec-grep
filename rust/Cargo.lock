@@ -4153,6 +4153,7 @@ dependencies = [
  "uuid",
  "zg-engine-macros",
  "zg-host-native",
+ "zg-llama-native",
  "zvec-rust",
 ]
 
@@ -4177,6 +4178,15 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "zg-llama-native"
+version = "0.0.1"
+dependencies = [
+ "libloading 0.8.9",
+ "llama-cpp-sys-2",
+ "tempfile",
 ]
 
 [[package]]
