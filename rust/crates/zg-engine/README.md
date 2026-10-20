@@ -66,7 +66,7 @@ Indexed search combines full-text and vector retrieval to return relevant source
 
 ### Embedding models
 
-Each workspace uses an embedding model for semantic search. Local models run on your machine and may need an initial download; remote models send content or queries to an external service and require authorization. Changing the model or encountering an incompatible index format requires rebuilding the index. Credentials and machine-specific runtime settings stay outside the portable workspace; moving to another machine requires configuring them there.
+Semantic search uses a workspace embedding model: local models run on your machine and may need an initial download, while remote models send content or queries to an external service and require authorization. Changing the model or encountering an incompatible index format requires rebuilding the index. Credentials and machine-specific runtime settings stay outside the portable workspace; moving to another machine requires configuring them there.
 
 ## Modules
 

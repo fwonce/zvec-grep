@@ -555,7 +555,7 @@ Index-only embedding concurrency:
 See zg --help environment for precedence and Server-mode scope.";
 
 const STATUS_HELP: &str = r"Usage:
-  zg --status [root] [--mode <direct|server|auto>] [--check-ready]
+  zg --status [root] [--index-dir <path>] [--mode <direct|server|auto>] [--check-ready]
 
 Shows the nearest workspace root, index policy, index state, embedding model,
 stored paths, refresh status, and suggested next action.
@@ -850,7 +850,8 @@ Qwen credential aliases:
   QWEN_API_KEY       Qwen credential fallback after DASHSCOPE_API_KEY
 
 State and authorization:
-  ZVEC_GREP_HOME                    Runtime and daemon state directory; Workspace indexes stay under <root>/.zvec-grep
+  ZVEC_GREP_HOME                    Runtime and daemon state directory
+  ZVEC_GREP_INDEX_DIR               Workspace index directory (default: <root>/.zvec-grep)
   ZVEC_GREP_AUTHORIZATION_KEY_FILE  Workspace grant signing-key file (advanced)
 
 Advanced:
@@ -875,7 +876,9 @@ Agent integration paths:
   VSCODE_APPDATA        Base directory for VS Code release channels
 
 Precedence:
-  Embedding runtime                 CLI > Workspace snapshot > Global config > Environment
+  Embedding credentials            CLI > Global config > Environment
+  Embedding endpoint               CLI > Workspace endpoint > Global config > Environment
+  Device and model cache           CLI > Environment > Global config
   New-index model                  --embedding > ZVEC_GREP_EMBEDDING > Global config
   Client mode                      --mode > ZVEC_GREP_MODE > Global config
   Qwen environment credential      ZVEC_GREP_API_KEY > DASHSCOPE_API_KEY > QWEN_API_KEY
