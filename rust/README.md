@@ -377,14 +377,17 @@ bash scripts/check.sh
 ## Native and CUDA builds
 
 The safe llama API and the C5 FFI boundary share the same pinned
-`zvec-ai/llama-cpp-rs` revision (`6077c595d91a147fc86f0eb8be8da34bf3a3c606`).
-Its sys crate automatically selects the SHA256-pinned `zvec-0.1.154-r1` SDK
-when target, features and native options match. Matching builds reuse native
+`zvec-ai/llama-cpp-rs` revision (`0e2d4b520af769de221c1bf98bbbf1b2accf4ddc`).
+Its sys crate automatically selects a SHA256-pinned SDK when target, features
+and native options match: `zvec-0.1.154-cpu-r1` for CPU-only Linux/Windows x64,
+and `zvec-0.1.154-r1` for the existing five release configurations, including
+CUDA-enabled Linux/Windows x64. Matching builds reuse native
 libraries and bindings without executing bindgen, CMake, C++ or CUDA compilation;
-Rust application code still compiles normally. The SDK covers the five release
-targets, including both x64 CUDA plugins. CPU-only Linux/Windows x64 and custom
-native configurations use source builds in default `auto` mode. A download or
-integrity failure is an error, not a silent source fallback.
+Rust application code still compiles normally. CPU-only x64 builds download only
+the static CPU SDK, not the CUDA SDK; CUDA builds retain the shared core, CPU
+backends and both CUDA plugins. Custom native configurations use source builds
+in default `auto` mode. A download or integrity failure is an error, not a silent
+source fallback.
 
 The fork no longer registers llama.cpp as a Git submodule. Cargo fetches only
 the Rust bindings; matching SDK builds never fetch native source. Only explicit
