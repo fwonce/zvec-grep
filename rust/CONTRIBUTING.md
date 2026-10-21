@@ -149,9 +149,9 @@ dangling. The existing packaged CPU GGUF index/query checks cover this path.
 ### Package validation
 
 `Publish Rust packages` (`.github/workflows/rust-publish.yml`) handles
-package-level validation. Pushes to `main` and
-`release/rust-*`, and manual runs with both `publish=false` and `cuda=false`,
-build/audit/package on ordinary CPU runners without allocating GPUs or publishing
+package-level validation. It runs only through manual dispatch. Runs with both
+`publish=false` and `cuda=false` build/audit/package on ordinary CPU runners
+without allocating GPUs or publishing
 to npm. Compilation always stays on CPU runners, including when `cuda=true` or
 `publish=true`; Linux/Windows x64 still build the default CUDA-capable bundles.
 Set `cuda=true,publish=false` to add GPU validation without publishing.

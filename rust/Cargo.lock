@@ -4177,6 +4177,7 @@ version = "0.0.1"
 dependencies = [
  "cc",
  "clap",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",
@@ -4186,6 +4187,7 @@ dependencies = [
  "zg-daemon",
  "zg-daemon-protocol",
  "zg-engine",
+ "zg-testkit",
  "zvec-rust",
  "zvec-rust-build",
 ]
@@ -4197,9 +4199,11 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "grep",
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio-util",
  "toml",
  "uuid",
  "zg-engine",

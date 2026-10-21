@@ -205,12 +205,13 @@ Release order:
 
 `.github/workflows/rust-publish.yml` builds and packs the selected targets once on
 their native runners in parallel, collects the candidates into a downloadable
-artifact, then checks real installation, CLI startup, managed-rg and daemon IPC. The manual
+artifact, then checks real installation, CLI startup, managed-rg and daemon IPC.
+The workflow runs only through manual dispatch and does not publish unless
+`publish` is enabled. The manual
 `platform` input defaults to `all`; each of the five target names can be selected
 individually.
 `publish=true` requires `platform=all`; a subset is a validation-only candidate,
-not a complete release. Pushes to `main` and
-`release/rust-*`, and manual runs with `publish=false, cuda=false`, use ordinary CPU runners;
+not a complete release. Manual runs with `publish=false, cuda=false` use ordinary CPU runners;
 they do not allocate GPUs or publish packages. All five package builds require
 the pinned llama-cpp-rs prebuilt SDK. Linux/Windows x64 still produce CUDA-capable
 bundles, but neither the 13.1 primary nor 12.4 fallback is compiled in zg CI.
@@ -288,8 +289,10 @@ see [Windows GPU runner preparation](../CONTRIBUTING.md#windows-gpu-runner-prepa
 `rust-ci.yml` separately verifies the workspace and all
 three real models using each platform's already-compiled test binary. Its manual
 `cuda_verify` input defaults to `false`. When enabled, Linux/Windows test jobs
-use GPU runners and compile with `zg/cuda` from the outset, then reuse those
-artifacts for the normal tests and additional ORT/llama.cpp CUDA verification.
+compile with `zg/cuda` on CPU runners from the outset, run the normal tests and
+CPU models, and upload the selected test executables and verified runtime files.
+Separate GPU jobs reuse that bundle for ORT/llama.cpp CUDA verification and both
+C5 tests without compiling or restoring build caches.
 Model2Vec remains CPU-only and macOS remains non-CUDA. The ordinary quality job
 stays separate. `platform=linux` or `windows` limits test platforms; optional
 `ref` selects the reviewed source commit. These CI checks do not package or publish.

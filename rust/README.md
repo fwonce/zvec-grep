@@ -178,6 +178,40 @@ piped output is compact. `--compact` forces compact output, and
 `--preview=full` explicitly requests full previews even in compact output.
 The former `--human` option is no longer accepted.
 
+When an interactive search finds no index, it asks you to choose an embedding
+model before building. The picker has **Local models** and **Remote models** tabs:
+downloaded local models and globally configured remote models appear first.
+Use ↑/↓ to select, ←/→ or Tab to switch, Enter to confirm and Esc to exit.
+Each tab keeps its selection when switching. A valid model preference selects the
+initial tab; without one the picker opens Local models. Remote models show whether
+credentials are available. Selecting one with missing credentials opens a masked
+API Key prompt, with paste, Backspace, Ctrl+U to clear and Esc to exit. Enter saves
+a non-empty key to the provider's global configuration and continues to remote
+authorization. The new key is used for both the build and following CLI query.
+
+Local selection starts the build. Remote selection first discloses the workspace,
+model, endpoint, data sent and possible API charges, then offers Allow once, Allow
+for this workspace, or Back to model selection. Existing matching workspace consent
+skips this step. Allow once covers the CLI build and the following query without
+persisting a grant. Esc exits either screen before any workspace content is sent.
+
+CLI searches display model preparation/download and file indexing progress and wait
+for the full index to be published before running the original search. This also
+applies to `--mode server`, where the CLI follows the daemon's background job.
+Non-interactive searches never create a missing index; initialize it explicitly
+with `zg --index --embedding <model>` first. Empty workspaces do not download models.
+
+On MCP connections with background scheduling and form elicitation, missing-index
+searches ask the user to select a model and authorize remote use when needed.
+MCP model choices require credentials to be configured beforehand.
+Acceptance submits a background build and returns its job ID immediately; retry
+search after completion. Allow once covers that background build only. Later search
+requests report current build progress without repeating model selection. Unsupported
+clients receive CLI initialization instructions. Native terminal tabs and Escape
+handling are controlled by the MCP host. For protocol `2026-07-28`, echo the exact
+`requestState` and unchanged tool arguments with `inputResponses.index_setup`;
+each model selection or remote authorization round issues a new, single-use state.
+
 This version indexes text with one embedding model per workspace. Choose it with
 `zg --index --embedding <model>` or set a default with
 `zg --config model set <model> --default`. Code, documents and structured text use
@@ -196,6 +230,33 @@ metadata included in search projections. Index format 5 uses this layout.
 Lexical search runs in-process with ripgrep's `grep` and `ignore` crates; the
 binary and ordinary CI jobs do not require a system `rg` executable.
 
+A single file name or path, such as `zg auth.ts` or `zg src/auth.ts`, first
+looks up current file paths. Matches use `#1 matchedBy=path src/auth.ts`, with
+forward slashes on every platform and exact workspace-relative paths before suffix
+matches. Ties use deterministic native path ordering; `--limit` bounds the list
+(default: 10). Lookup uses the nearest workspace's saved scan rules and query
+file filters, and includes empty files. It runs locally in direct, server, and
+auto modes without loading a model, creating an index, or requiring a daemon.
+File discovery does not apply index-only default exclusions for build directories,
+lock files, or images; saved scanning rules and ignore files still apply.
+File matches do not read or embed contents. If no file matches, lookup searches
+the selected current source text literally using the same scan rules and filters.
+A path mentioned only in source text returns those text matches. No match prints
+`No matches.` instead of unrelated vector neighbors, even with an existing index.
+Text results deduplicate complete structural entities before applying `--limit`;
+multiple retrieval fragments of one function or Markdown section count once.
+Literal matching and highlighting use the same smart-case rules: queries with
+uppercase letters are case-sensitive; lowercase queries ignore case.
+Results show line numbers, match/context markers, and structural headings. Terminal output also
+shows coverage and per-file/per-hit metadata. Truncated file or text results warn
+on stderr. Unlike the Node.js CLI, truncated text remains local instead of starting
+indexed retrieval; direct, server, and auto modes share this behavior and never
+require model loading or indexing. Native glob ordering, format aliases, ignore
+handling, and path normalization retain the Rust CLI's existing semantics.
+Explicit `--hybrid`, `--fts`, `--vector`, `--fuse`, symbol options, `--trace`, and
+`--refresh` retain their indexed behavior. Text questions, URLs, and glob patterns
+do not trigger automatic path lookup.
+
 Managed `zg --rg` preserves literal pattern whitespace and supports empty
 patterns with `-e ''`. Matching options include fixed strings (`-F`), case
 selection (`-i`, `-s`, `-S`, with the last option winning), word/whole-line
@@ -209,7 +270,43 @@ automatic thread count. Ignore controls include `-u`/`-uu`/`-uuu`,
 `--no-ignore-parent`, and `--no-ignore-vcs`. Managed search still excludes its
 internal directories. The full MCP toolset uses the same argument parser and
 engine. PCRE2, compressed-file search, explicit encoding selection, and native
-ripgrep output-format switches are rejected; Unicode BOM decoding is automatic.
+ripgrep output-format switches other than file listing are rejected; Unicode
+BOM decoding is automatic.
+
+Automatic path lookup emits
+`warning: automatically performing path lookup; use --hybrid to force hybrid search.`
+on stderr only when the default query actually enters that branch. `--hybrid`
+overrides the inference, including ambiguous inputs such as `config.timeout` and
+`v1.2`.
+
+When no file path matches and lookup falls back to literal source search, it also
+prints `warning: no matching file paths; searching current file contents literally (rg).`
+on stderr. This appears for both text matches and `No matches.`; stdout contains
+only the search results.
+
+Use `zg --rg --files` for explicit file discovery:
+
+```sh
+zg --rg --files
+zg --rg --files -g 'auth.ts'
+zg --rg --files src -g '*.ts' -g '!*.test.ts'
+zg --rg --files -t rust -0
+```
+
+Every positional argument is an input file or directory, so `auth.ts` by itself
+selects that input path; `-g 'auth.ts'` finds that name throughout the inputs.
+Discovery reuses managed rg's glob, type, ignore, hidden, symlink, depth, size,
+and modification-time filters. It reads filesystem metadata and ignore rules,
+without opening source contents, loading models, or opening an index. All client
+modes run locally. Output contains all selected paths in sorted order, one per
+line or NUL-delimited with `-0`/`--null`, without headings or match metadata.
+Absolute inputs retain absolute output paths; relative inputs retain relative
+paths. `--limit` is rejected to avoid silently truncating the enumeration.
+Exit status is 0 when files are found, 1 for an empty list, and 2 for a discovery
+error; traversal errors go to stderr while accessible paths remain on stdout.
+Like managed content search, recursive discovery skips `.git` and `.zvec-grep`;
+explicit file inputs are still listed.
+This is a CLI entry point; the MCP rg tool retains its content-search contract.
 
 ## Remote embedding authorization
 
@@ -609,8 +706,9 @@ contains exactly the target executable. It cannot be combined with
 `--binary`, `--lib-dir`, or `--cpu-only`. All payload files are checksummed.
 
 The `Publish Rust packages` workflow builds the selected published native targets
-(all five by default) on matching CPU runners. Manual runs produce downloadable candidates without publishing
-to npm unless publication is explicitly selected. Each runner installs
+(all five by default) on matching CPU runners. It runs only through manual
+dispatch. With `publish` left at its default `false`, it produces downloadable
+candidates without publishing to npm. Each CPU artifact-verification runner installs
 its platform and meta tarballs, then runs `zg --version`, checks managed-rg,
 starts the packaged daemon, compares workspace status in direct and server
 modes, and stops the daemon. The server status request crosses the IPC boundary;
@@ -619,9 +717,10 @@ Developer ID, notarization, and Windows certificate signing are not required for
 candidate builds.
 
 The selected platforms build in parallel after source validation; Intel macOS
-does not gate Linux or Windows. Each platform runs tarball installation, CLI
-startup, managed-rg, and daemon IPC checks before uploading its native artifact.
-The final artifact is collected after all selected targets pass.
+does not gate Linux or Windows. After all selected build jobs upload their
+native artifacts, collection creates the candidate once. Independent CPU and
+requested GPU jobs then verify the exact collected tarballs, including CLI,
+managed-rg, and daemon IPC checks on every selected platform.
 
 The packaging workflow's manual `platform` input defaults to `all`. Select any
 of `darwin-arm64`, `darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`, or
@@ -633,14 +732,13 @@ gh workflow run rust-publish.yml --ref <branch> \
 ```
 
 Partial selections produce validation-only candidates and cannot be published;
-`publish=true` requires `platform=all`. Push-triggered runs still build all five
-platforms on ordinary CPU runners. Runs use branch-plus-platform concurrency
+`publish=true` requires `platform=all`. Runs use branch-plus-platform concurrency
 groups: different platform selections can run concurrently, while an in-progress
 run in the same group is not cancelled by a newer run.
 
-Pushes to `main` and `release/rust-*` start candidate packaging on CPU runners,
-as do manual runs with both `publish=false` and `cuda=false`; they do not publish
-to npm. Packaging always compiles on CPU runners, including when `cuda=true` or
+Pushes do not trigger this packaging workflow. Manual runs with both
+`publish=false` and `cuda=false` use only CPU runners and do not publish to npm.
+Packaging always compiles on CPU runners, including when `cuda=true` or
 `publish=true`. Set `cuda=true, publish=false` to add GPU validation without
 publishing. Separate jobs on `gpu-linux-t4` and `gpu-windows-t4` download the
 selected Linux/Windows x64 native packages from the same run, verify their
