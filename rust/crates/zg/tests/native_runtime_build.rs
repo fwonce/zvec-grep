@@ -143,11 +143,18 @@ fn fixture(target: &str) -> (tempfile::TempDir, Value) {
     let mut manifest = json!({"schema": 1, "target": target, "linkage": "dynamic",
         "link_libraries": ["dylib=llama", "dylib=ggml", "static=ggml-cpu"], "files": {}});
     let names = if target == WINDOWS {
+        // Match the pinned Windows SDK: the common-base CMake target is STATIC,
+        // but its MSVC .lib is recorded with the same dylib= link directive.
+        manifest["link_libraries"]
+            .as_array_mut()
+            .expect("link libraries")
+            .push(json!("dylib=llama-common-base"));
         vec![
             "llama.dll",
             "llama.lib",
             "ggml.dll",
             "ggml.lib",
+            "llama-common-base.lib",
             "ggml-cpu.lib",
             "ggml-cpu-x64.dll",
             "ggml-cuda.dll",
@@ -240,6 +247,30 @@ fn windows_stages_dlls_not_import_libraries_or_plugins() {
         ["llama.dll", "ggml.dll"]
             .contains(&p.file_name().expect("filename").to_str().expect("UTF-8"))
     }));
+}
+
+#[test]
+fn missing_windows_runtime_is_not_hidden_by_its_import_library() {
+    let (sdk, mut manifest) = fixture(WINDOWS);
+    manifest["files"]
+        .as_object_mut()
+        .expect("payloads")
+        .remove("lib/llama.dll");
+    fs::remove_file(sdk.path().join("lib/llama.dll")).expect("remove DLL");
+    save(sdk.path(), &manifest);
+    let target = tempfile::tempdir().expect("target");
+    let error = llama_runtime::stage(
+        sdk.path(),
+        &sdk.path().join("manifest.json"),
+        WINDOWS,
+        &target.path().join("release/build/zg/out"),
+    )
+    .expect_err("the import .lib does not replace its required DLL");
+    assert!(
+        error
+            .to_string()
+            .contains("missing shared runtime for llama.cpp link library: llama")
+    );
 }
 
 #[test]

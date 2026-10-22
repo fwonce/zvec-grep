@@ -125,8 +125,11 @@ runs:
           --env PATH=/opt/node/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
           nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04@sha256:ac55d124da4882b497f732d8dfd9a702d5447a5f29d08d56da6f64f0a1eb34bc \
           bash -euo pipefail -c '
-            apt-get update -qq
-            apt-get install --yes --no-install-recommends python3 ca-certificates >/dev/null
+            # CUDA/cuDNN are already in this pinned image. Only Ubuntu packages
+            # are needed; do not depend on the NVIDIA repository mirror state.
+            apt_options=(-o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- -o APT::Update::Error-Mode=any -o Acquire::Retries=3)
+            apt-get "${apt_options[@]}" update -qq
+            apt-get "${apt_options[@]}" install --yes --no-install-recommends python3 ca-certificates >/dev/null
             cd /work/rust
             node scripts/npm-release.mjs install-artifacts --target "${{ inputs.target }}" --tarball-dir "/work/${{ inputs.package_directory }}" --prefix-root /tmp/zg-install/install --accelerator cpu
             python3 scripts/cuda/e2e.py --explicit-cpu --bundle /tmp/zg-install/install/prefix/lib/node_modules/@zvec/zvec-grep --model-cache /model-cache --logs /logs/cpu-base
@@ -157,8 +160,9 @@ runs:
           --env PATH=/opt/node/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
           nvidia/cuda:13.1.1-runtime-ubuntu24.04@sha256:12e26235ebe186000d71f8e457a9ad2aed6c0cb743a7935f0443bacef206aa34 \
           bash -euo pipefail -c '
-            apt-get update -qq
-            apt-get install --yes --no-install-recommends python3 ca-certificates >/dev/null
+            apt_options=(-o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- -o APT::Update::Error-Mode=any -o Acquire::Retries=3)
+            apt-get "${apt_options[@]}" update -qq
+            apt-get "${apt_options[@]}" install --yes --no-install-recommends python3 ca-certificates >/dev/null
             cd /work/rust
             python3 /work/rust/scripts/cuda/e2e.py \
               --bundle /tmp/zg-install/install/prefix/lib/node_modules/@zvec/zvec-grep \

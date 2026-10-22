@@ -37,6 +37,7 @@ llama-cpp-2.workspace = true
 # dynamically linked Intel macOS ORT and Windows DirectML's DLL.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["api-27", "copy-dylibs", "download-binaries", "std", "tls-rustls"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 rayon = "1.11.0"
 serde.workspace = true
 serde_json.workspace = true
@@ -74,6 +75,8 @@ dunce = "1.0.5"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["directml"] }
 
 [dev-dependencies]
+# Count SQLite VM instructions in graph query performance regression tests.
+rusqlite = { version = "0.37", features = ["hooks"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber.workspace = true
 

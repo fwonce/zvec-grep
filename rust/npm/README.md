@@ -13,7 +13,7 @@ files are present only after successful plugin installation:
 
 ```text
 bin/zg.exe              # meta entry on every OS; command remains zg
-lib/libzvec_c_api.*       # storage runtime and lib/data dictionaries
+lib/libzvec_c_api.*       # storage runtime with embedded Jieba dictionary
 lib/lib{llama,ggml}*      # CUDA variant: shared llama.cpp core and CPU backend
 lib/*onnxruntime*        # ONNX Runtime core/providers, when dynamically linked
 lib/*ggml-cuda*          # primary CUDA 13.1 GGUF plugin
@@ -31,7 +31,8 @@ platform package name. macOS, Linux ARM64 and deliberate CPU-only builds remain
 single native packages. A default all-platform release contains 13 tarballs:
 five base packages, seven runtime components and the meta package.
 
-The base package retains the executable, CPU/core libraries and dictionaries.
+The base package retains the executable and CPU/core libraries, including
+zvec's embedded Jieba dictionary; no external dictionary files are required.
 CUDA components contain whole GGML plugins or the ORT provider. The Linux ORT
 provider is split into two ordered byte ranges under `parts/`; postinstall
 streams them back into the original `.so` and verifies the original complete
@@ -75,7 +76,7 @@ it must be split further, not silently published as a reduced CPU package.
 validation candidates may omit them, but publication and promotion may not.
 
 `bin/` contains only the native executable. All runtime libraries, providers,
-plugins, and dictionaries live under `lib/`. Unix binaries use a `../lib`
+and plugins live under `lib/`. Unix binaries use a `../lib`
 rpath. Windows uses a native MSVC delay-load hook to resolve DLLs from the
 executable's sibling `lib/`. The binary runs directly, without a JavaScript
 launcher or custom loader environment variables for bundled libraries. Host

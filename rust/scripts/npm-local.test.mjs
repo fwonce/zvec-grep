@@ -22,14 +22,11 @@ import {
 
 const manifest = loadReleaseManifest();
 
-test("packages the SDK library and dictionaries under lib on every platform", async (t) => {
+test("packages the SDK library with its embedded dictionary under lib on every platform", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "zg-zvec-runtime-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const source = join(root, "sdk");
-  await mkdir(join(source, "data/jieba_dict"), { recursive: true });
-  for (const file of ["jieba.dict.utf8", "hmm_model.utf8"]) {
-    await writeFile(join(source, "data/jieba_dict", file), file);
-  }
+  await mkdir(source);
   for (const [platform, library] of Object.entries({
     darwin: "libzvec_c_api.dylib",
     linux: "libzvec_c_api.so",
@@ -38,7 +35,7 @@ test("packages the SDK library and dictionaries under lib on every platform", as
     await writeFile(join(source, library), platform);
     const destination = join(root, platform, "lib");
     const files = await stageZvecRuntime(source, destination, platform);
-    assert.equal(files.length, 3);
+    assert.deepEqual(files, [`lib/${library}`]);
     for (const file of files) {
       assert.deepEqual(
         await readFile(join(root, platform, file)),
@@ -46,7 +43,7 @@ test("packages the SDK library and dictionaries under lib on every platform", as
       );
     }
   }
-  await rm(join(source, "data/jieba_dict/hmm_model.utf8"));
+  await rm(join(source, "libzvec_c_api.so"));
   await assert.rejects(
     stageZvecRuntime(source, join(root, "incomplete/lib"), "linux"),
     /ENOENT/,
@@ -57,10 +54,7 @@ test("includes model runtime libraries but excludes build files and other platfo
   const root = await mkdtemp(join(tmpdir(), "zg-model-runtime-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const source = join(root, "sdk");
-  await mkdir(join(source, "data", "jieba_dict"), { recursive: true });
-  for (const name of ["jieba.dict.utf8", "hmm_model.utf8"]) {
-    await writeFile(join(source, "data", "jieba_dict", name), name);
-  }
+  await mkdir(source);
   const runtimeFiles = {
     darwin: ["libzvec_c_api.dylib", "libonnxruntime.1.dylib"],
     linux: ["libzvec_c_api.so", "libonnxruntime.so.1.24.2"],
@@ -78,7 +72,7 @@ test("includes model runtime libraries but excludes build files and other platfo
     const destination = join(root, platform, "lib");
     const files = await stageZvecRuntime(source, destination, platform);
     assert.deepEqual(
-      files.filter((file) => !file.includes("/data/")).sort(),
+      files.sort(),
       libraries.map((name) => `lib/${name}`).sort(),
     );
     for (const name of libraries) {
@@ -108,11 +102,8 @@ test("materializes cached model runtime symlinks and rejects broken runtime link
     const source = join(root, platform, "profile");
     const cache = join(root, platform, "ort-cache");
     const destination = join(root, platform, "package", "lib");
-    await mkdir(join(source, "data", "jieba_dict"), { recursive: true });
+    await mkdir(source, { recursive: true });
     await mkdir(cache, { recursive: true });
-    for (const name of ["jieba.dict.utf8", "hmm_model.utf8"]) {
-      await writeFile(join(source, "data", "jieba_dict", name), name);
-    }
     await writeFile(join(source, zvec), zvec);
     for (const name of new Set(Object.values(runtimeLinks))) {
       await writeFile(join(cache, name), `${platform}:${name}`);
@@ -133,8 +124,6 @@ test("materializes cached model runtime symlinks and rejects broken runtime link
     const files = await stageZvecRuntime(source, destination, platform);
     assert.deepEqual(files.sort(), [
       `lib/${zvec}`,
-      "lib/data/jieba_dict/jieba.dict.utf8",
-      "lib/data/jieba_dict/hmm_model.utf8",
       ...Object.keys(runtimeLinks).map((name) => `lib/${name}`),
     ].sort());
     await rm(cache, { recursive: true });
@@ -167,13 +156,11 @@ test("stages a complete native bundle with one binary and sibling libraries", as
     const source = join(root, `${entry.target}-source`);
     const destination = join(root, `${entry.target}-package`);
     await mkdir(join(source, "bin"), { recursive: true });
-    await mkdir(join(source, "lib/data/jieba_dict"), { recursive: true });
+    await mkdir(join(source, "lib"), { recursive: true });
     await writeFile(join(source, "bin", configuration.binary), `${entry.target} binary\n`);
     await chmod(join(source, "bin", configuration.binary), 0o755);
     await writeFile(join(source, "lib", configuration.zvec), `${entry.target} zvec\n`);
     await writeFile(join(source, "lib", configuration.backend), `${entry.target} backend\n`);
-    await writeFile(join(source, "lib/data/jieba_dict/jieba.dict.utf8"), "dictionary\n");
-    await writeFile(join(source, "lib/data/jieba_dict/hmm_model.utf8"), "model\n");
 
     const files = await stageRuntimeBundle(
       source,
@@ -184,8 +171,6 @@ test("stages a complete native bundle with one binary and sibling libraries", as
     assert.deepEqual(files, [
       `bin/${configuration.binary}`,
       `lib/${configuration.backend}`,
-      "lib/data/jieba_dict/hmm_model.utf8",
-      "lib/data/jieba_dict/jieba.dict.utf8",
       `lib/${configuration.zvec}`,
     ].sort());
     for (const file of files) {
@@ -214,10 +199,8 @@ test("keeps only CUDA plugins in the secondary backend directory", async (t) => 
     const source = join(root, platform, "source");
     await mkdir(join(source, "bin"), { recursive: true });
     await mkdir(join(source, "lib/cuda12"), { recursive: true });
-    await mkdir(join(source, "lib/data/jieba_dict"), { recursive: true });
     await writeFile(join(source, "bin", binary), binary);
-    for (const file of [zvec, cuda, core, `cuda12/${cuda}`,
-      "data/jieba_dict/jieba.dict.utf8", "data/jieba_dict/hmm_model.utf8"]) {
+    for (const file of [zvec, cuda, core, `cuda12/${cuda}`]) {
       await writeFile(join(source, "lib", file), file);
     }
     const files = await stageRuntimeBundle(source, join(root, platform), platform, binary);
@@ -235,12 +218,10 @@ test("rejects symbolic links in a native bundle", async (t) => {
   t.after(() => rm(root, { recursive: true, force: true }));
   const source = join(root, "source");
   await mkdir(join(source, "bin"), { recursive: true });
-  await mkdir(join(source, "lib/data/jieba_dict"), { recursive: true });
+  await mkdir(join(source, "lib"), { recursive: true });
   await writeFile(join(source, "bin/zg"), "binary\n");
   await writeFile(join(source, "lib/libzvec_c_api.so"), "zvec\n");
   await writeFile(join(source, "lib/libggml.so.0"), "ggml\n");
-  await writeFile(join(source, "lib/data/jieba_dict/jieba.dict.utf8"), "dictionary\n");
-  await writeFile(join(source, "lib/data/jieba_dict/hmm_model.utf8"), "model\n");
   await symlink("libggml.so.0", join(source, "lib/libggml.so"));
   await assert.rejects(
     stageRuntimeBundle(source, join(root, "package"), "linux", "zg"),

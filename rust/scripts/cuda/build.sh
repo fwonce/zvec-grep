@@ -75,9 +75,6 @@ if [[ ! -f "${profile_dir}/libzvec_c_api.so" ]]; then
   exit 1
 fi
 cp -L --preserve=mode,timestamps -- "${profile_dir}/libzvec_c_api.so" "${staging_dir}/lib/"
-if [[ -d "${profile_dir}/data" ]]; then
-  cp -a -- "${profile_dir}/data" "${staging_dir}/lib/"
-fi
 
 patchelf --set-rpath '$ORIGIN/../lib' "${staging_dir}/bin/zg"
 while IFS= read -r -d '' file; do

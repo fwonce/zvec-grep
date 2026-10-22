@@ -617,7 +617,12 @@ jobs:
                       *[argument for key, value in variables.items() for argument in ("--env", f"{key}={value}")],
                       image, "bash", "-euo", "pipefail", "-c",
                       'export LD_LIBRARY_PATH="/gpu-tests/lib:${LD_LIBRARY_PATH:-}"; '
-                      'if [ "$1" = model ]; then apt-get update -qq; apt-get install --yes --no-install-recommends ca-certificates >/dev/null; fi; '
+                      # The pinned image supplies CUDA. Restrict apt to Ubuntu
+                      # sources so NVIDIA mirror syncs cannot block certificates.
+                      'if [ "$1" = model ]; then '
+                      'apt_options=(-o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- -o APT::Update::Error-Mode=any -o Acquire::Retries=3); '
+                      'apt-get "${apt_options[@]}" update -qq; '
+                      'apt-get "${apt_options[@]}" install --yes --no-install-recommends ca-certificates >/dev/null; fi; '
                       'shift; exec timeout 900 "$@"', "gpu-test", "model" if model else "c5", *command,
                   ]
               log_path = logs / f"{name}.log"

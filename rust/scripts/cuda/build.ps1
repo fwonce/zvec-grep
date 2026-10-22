@@ -96,12 +96,6 @@ try {
         --cache-dir (Join-Path $targetDirectory "ort-cuda12") --destination $libDirectory
     if ($LASTEXITCODE -ne 0) { throw "Preparing the ORT CUDA 12 runtime failed" }
 
-    $dataDirectory = Join-Path $profileDirectory "data"
-    if (-not (Test-Path -LiteralPath $dataDirectory -PathType Container)) {
-        throw "zvec runtime data directory is missing: $dataDirectory"
-    }
-    Copy-Item -LiteralPath $dataDirectory -Destination (Join-Path $libDirectory "data") -Recurse
-
     if ($PrimaryOnly) {
         # Incomplete CI output must not replace a complete local bundle.
         $bundleDirectory = Join-Path $profileDirectory "zg-cuda-staging"

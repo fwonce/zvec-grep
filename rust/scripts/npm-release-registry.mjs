@@ -191,7 +191,7 @@ export async function collectRelease({ manifest, version, tarballRoot, targets }
     "```",
     "",
     "Use only the command for your platform. On Windows, use zg.cmd if PowerShell blocks the generated zg.ps1 shim.",
-    "The native packages contain the executable, shared runtime libraries, and Jieba dictionaries.",
+    "The native packages contain the executable and shared runtime libraries. The zvec library embeds its Jieba dictionary; no external dictionary files are required.",
     "ZG_INSTALL_ACCELERATOR=auto (default) installs CPU first and requests CUDA plugins only when NVIDIA detection succeeds; cpu skips detection/downloads; cuda forces plugin installation and fails if unsuccessful. Later use npm rebuild -g @zvec/zvec-grep with the same settings; no compilation is performed. Stop zg/daemon first and restart it afterwards.",
     "CPU installs do not require CUDA component tarballs. CUDA plugins are exact-version, core-bound and integrity-checked; Linux ORT fragments are concatenated and checked before activation. ZG_INSTALL_OFFLINE=1 disables network downloads; ZG_PLUGIN_DIR selects local archives. --ignore-scripts skips even CPU bootstrap: explicitly permit the package's scripts and run npm rebuild to initialize it.",
     "Every compressed npm tarball must be at most 350 MiB; this is checked at pack, collect, and publication preflight.",

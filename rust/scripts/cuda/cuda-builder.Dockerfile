@@ -4,8 +4,12 @@ FROM ${CUDA_IMAGE}
 ARG DEBIAN_FRONTEND=noninteractive
 ARG RUST_VERSION=1.98.0
 
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends \
+# CUDA is already supplied by the pinned image. Build tools come from Ubuntu;
+# NVIDIA repository metadata is not needed and may be mid-mirror-sync.
+RUN set -- -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- \
+        -o APT::Update::Error-Mode=any -o Acquire::Retries=3 \
+    && apt-get "$@" update \
+    && apt-get "$@" install --yes --no-install-recommends \
         binutils \
         build-essential \
         ca-certificates \

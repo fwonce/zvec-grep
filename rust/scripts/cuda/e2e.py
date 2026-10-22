@@ -204,9 +204,7 @@ def case_environment(work, backend):
     # a device override inherited from the runner.
     env.pop("ZVEC_GREP_DEVICE", None)
     env.update({
-        # The registry is independent of ZVEC_GREP_HOME and XDG_CONFIG_HOME.
-        # Each invocation/backend must own its registry, including on Windows.
-        "ZVEC_GREP_WORKSPACE_REGISTRY": str(root / "workspaces.json"),
+        # Each invocation/backend owns its workspace root and runtime home.
         "ZVEC_GREP_HOME": str(root / "runtime"),
         "ORT_LOG": "verbose",
         "RUST_LOG": "warn,zg=debug,zg_engine=debug,ort=trace,llama-cpp-2=info",
@@ -233,7 +231,7 @@ def run_case(binary, model_cache, work, logs, backend, model, expected_gguf_cuda
             return cuda_evidence(stderr, backend, expected_gguf_cuda)
         return cpu_evidence(stderr, backend, device)
     _, index_err = run_zg(binary, workspace, logs, "index", [
-        "--index", "--name", f"{device}-e2e-{backend}", "--mode", "direct",
+        "--index", "--mode", "direct",
         "--embedding", model, "--index-embedding-concurrency", "2", *runtime_args,
     ], env)
     require(index_err, "Index complete")

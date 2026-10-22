@@ -569,7 +569,6 @@ for (const target of ["linux-x64-gnu", "win32-x64-msvc"]) {
     const platform = loadReleaseManifest().platforms.find((p) => p.target === target);
     const bundle = join(root, "bundle");
     const files = [`bin/${platform.binary}`, `lib/${platform.os === "win32" ? "zvec_c_api.dll" : "libzvec_c_api.so"}`,
-      "lib/data/jieba_dict/jieba.dict.utf8", "lib/data/jieba_dict/hmm_model.utf8",
       ...new Set(platform.components.map((c) => c.file))];
     for (const file of files) {
       await mkdir(join(bundle, file, ".."), { recursive: true });

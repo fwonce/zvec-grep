@@ -77,6 +77,17 @@ pub fn stage(root: &Path, manifest_path: &Path, target: &str, out: &Path) -> Res
         .collect();
     let mut staged = Vec::new();
     for library in &libraries {
+        // The pinned SDK's common-base CMake target is always STATIC. On
+        // Windows its .lib is nevertheless recorded as dylib= (MSVC uses .lib
+        // for both static and import libraries). Do not invent a DLL for this
+        // archive, but still require DLLs for every other dynamic link entry.
+        if target.contains("windows")
+            && *library == "llama-common-base"
+            && manifest.files.contains_key("lib/llama-common-base.lib")
+            && !manifest.files.contains_key("lib/llama-common-base.dll")
+        {
+            continue;
+        }
         let mut found = false;
         for (name, digest) in &manifest.files {
             let Some(filename) = name.strip_prefix("lib/") else {

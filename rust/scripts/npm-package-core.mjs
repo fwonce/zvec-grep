@@ -282,11 +282,7 @@ export async function stageZvecRuntime(sourceDir, libDir, platform) {
   }[platform];
   if (!library)
     throw new Error(`unsupported zvec runtime platform: ${platform}`);
-  const files = [
-    library,
-    "data/jieba_dict/jieba.dict.utf8",
-    "data/jieba_dict/hmm_model.utf8",
-  ];
+  const files = [library];
   for (const file of files) {
     const source = join(sourceDir, file);
     if (!(await stat(source)).isFile())
@@ -353,8 +349,6 @@ export async function stageRuntimeBundle(sourceDir, destinationRoot, platform, b
   const required = [
     `bin/${binary}`,
     `lib/${library}`,
-    "lib/data/jieba_dict/jieba.dict.utf8",
-    "lib/data/jieba_dict/hmm_model.utf8",
   ];
   const directories = await readdir(sourceDir, { withFileTypes: true });
   if (directories.length !== 2 || directories.some((entry) =>
