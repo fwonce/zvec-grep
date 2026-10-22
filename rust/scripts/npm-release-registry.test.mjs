@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { cargoPackageVersion, loadReleaseManifest, MAX_NPM_TARBALL_BYTES, nativePackageEntries, run, sha256File } from "./npm-package-core.mjs";
 import { coreIdentity } from "../npm/meta/plugins.cjs";
 import { materialize, verifyInstallation } from "../npm/meta/install.cjs";
+import { smokeRegistryRelease } from "./npm-release-smoke.mjs";
 import {
   checkPublishedPackage,
   collectRelease,
@@ -248,10 +249,9 @@ test("default collection still requires every platform and treats all targets as
   );
 });
 
-test("verification metadata copies collected bytes without repacking native artifacts", async (t) => {
-  const targets = ["linux-x64-gnu"];
-  const fixture = await releaseFixture(t, { targets });
-  const release = await collectRelease({ ...fixture, version: entry.version, targets });
+test("verification metadata preserves collected bytes and supports registry smoke without native tarballs", async (t) => {
+  const fixture = await releaseFixture(t);
+  const release = await collectRelease({ ...fixture, version: entry.version });
   const destination = join(fixture.tarballRoot, "verification");
   await stageVerificationMetadata({ ...fixture, release, destination });
   const meta = release.packages.find((pkg) => pkg.target === "meta");
@@ -259,6 +259,30 @@ test("verification metadata copies collected bytes without repacking native arti
   assert.equal(await sha256File(join(destination, meta.file)), meta.sha256);
   assert.equal(await readFile(join(destination, "release.json"), "utf8"), await readFile(join(fixture.tarballRoot, "release.json"), "utf8"));
   for (const pkg of release.packages) assert.equal(await sha256File(join(fixture.tarballRoot, pkg.file)), pkg.sha256);
+  for (const pkg of release.packages.filter((pkg) => pkg.target !== "meta")) await rm(join(fixture.tarballRoot, pkg.file));
+  const prefixRoot = join(destination, "registry-smoke");
+  let verifiedPackages = 0;
+  let probes = 0;
+  await smokeRegistryRelease({
+    manifest: fixture.manifest,
+    release: JSON.parse(await readFile(join(destination, "release.json"), "utf8")),
+    baseline: "0.2.2", prefixRoot,
+    registryFetch: async (url) => {
+      const pkg = release.packages.find((pkg) => url.endsWith(`/${encodeURIComponent(pkg.name)}/${pkg.version}`));
+      assert.ok(pkg);
+      verifiedPackages++;
+      return { ok: true, json: async () => ({ dist: { integrity: pkg.integrity } }) };
+    },
+    runNpm: (_, args) => {
+      assert.ok(args.includes("--registry=https://registry.npmjs.org"));
+      assert.ok(!args.some((arg) => arg.endsWith(".tgz")));
+    },
+    verifyInstalled: async () => { await mkdir(prefixRoot, { recursive: true }); return { components: [] }; },
+    probe: async () => { probes++; },
+    probePrevious: async () => {},
+  });
+  assert.equal(verifiedPackages, release.packages.length);
+  assert.equal(probes, 2);
   await writeFile(join(fixture.tarballRoot, meta.file), "changed after collection");
   await assert.rejects(stageVerificationMetadata({ ...fixture, release, destination }), /invalid collected meta package/);
 });

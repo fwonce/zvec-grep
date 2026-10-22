@@ -81,6 +81,10 @@ function parseOptions(args) {
       options.expectCpu = true;
       continue;
     }
+    if (argument === "--expect-cuda") {
+      options.expectCuda = true;
+      continue;
+    }
     const fields = new Map([
       ["--binary", "binary"],
       ["--bundle-dir", "bundleDir"],
@@ -402,8 +406,8 @@ async function main() {
     throw new Error("--targets is only supported by collect");
   }
   const artifactCommands = ["smoke-artifacts", "install-artifacts", "rebuild-artifacts"];
-  if (options.expectCpu && !["smoke-artifacts", "install-artifacts"].includes(command)) {
-    throw new Error("--expect-cpu is only supported by artifact installation/verification");
+  if ((options.expectCpu || options.expectCuda) && !["smoke-artifacts", "install-artifacts"].includes(command)) {
+    throw new Error("--expect-cpu and --expect-cuda are only supported by artifact installation/verification");
   }
   if (command === "rebuild-artifacts" && options.accelerator) {
     throw new Error("rebuild-artifacts always supplements the existing CPU installation with CUDA");
@@ -456,6 +460,7 @@ async function main() {
       target: options.target,
       accelerator: options.accelerator ?? "auto",
       expectCpu: options.expectCpu ?? false,
+      expectCuda: options.expectCuda ?? false,
     });
     if (process.env.GITHUB_OUTPUT) {
       await appendFile(process.env.GITHUB_OUTPUT,
@@ -504,7 +509,7 @@ async function main() {
     return;
   }
   throw new Error(
-    "usage: npm-release.mjs <build|verify|verify-publication|pack-platform|pack-meta|pack-current|install-artifacts|smoke-artifacts|rebuild-artifacts|collect|publish|promote|rollback-version|smoke-registry> [--target TARGET] [--targets TARGET,... (collect only)] [--binary PATH] [--lib-dir PATH] [--bundle-dir PATH] [--output-dir PATH] [--tarball-dir PATH] [--prefix-root PATH] [--accelerator cpu|auto|cuda (artifact installation/verification only)] [--expect-cpu (default auto must not request CUDA)] [--cpu-only] [--no-build]",
+    "usage: npm-release.mjs <build|verify|verify-publication|pack-platform|pack-meta|pack-current|install-artifacts|smoke-artifacts|rebuild-artifacts|collect|publish|promote|rollback-version|smoke-registry> [--target TARGET] [--targets TARGET,... (collect only)] [--binary PATH] [--lib-dir PATH] [--bundle-dir PATH] [--output-dir PATH] [--tarball-dir PATH] [--prefix-root PATH] [--accelerator cpu|auto|cuda (artifact installation/verification only)] [--expect-cpu (default auto must not request CUDA)] [--expect-cuda (CUDA installation required even in auto mode)] [--cpu-only] [--no-build]",
   );
 }
 

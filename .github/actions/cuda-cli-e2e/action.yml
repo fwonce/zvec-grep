@@ -77,10 +77,12 @@ runs:
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         python rust/scripts/cuda/e2e.py --bundle "$env:RUNNER_TEMP/zg-icpu/prefix/node_modules/@zvec/zvec-grep" --model-cache "$env:RUNNER_TEMP/zvec-grep-model-cache" --logs gpu-logs/cuda12 --expected-gguf-cuda 12.4
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        # Retain coverage of fresh automatic GPU installation as well.
-        node rust/scripts/npm-release.mjs install-artifacts --target "${{ inputs.target }}" --tarball-dir "${{ inputs.package_directory }}" --prefix-root "$env:RUNNER_TEMP/zg-i12" --accelerator auto
+        # Verify fresh Auto installation AND omitted-device GPU inference.
+        node rust/scripts/npm-release.mjs install-artifacts --target "${{ inputs.target }}" --tarball-dir "${{ inputs.package_directory }}" --prefix-root "$env:RUNNER_TEMP/zg-i12" --accelerator auto --expect-cuda
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         Copy-Item "$env:RUNNER_TEMP/zg-i12/installation.json" gpu-logs/cuda12-installation.json
+        python rust/scripts/cuda/e2e.py --auto-only --bundle "$env:RUNNER_TEMP/zg-i12/prefix/node_modules/@zvec/zvec-grep" --model-cache "$env:RUNNER_TEMP/zvec-grep-model-cache" --logs gpu-logs/auto-cuda12 --expected-gguf-cuda 12.4
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     - name: Install Windows CUDA 13.1 runtime alongside CUDA 12
       if: runner.os == 'Windows'
       uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
@@ -104,6 +106,8 @@ runs:
       working-directory: ${{ github.workspace }}
       run: |
         python rust/scripts/cuda/e2e.py --bundle "$env:RUNNER_TEMP/zg-icpu/prefix/node_modules/@zvec/zvec-grep" --model-cache "$env:RUNNER_TEMP/zvec-grep-model-cache" --logs gpu-logs/cuda13 --expected-gguf-cuda 13.1
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        python rust/scripts/cuda/e2e.py --auto-only --bundle "$env:RUNNER_TEMP/zg-i12/prefix/node_modules/@zvec/zvec-grep" --model-cache "$env:RUNNER_TEMP/zvec-grep-model-cache" --logs gpu-logs/auto-cuda13 --expected-gguf-cuda 13.1
     - name: Rebuild the Linux CPU installation for GGUF and ONNX CUDA 12
       if: runner.os == 'Linux'
       shell: bash
@@ -130,9 +134,12 @@ runs:
             python3 /work/rust/scripts/cuda/e2e.py \
               --bundle /tmp/zg-install/install/prefix/lib/node_modules/@zvec/zvec-grep \
               --model-cache /model-cache --logs /logs/cuda12 --expected-gguf-cuda 12.4
-            # Retain fresh automatic GPU installation coverage, without repeating inference.
-            node scripts/npm-release.mjs install-artifacts --target "${{ inputs.target }}" --tarball-dir "/work/${{ inputs.package_directory }}" --prefix-root /tmp/zg-i12 --accelerator auto
-            cp /tmp/zg-i12/installation.json /logs/cuda12-installation.json
+            # Keep this fresh Auto prefix for both runtime environments.
+            node scripts/npm-release.mjs install-artifacts --target "${{ inputs.target }}" --tarball-dir "/work/${{ inputs.package_directory }}" --prefix-root /tmp/zg-install/auto --accelerator auto --expect-cuda
+            cp /tmp/zg-install/auto/installation.json /logs/cuda12-installation.json
+            python3 scripts/cuda/e2e.py --auto-only \
+              --bundle /tmp/zg-install/auto/prefix/lib/node_modules/@zvec/zvec-grep \
+              --model-cache /model-cache --logs /logs/auto-cuda12 --expected-gguf-cuda 12.4
           '
     - name: Run Linux GGUF primary on CUDA 13.1
       if: runner.os == 'Linux'
@@ -156,6 +163,9 @@ runs:
             python3 /work/rust/scripts/cuda/e2e.py \
               --bundle /tmp/zg-install/install/prefix/lib/node_modules/@zvec/zvec-grep \
               --model-cache /model-cache --logs /logs/cuda13 --backend gguf --expected-gguf-cuda 13.1
+            python3 /work/rust/scripts/cuda/e2e.py --auto-only \
+              --bundle /tmp/zg-install/auto/prefix/lib/node_modules/@zvec/zvec-grep \
+              --model-cache /model-cache --logs /logs/auto-cuda13 --backend gguf --expected-gguf-cuda 13.1
           '
     - name: Make Linux cache and logs readable
       shell: bash

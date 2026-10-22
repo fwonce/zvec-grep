@@ -1,6 +1,6 @@
 "use strict";
 
-const { createHash } = require("crypto");
+const { createHash, randomBytes } = require("crypto");
 const {
   chmodSync,
   closeSync,
@@ -14,6 +14,7 @@ const {
   readFileSync,
   readSync,
   renameSync,
+  rmdirSync,
   rmSync,
   writeSync,
   writeFileSync,
@@ -95,10 +96,10 @@ function verifyPackageIdentity(root, name, expectedVersion) {
 }
 
 function verifyPayload(platformRoot, entry, expectedVersion) {
-  const packageJson = verifyPackageIdentity(platformRoot, entry.package, expectedVersion);
+  verifyPackageIdentity(platformRoot, entry.package, expectedVersion);
   const checksumPath = join(platformRoot, "checksums.json");
   const checksums = JSON.parse(readFileSync(checksumPath, "utf8"));
-  if (![1, 2, 3].includes(checksums.schemaVersion) || checksums.target !== entry.target) {
+  if (![1, 3].includes(checksums.schemaVersion) || checksums.target !== entry.target) {
     throw new Error(`invalid native checksum manifest for ${entry.package}`);
   }
   const expectedBinary = `bin/${entry.binary}`;
@@ -106,26 +107,14 @@ function verifyPayload(platformRoot, entry, expectedVersion) {
     throw new Error(`native checksum manifest does not contain ${expectedBinary}`);
   }
 
-  const components = checksums.schemaVersion === 2 ? entry.components ?? [] : [];
-  if (checksums.schemaVersion === 2 && (!components.length ||
-      JSON.stringify(checksums.components) !== JSON.stringify(components.map((component) => component.package)) ||
-      Object.keys(packageJson.dependencies ?? {}).length !== components.length ||
-      components.some((component) => packageJson.dependencies?.[component.package] !== expectedVersion))) {
-    throw new Error("native component dependencies do not match the platform manifest");
-  }
-  const externalFiles = new Set(components.map((component) => component.file));
-  for (const file of externalFiles) {
-    if (!checksums.files[file]) throw new Error(`native checksum manifest does not contain ${file}`);
-  }
-  // Validate the complete installed manifest, including files reconstructed later.
+  // Schema 1 is a self-contained package; schema 3 declares optional plugins separately.
   for (const [file, expected] of Object.entries(checksums.files)) {
     checkedPayloadPath(platformRoot, file);
     if (!Number.isSafeInteger(expected.bytes) || expected.bytes < 0 || !/^[a-f0-9]{64}$/.test(expected.sha256)) {
       throw new Error(`invalid native checksum: ${file}`);
     }
   }
-  verifyFiles(platformRoot, Object.fromEntries(
-    Object.entries(checksums.files).filter(([file]) => !externalFiles.has(file))));
+  verifyFiles(platformRoot, checksums.files);
   if (checksums.schemaVersion === 3) readPlugins(platformRoot, entry, expectedVersion, checksums);
   return checksums;
 }
@@ -172,18 +161,6 @@ function verifyFiles(root, files) {
   }
 }
 
-function verifyComponentPayload(metaRoot, platformRoot, entry, component, expectedVersion) {
-  const root = resolvePackageRoot(metaRoot, component.package, platformRoot);
-  verifyPackageIdentity(root, component.package, expectedVersion);
-  const part = JSON.parse(readFileSync(join(root, "checksums.json"), "utf8"));
-  if (part.schemaVersion !== 1 || part.target !== entry.target || part.component !== component.package ||
-      JSON.stringify(Object.keys(part.files ?? {})) !== JSON.stringify([component.payload])) {
-    throw new Error(`invalid native component manifest: ${component.package}`);
-  }
-  verifyFiles(root, part.files);
-  return checkedPayloadPath(root, component.payload);
-}
-
 // Also used by release verification: a successful CPU CLI must not hide missing
 // or corrupt GPU components, even when no GPU is present on the verification host.
 function verifyInstallation({ metaRoot, platformRoot, entry, expectedVersion, requireCuda = false }) {
@@ -201,16 +178,12 @@ function verifyInstallation({ metaRoot, platformRoot, entry, expectedVersion, re
       ...(receipt.components.length ? manifest.files : {}) }));
     return { ...receipt, plugins: receipt.components.length ? manifest.components : [] };
   }
-  const components = checksums.schemaVersion === 2 ? entry.components : [];
-  for (const component of components) {
-    verifyComponentPayload(metaRoot, platformRoot, entry, component, expectedVersion);
-  }
-  verifyFiles(metaRoot, Object.fromEntries(Object.entries(checksums.files).map(([file, value]) =>
-    [file === `bin/${entry.binary}` ? "bin/zg.exe" : file, value])));
-  return { target: entry.target, version: expectedVersion, components: components.map((component) => component.package) };
+  if (requireCuda) throw new Error("required CUDA plugins missing");
+  verifyFiles(metaRoot, installedFiles(entry, checksums.files));
+  return { target: entry.target, version: expectedVersion, components: [] };
 }
 
-function materializeLegacy({ metaRoot, platformRoot, entry, expectedVersion }) {
+function materializeBase({ metaRoot, platformRoot, entry, expectedVersion }) {
   const checksums = verifyPayload(platformRoot, entry, expectedVersion);
 
   const temporaryRoot = join(metaRoot, `.native-${process.pid}.tmp`);
@@ -231,37 +204,7 @@ function materializeLegacy({ metaRoot, platformRoot, entry, expectedVersion }) {
     copyFileSync(join(sourceBin, entry.binary), join(stagedBin, entry.binary));
     copyTreeSync(sourceLib, stagedLib);
 
-    const components = checksums.schemaVersion === 2 ? entry.components : [];
-    for (const file of new Set(components.map((component) => component.file))) {
-      const sources = [];
-      for (const component of components.filter((candidate) => candidate.file === file)) {
-        sources.push(verifyComponentPayload(metaRoot, platformRoot, entry, component, expectedVersion));
-      }
-      const destination = checkedPayloadPath(temporaryRoot, file);
-      mkdirSync(dirname(destination), { recursive: true });
-      // Concatenate in manifest order with bounded memory. Even the complete
-      // Linux ORT provider can exceed Node's maximum string/buffer sizes.
-      const output = openSync(destination, "wx", lstatSync(sources[0]).mode);
-      const buffer = Buffer.allocUnsafe(1024 * 1024);
-      try {
-        for (const source of sources) {
-          const input = openSync(source, "r");
-          try {
-            let count;
-            while ((count = readSync(input, buffer, 0, buffer.length, null)) > 0) {
-              let offset = 0;
-              while (offset < count) offset += writeSync(output, buffer, offset, count - offset);
-            }
-          } finally {
-            closeSync(input);
-          }
-        }
-      } finally {
-        closeSync(output);
-      }
-    }
-    // Verify the original full runtime manifest before touching the previous
-    // installation. Missing/swapped/truncated parts cannot become loadable DLLs.
+    // Verify the complete CPU base before touching the previous installation.
     verifyFiles(temporaryRoot, checksums.files);
 
     mkdirSync(metaBin, { recursive: true });
@@ -308,22 +251,73 @@ function writeReceipt(metaRoot, receipt) {
   renameSync(temporary, join(metaRoot, "native-install.json"));
 }
 
+function readInstallLock(path) {
+  let identity;
+  try { identity = readFileSync(path, "utf8"); } catch (error) {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  }
+  let record;
+  try { record = JSON.parse(identity); } catch { /* invalid/partially written lock: fail closed */ }
+  // Retain recovery of the previous PID-only format.
+  const pid = typeof record === "number" ? record : record?.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0 ||
+      (typeof record !== "number" && typeof record?.token !== "string")) {
+    throw new Error("invalid installation lock; inspect .native-install.lock before retrying");
+  }
+  return { pid, identity };
+}
+
+function ownerAlive(pid) {
+  try { process.kill(pid, 0); } catch (error) { if (error.code === "ESRCH") return false; }
+  return true; // Permission/query errors must not authorize deleting a lock.
+}
+
+function openInstallLock(path) {
+  try { return openSync(path, "wx"); } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    throw new Error("another native installation is in progress; retry after it finishes");
+  }
+}
+
+function acquireInstallLock(path) {
+  const previous = readInstallLock(path);
+  if (!previous) return openInstallLock(path);
+  if (ownerAlive(previous.pid)) throw new Error("another native installation is in progress; retry after it finishes");
+  const recovery = `${path}.recovery`;
+  // Only one stale-owner recovery may inspect/remove/replace the lock at once.
+  // Never reclaim this short-lived guard automatically: doing so would recreate
+  // the same race one level up. A crash here requires manual inspection.
+  try { mkdirSync(recovery); } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    throw new Error("native lock recovery is in progress; if no installer is running, inspect .native-install.lock.recovery before retrying");
+  }
+  try {
+    const current = readInstallLock(path);
+    if (current && (current.identity !== previous.identity || ownerAlive(current.pid))) {
+      throw new Error("installation lock owner changed; retry after the current installation finishes");
+    }
+    if (current) rmSync(path);
+    // A fresh installer may win this gap; exclusive create must then fail,
+    // without removing its replacement lock.
+    return openInstallLock(path);
+  } finally { rmdirSync(recovery); }
+}
+
 function installLock(metaRoot, action) {
   mkdirSync(metaRoot, { recursive: true });
   const path = join(metaRoot, ".native-install.lock");
-  if (existsSync(path)) {
-    const pid = Number(readFileSync(path, "utf8"));
-    if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("invalid installation lock; inspect .native-install.lock before retrying");
-    let alive = true;
-    try { process.kill(pid, 0); } catch (error) { if (error.code === "ESRCH") alive = false; }
-    if (alive) throw new Error("another native installation is in progress; retry after it finishes");
-    rmSync(path);
-  }
-  const fd = openSync(path, "wx");
+  const identity = JSON.stringify({ pid: process.pid, token: randomBytes(16).toString("hex") });
+  const fd = acquireInstallLock(path);
   try {
-    writeFileSync(fd, String(process.pid));
+    writeFileSync(fd, identity);
     return action();
-  } finally { closeSync(fd); rmSync(path, { force: true }); }
+  } finally {
+    closeSync(fd);
+    // A live owner cannot be reclaimed by this protocol. Also refuse to delete
+    // a lock replaced externally (or by a different invocation in this process).
+    if (readInstallLock(path)?.identity === identity) rmSync(path);
+  }
 }
 
 function assemblePlugins(manifest, config, temporary, fetchArchive) {
@@ -354,15 +348,15 @@ function materialize(options) {
   const checksums = verifyPayload(platformRoot, entry, expectedVersion);
   return installLock(metaRoot, () => {
     if (checksums.schemaVersion !== 3) {
-      materializeLegacy(options);
-      if (config.mode === "cuda" && checksums.schemaVersion !== 2) throw new Error("this native package has no CUDA plugin support");
+      materializeBase(options);
+      if (config.mode === "cuda") throw new Error("this native package has no CUDA plugin support");
       return verifyInstallation(options);
     }
     const manifest = readPlugins(platformRoot, entry, expectedVersion, checksums);
     let installed;
     try { installed = verifyInstallation(options); } catch { /* bootstrap or repair from the verified base */ }
     if (!installed) {
-      materializeLegacy(options);
+      materializeBase(options);
       installed = { schemaVersion: 1, target: entry.target, version: expectedVersion,
         coreId: manifest.coreId, components: [] };
       writeReceipt(metaRoot, installed);
@@ -400,13 +394,13 @@ function materialize(options) {
   });
 }
 
-function resolvePackageRoot(metaRoot, packageName, platformRoot = metaRoot) {
+function resolvePackageRoot(metaRoot, packageName) {
   try {
-    return dirname(require.resolve(`${packageName}/package.json`, { paths: [resolve(platformRoot), resolve(metaRoot)] }));
+    return dirname(require.resolve(`${packageName}/package.json`, { paths: [resolve(metaRoot)] }));
   } catch (error) {
     const detail = error && error.code === "MODULE_NOT_FOUND" ? "" : ` (${error.message})`;
     throw new Error(
-      `missing ${packageName}; reinstall without --omit=optional or install all exact-version platform component tarballs${detail}`,
+      `missing ${packageName}; reinstall without --omit=optional or install the exact-version platform base tarball${detail}`,
     );
   }
 }

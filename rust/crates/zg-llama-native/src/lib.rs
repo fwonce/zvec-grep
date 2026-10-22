@@ -10,7 +10,7 @@ use std::{
 };
 
 mod cuda;
-pub use cuda::check_cuda12_driver;
+pub use cuda::{check_cuda12_driver, check_cuda13_driver};
 
 static REGISTRY: Mutex<()> = Mutex::new(());
 

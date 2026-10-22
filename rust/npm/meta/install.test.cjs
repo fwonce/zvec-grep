@@ -126,27 +126,26 @@ test("selects one published platform and rejects unsupported libc", () => {
   );
 });
 
-function splitFixture(target = "linux-x64-gnu") {
+function componentFixture(target = "linux-x64-gnu") {
   const paths = fixture();
   const platform = require("../platforms.json").platforms.find((candidate) => candidate.target === target);
   const manifest = JSON.parse(readFileSync(join(paths.platformRoot, "checksums.json"), "utf8"));
-  manifest.schemaVersion = 2;
   manifest.target = target;
-  manifest.components = platform.components.map((component) => component.package);
   if (platform.binary !== "zg") {
     renameSync(join(paths.platformRoot, "bin/zg"), join(paths.platformRoot, "bin", platform.binary));
     manifest.files[`bin/${platform.binary}`] = manifest.files["bin/zg"];
     delete manifest.files["bin/zg"];
   }
   const originals = new Map();
+  const pluginFiles = {};
   for (const file of new Set(platform.components.map((component) => component.file))) {
     const contents = Buffer.alloc(2 * 1024 * 1024 + 37);
     for (let i = 0; i < contents.length; i++) contents[i] = (i + file.length) % 251;
     originals.set(file, contents);
-    manifest.files[file] = { bytes: contents.length, sha256: sha256(contents) };
+    pluginFiles[file] = { bytes: contents.length, sha256: sha256(contents) };
     const siblings = platform.components.filter((component) => component.file === file);
     for (const [index, component] of siblings.entries()) {
-      const directory = join(paths.root, "node_modules", component.package);
+      const directory = join(paths.root, "component-sources", component.package);
       mkdirSync(join(directory, component.payload, ".."), { recursive: true });
       const bytes = contents.subarray(Math.floor(contents.length * index / siblings.length),
         Math.floor(contents.length * (index + 1) / siblings.length));
@@ -161,71 +160,79 @@ function splitFixture(target = "linux-x64-gnu") {
   writeFileSync(join(paths.platformRoot, "checksums.json"), JSON.stringify(manifest));
   writeFileSync(join(paths.platformRoot, "package.json"), JSON.stringify({
     name: platform.package, version: "0.0.1",
-    dependencies: Object.fromEntries(platform.components.map((component) => [component.package, "0.0.1"]).reverse()),
   }));
-  return { ...paths, entry: platform, originals };
+  return { ...paths, entry: platform, originals, pluginFiles };
 }
 
 for (const target of ["linux-x64-gnu", "win32-x64-msvc"]) {
   test(`assembles ${target} CUDA components into the unchanged bin/lib layout`, (t) => {
-    const paths = splitFixture(target);
-    t.after(() => rmSync(paths.root, { recursive: true, force: true }));
-    materialize({ ...paths, expectedVersion: "0.0.1" });
+    const paths = optionalFixture(t, target);
+    const options = { ...paths, config: { ...paths.config, mode: "cuda" } };
+    materialize(options);
     for (const [file, contents] of paths.originals) {
       assert.deepEqual(readFileSync(join(paths.metaRoot, file)), contents);
     }
     assert.match(readFileSync(join(paths.metaRoot, "bin/zg.exe"), "utf8"), /0\.0\.1/);
     // Reinstallation also verifies and replaces an existing complete runtime.
-    materialize({ ...paths, expectedVersion: "0.0.1" });
+    materialize(options);
   });
 }
 
-for (const failure of ["missing", "version", "corrupt", "swapped", "untracked", "traversal"]) {
-  test(`rejects ${failure} components without replacing the previous installation`, (t) => {
-    const paths = splitFixture();
-    t.after(() => rmSync(paths.root, { recursive: true, force: true }));
-    mkdirSync(join(paths.metaRoot, "lib"), { recursive: true });
-    writeFileSync(join(paths.metaRoot, "lib/previous.so"), "previous installation");
-    const parts = paths.entry.components.filter((component) => component.payload.startsWith("parts/"));
-    const component = parts[0];
-    const directory = join(paths.root, "node_modules", component.package);
-    const checksums = JSON.parse(readFileSync(join(directory, "checksums.json"), "utf8"));
-    if (failure === "missing") rmSync(directory, { recursive: true, force: true });
-    if (failure === "version") writeFileSync(join(directory, "package.json"), JSON.stringify({ name: component.package, version: "0.0.2" }));
-    if (failure === "corrupt") writeFileSync(join(directory, component.payload), "corrupt");
-    if (failure === "untracked") writeFileSync(join(directory, "parts/untracked"), "unexpected");
-    if (failure === "traversal") {
-      checksums.files = { "parts/../../outside": Object.values(checksums.files)[0] };
-      writeFileSync(join(directory, "checksums.json"), JSON.stringify(checksums));
-    }
-    if (failure === "swapped") {
-      // Make the fragment's own hash valid: only the final complete-file hash
-      // can detect a valid fragment being put in the wrong position.
-      const wrong = readFileSync(join(paths.root, "node_modules", parts[1].package, parts[1].payload));
-      writeFileSync(join(directory, component.payload), wrong);
-      checksums.files[component.payload] = { bytes: wrong.length, sha256: sha256(wrong) };
-      writeFileSync(join(directory, "checksums.json"), JSON.stringify(checksums));
-    }
-    assert.throws(() => materialize({ ...paths, expectedVersion: "0.0.1" }),
+for (const failure of ["missing", "version", "corrupt", "swapped", "unexpected-manifest-file", "traversal"]) {
+  test(`rejects ${failure} optional components without replacing the CPU installation`, (t) => {
+    const paths = optionalFixture(t, "linux-x64-gnu", ({ source, component, paths }) => {
+      const parts = paths.entry.components.filter((candidate) => candidate.payload.startsWith("parts/"));
+      if (component !== parts[0]) return;
+      const checksums = JSON.parse(readFileSync(join(source, "checksums.json"), "utf8"));
+      if (failure === "version") writeFileSync(join(source, "package.json"), JSON.stringify({ name: component.package, version: "0.0.2" }));
+      if (failure === "corrupt") writeFileSync(join(source, component.payload), "corrupt");
+      if (failure === "unexpected-manifest-file") checksums.files["parts/untracked"] = { bytes: 0, sha256: sha256("") };
+      if (failure === "traversal") checksums.files = { "parts/../../outside": checksums.files[component.payload] };
+      if (failure === "swapped") {
+        // Both the archive and fragment hashes are valid. Only the reconstructed
+        // whole-library hash can detect a fragment in the wrong position.
+        const wrong = readFileSync(join(paths.root, "component-sources", parts[1].package, parts[1].payload));
+        writeFileSync(join(source, component.payload), wrong);
+        checksums.files[component.payload] = { bytes: wrong.length, sha256: sha256(wrong) };
+      }
+      writeFileSync(join(source, "checksums.json"), JSON.stringify(checksums));
+      if (failure === "swapped") return checksums.files[component.payload];
+    });
+    if (failure === "missing") rmSync(join(paths.config.directory, paths.plugins.components.at(-1).tarball));
+    materialize(paths);
+    const before = installedBaseSnapshot(paths);
+    assert.throws(() => materialize({ ...paths, config: { ...paths.config, mode: "cuda" } }),
       /missing|mismatch|checksum|manifest|ENOENT/);
-    assert.equal(readFileSync(join(paths.metaRoot, "bin/zg.exe"), "utf8"), "placeholder\n");
-    assert.equal(readFileSync(join(paths.metaRoot, "lib/previous.so"), "utf8"), "previous installation");
+    assert.deepEqual(installedBaseSnapshot(paths), before);
+    assert.deepEqual(verifyInstallation(paths).components, []);
+    for (const file of paths.originals.keys()) assert.equal(existsSync(join(paths.metaRoot, file)), false);
   });
 }
 
-function optionalFixture(t, target = "linux-x64-gnu") {
-  const paths = splitFixture(target);
+test("rejects the unpublished schema 2 without changing the existing installation", (t) => {
+  const paths = fixture();
+  t.after(() => rmSync(paths.root, { recursive: true, force: true }));
+  materialize({ ...paths, entry, expectedVersion: "0.0.1" });
+  const before = readFileSync(join(paths.metaRoot, "bin/zg.exe"));
+  const checksums = JSON.parse(readFileSync(join(paths.platformRoot, "checksums.json")));
+  checksums.schemaVersion = 2;
+  writeFileSync(join(paths.platformRoot, "checksums.json"), JSON.stringify(checksums));
+  assert.throws(() => materialize({ ...paths, entry, expectedVersion: "0.0.1" }), /invalid native checksum manifest/);
+  assert.deepEqual(readFileSync(join(paths.metaRoot, "bin/zg.exe")), before);
+});
+
+function optionalFixture(t, target = "linux-x64-gnu", mutateComponent = () => {}) {
+  const paths = componentFixture(target);
   t.after(() => rmSync(paths.root, { recursive: true, force: true }));
   const checksums = JSON.parse(readFileSync(join(paths.platformRoot, "checksums.json")));
-  const files = {};
-  for (const file of paths.originals.keys()) { files[file] = checksums.files[file]; delete checksums.files[file]; }
   checksums.schemaVersion = 3;
-  delete checksums.components;
   checksums.coreId = coreIdentity(paths.entry.target, "0.0.1", checksums.files);
   const directory = join(paths.root, "archives");
   mkdirSync(directory);
   const components = paths.entry.components.map((component, index) => {
-    const source = join(paths.root, "node_modules", component.package);
+    const source = join(paths.root, "component-sources", component.package);
+    const checksum = JSON.parse(readFileSync(join(source, "checksums.json"))).files[component.payload];
+    const pinnedChecksum = mutateComponent({ source, component, paths }) ?? checksum;
     const packing = join(paths.root, "packing", String(index));
     cpSync(source, join(packing, "package"), { recursive: true });
     const tarball = packageFilename(component.package, "0.0.1");
@@ -235,11 +242,11 @@ function optionalFixture(t, target = "linux-x64-gnu") {
     const bytes = readFileSync(join(directory, tarball));
     return { ...component, version: "0.0.1", tarball, archiveBytes: bytes.length,
       integrity: `sha512-${createHash("sha512").update(bytes).digest("base64")}`,
-      checksum: JSON.parse(readFileSync(join(source, "checksums.json"))).files[component.payload] };
+      checksum: pinnedChecksum };
   });
   // No installed component packages may be needed for CPU or later CUDA installation.
-  rmSync(join(paths.root, "node_modules"), { recursive: true });
-  const plugins = { schemaVersion: 1, target, version: "0.0.1", coreId: checksums.coreId, components, files };
+  rmSync(join(paths.root, "component-sources"), { recursive: true });
+  const plugins = { schemaVersion: 1, target, version: "0.0.1", coreId: checksums.coreId, components, files: paths.pluginFiles };
   const raw = JSON.stringify(plugins);
   checksums.pluginsSha256 = sha256(raw);
   writeFileSync(join(paths.platformRoot, "plugins.json"), raw);
@@ -444,6 +451,123 @@ test("concurrent installation is rejected without touching the CPU runtime", (t)
   writeFileSync(join(fixture.metaRoot, ".native-install.lock"), String(process.pid));
   assert.throws(() => materialize(fixture), /installation is in progress/);
   assert.deepEqual(verifyInstallation(fixture).components, []);
+});
+
+function staleLockRetry(t, fixture, pauseWriter) {
+  const installer = join(__dirname, "install.cjs");
+  const options = { metaRoot: fixture.metaRoot, platformRoot: fixture.platformRoot,
+    entry: fixture.entry, expectedVersion: fixture.expectedVersion,
+    config: { ...fixture.config, mode: "cuda" } };
+  const source = `
+    const fs = require('node:fs');
+    const [installer, serialized, pauseWriter] = process.argv.slice(1);
+    const options = JSON.parse(serialized);
+    const signal = name => fs.writeSync(1, name + '\\n');
+    const resume = () => {
+      if (fs.readSync(0, Buffer.alloc(1), 0, 1, null) !== 1) throw new Error('missing test barrier');
+    };
+    const kill = process.kill;
+    let observed = false;
+    process.kill = (pid, signalNumber) => {
+      if (pid === 2147483647) {
+        if (!observed) { observed = true; signal('observed-stale'); resume(); }
+        throw Object.assign(new Error('dead test owner'), { code: 'ESRCH' });
+      }
+      return kill(pid, signalNumber);
+    };
+    const { materialize } = require(installer);
+    const { componentArchive } = require(require('node:path').join(require('node:path').dirname(installer), 'plugins.cjs'));
+    let entered = false;
+    materialize({ ...options, fetchArchive: (...args) => {
+      if (!entered) { entered = true; signal('entered'); if (pauseWriter === 'true') resume(); }
+      return componentArchive(...args);
+    } });
+  `;
+  const child = spawn(process.execPath, ["-e", source, installer, JSON.stringify(options), String(pauseWriter)],
+    { stdio: ["pipe", "pipe", "pipe"] });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  let stdout = "", stderr = "", ended = false;
+  const waiting = new Map();
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+    for (const [marker, waiter] of waiting) {
+      if (stdout.includes(`${marker}\n`)) { waiting.delete(marker); waiter.resolve(); }
+    }
+  });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const done = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) => {
+      ended = true;
+      for (const waiter of waiting.values()) waiter.reject(new Error(`retry exited before barrier: ${stderr}`));
+      resolve({ code, stdout, stderr });
+    });
+  });
+  return { child, done, waitFor(marker) {
+    if (stdout.includes(`${marker}\n`)) return Promise.resolve();
+    if (ended) return Promise.reject(new Error(`retry exited before ${marker}: ${stderr}`));
+    return new Promise((resolve, reject) => waiting.set(marker, { resolve, reject }));
+  } };
+}
+
+for (const target of ["linux-x64-gnu", "win32-x64-msvc"]) {
+  test(`two retries observing one stale lock cannot both activate plugins: ${target}`, { timeout: 60000 }, async (t) => {
+    const fixture = optionalFixture(t, target);
+    materialize(fixture);
+    const before = installedBaseSnapshot(fixture);
+    const lock = join(fixture.metaRoot, ".native-install.lock");
+    writeFileSync(lock, "2147483647");
+    const first = staleLockRetry(t, fixture, true);
+    const second = staleLockRetry(t, fixture, false);
+    await Promise.all([first.waitFor("observed-stale"), second.waitFor("observed-stale")]);
+    first.child.stdin.write("1");
+    await first.waitFor("entered"); // The first writer holds the replacement lock.
+    const owner = readFileSync(lock, "utf8");
+    const record = JSON.parse(owner);
+    assert.equal(typeof record === "number" ? record : record.pid, first.child.pid);
+    second.child.stdin.write("1"); // Resume the stale observation AFTER replacement.
+    const rejected = await second.done;
+    assert.notEqual(rejected.code, 0);
+    assert.match(rejected.stderr, /lock owner changed/);
+    assert.doesNotMatch(rejected.stdout, /entered/);
+    assert.equal(readFileSync(lock, "utf8"), owner);
+    assert.deepEqual(installedBaseSnapshot(fixture), before);
+    assert.deepEqual(JSON.parse(readFileSync(join(fixture.metaRoot, "native-install.json"))).components, []);
+    first.child.stdin.write("1");
+    const completed = await first.done;
+    assert.equal(completed.code, 0, completed.stderr);
+    assert.equal(verifyInstallation({ ...fixture, requireCuda: true }).components.length, fixture.plugins.components.length);
+    assert.deepEqual(installedBaseSnapshot(fixture), before);
+    assert.equal(existsSync(lock), false);
+    assert.equal(existsSync(`${lock}.recovery`), false);
+  });
+}
+
+test("release never deletes a replacement owner's lock", (t) => {
+  const fixture = optionalFixture(t);
+  materialize(fixture);
+  const lock = join(fixture.metaRoot, ".native-install.lock");
+  const replacement = JSON.stringify({ pid: process.pid, token: "different-owner" });
+  materialize({ ...fixture, config: { ...fixture.config, mode: "cuda" }, fetchArchive: (...args) => {
+    writeFileSync(lock, replacement);
+    return componentArchive(...args);
+  } });
+  assert.equal(readFileSync(lock, "utf8"), replacement);
+  assert.equal(verifyInstallation({ ...fixture, requireCuda: true }).components.length, fixture.plugins.components.length);
+});
+
+test("an interrupted recovery guard fails closed without changing the CPU installation", (t) => {
+  const fixture = optionalFixture(t);
+  materialize(fixture);
+  const before = installedBaseSnapshot(fixture);
+  const dead = spawnSync(process.execPath, ["-e", ""]);
+  assert.equal(dead.status, 0);
+  const lock = join(fixture.metaRoot, ".native-install.lock");
+  writeFileSync(lock, String(dead.pid));
+  mkdirSync(`${lock}.recovery`);
+  assert.throws(() => materialize(fixture), /inspect \.native-install.lock.recovery/);
+  assert.equal(readFileSync(lock, "utf8"), String(dead.pid));
+  assert.deepEqual(installedBaseSnapshot(fixture), before);
 });
 
 test("relocating the completed install does not depend on its cache", (t) => {

@@ -136,20 +136,32 @@ primary source build; `CUDA12_ARCHITECTURES` overrides only the fallback, which 
 inherit the primary list. These build targets do not imply hardware validation
 on every GPU generation.
 
-Before loading the 12.4 fallback, GGUF queries the active CUDA Driver API.
+Before loading either GGUF CUDA plugin, GGUF queries the active CUDA Driver API
+(driver capability, not the installed Toolkit). The 13.1 primary requires at
+least `cuDriverGetVersion >= 13000`. With the distribution targets, every visible
+GPU must have compatible native SM75/80/86/89/90 code, or be able to use compute90
+PTX with driver capability `>= 13010`. For example, SM100 requires PTX and cannot
+use the primary on a driver reporting `13000`. Forced PTX also requires `13010`
+and a compute90-compatible device; older GPUs cannot use that PTX even with a
+new driver. A failed query, missing compatible code, or insufficient capability
+skips the primary **before registration**, logs the reason, and tries CUDA 12.4.
+
+Before loading the 12.4 fallback, its own preflight still applies.
 Paths requiring the distribution's PTX 8.4 require `cuDriverGetVersion >= 12040`
-(driver capability for CUDA 12.4, not the installed Toolkit). Older CUDA 12
-drivers are allowed only when every visible device can use the native SM86
+(driver capability for CUDA 12.4). Older CUDA 12 drivers are allowed only when
+every visible device can use the native SM86
 cubin (SM86/89) and PTX JIT is not forced. A mixed set containing a PTX-only GPU
 therefore cannot use the old-driver exception. Failed queries or insufficient
 capability skip the fallback, log the reason, and preserve CPU execution; the
 process does not rewrite `CUDA_VISIBLE_DEVICES`.
-`GGML_BACKEND_PATH` overrides require `12040` before the directory loader runs,
+`GGML_BACKEND_PATH` overrides require `13010` before either directory loader runs,
 without a native-code exception for unknown custom architectures.
-Build-time custom `CUDA12_ARCHITECTURES` or an external `LLAMA_CPP_RUNTIME_DIR`
-likewise disable the exception; replacing plugins after a build is outside
-the distribution contract.
-The ordinary CUDA 13.1 primary path and independent ORT selection are unchanged.
+Build-time custom architecture lists or an external `LLAMA_CPP_RUNTIME_DIR`
+likewise disable the corresponding plugin's exception. The primary's native-code
+exception requires explicit distribution targets or pinned `prebuilt` mode;
+`auto`/`source` builds without explicit targets conservatively require `13010`.
+Replacing plugins after a build is outside the distribution contract.
+Explicit CPU execution never runs these probes; ORT selection is independent.
 This preflight is not a PTX execution test or subprocess crash isolation: native
 driver aborts and later inference failures are not guaranteed to recover.
 CPU/GPU CI validates its specific driver/runtime environments, not every older
@@ -181,6 +193,11 @@ extensible: it is not replaced with a `--cpu-only` build. The npm command is alw
 package retains the cross-platform `bin/zg.exe` native entry point so npm's
 Windows shim and Unix symlink both enter the executable directly.
 
+Self-contained native packages (macOS, Linux ARM64 and deliberate CPU-only
+builds) retain schema-1 checksums. The installer supports native schemas 1 and 3;
+the unpublished schema-2 format with mandatory CUDA npm dependencies is not
+supported. Plugin component checksums still use their own schema 1.
+
 The published meta package supports Node.js 14.14 and newer for installation
 only, not for CLI execution. Online plugin transport requires npm 7+ and
 extraction uses system `tar`; local archives need no network. The root workspace may require a newer Node version for
@@ -195,7 +212,9 @@ Release order:
 3. Publish runtime components before their base native packages to `rust-canary`, then publish the meta package
    to `rust-canary` last. Candidate publication never changes `latest`.
 4. On every platform's ordinary CPU runner, install the exact meta-package version from the
-   registry alone, so npm must select its native optional dependency.
+   registry alone, so npm must select its native optional dependency. These jobs
+   download only the small `rust-verification-<version>` artifact for the release
+   inventory, not another copy of all platforms' native/CUDA tarballs.
 5. Verify CLI startup, managed-rg, daemon startup and IPC, then update from a
    distinct published baseline version and roll back to that version. On the
    CUDA targets also force a registry plugin installation and verify its hashes
@@ -240,6 +259,10 @@ Linux CUDA builder is needed. Rust linking and dependency audits remain. The SDK
 cache is keyed separately from Cargo build output and checked by the fork's
 embedded archive/manifest hashes. Native configuration drift fails release CI
 instead of silently rebuilding. ORT and zvec build/download behavior is unchanged.
+Linux x64 mounts the restored Cargo registry and Git caches into its Docker
+builder and returns ownership to the runner before saving them. The host skips
+compiler-library/CMake installation; pinned Rust remains for packaging's
+`cargo metadata` version lookup. Linux ARM64 still installs its host build tools.
 
 All-platform runs produce `rust-release-<version>`; subset runs produce
 `rust-candidate-<version>` with the selected native tarballs and all their components, the same
@@ -269,7 +292,13 @@ unpublished CUDA archives from a loopback registry. Every plugin must verify,
 and the original core identity and binary must remain unchanged.
 The rebuilt installation is used for both CUDA 12 fallback and CUDA 13 primary
 inference (shared between Linux runtime containers); fresh automatic GPU
-installation is also checked separately. These checks run with
+installation is also checked separately with `--accelerator auto --expect-cuda`,
+so optional download failure cannot pass by leaving only CPU installed.
+That fresh installation then runs index/query with `--device` omitted:
+GGUF must report CUDA layer offload for both the 12.4 and 13.1 plugins, and ONNX
+must report CUDA graph placement in the CUDA 12 environment (also alongside
+CUDA 13 on Windows). Explicit CPU isolation and explicit CUDA checks on the
+rebuilt prefix remain unchanged. These checks run with
 `publish=false,cuda=true` and require real inference evidence, not merely
 successful installation. CPU/GPU jobs remain parallel; the GPU job bootstraps
 its own CPU installation rather than transferring the CPU runner's prefix.

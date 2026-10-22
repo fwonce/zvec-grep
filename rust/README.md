@@ -558,8 +558,16 @@ to CPU when a GPU/backend is unavailable. `--device cpu` or
 explicit CPU execution loads only CPU plugins, ignores `GGML_BACKEND_PATH`,
 and supplies an empty GPU device list. Optional GPU registration is separate:
 a later GPU request in the same process can still use preinstalled plugins.
-Before opening the CUDA 12.4 fallback, GGUF checks the active CUDA Driver API
-capability, not the installed Toolkit version. PTX 8.4 paths require a reported
+Before opening either CUDA plugin, GGUF checks the active CUDA Driver API
+capability, not the installed Toolkit version. The CUDA 13.1 primary requires
+at least `13000`. With the distribution targets, every visible GPU must be able
+to use native SM75/80/86/89/90 code, or compute90 PTX with capability `>= 13010`.
+For example, SM100 on a driver reporting `13000` skips the primary before it is
+registered and tries CUDA 12.4 instead. Forced PTX requires `13010` and a
+compute90-compatible GPU; it cannot use the primary on older GPU architectures.
+Failed queries or missing compatible code likewise skip the primary.
+Before opening the CUDA 12.4 fallback, its separate check still applies.
+PTX 8.4 paths require a reported
 capability of at least `12040` (CUDA 12.4). Older CUDA 12 drivers remain eligible
 when every visible GPU can use the distribution's native SM86 code (SM86/89)
 and PTX JIT is not forced. On those older drivers, any visible PTX-only device
@@ -567,11 +575,13 @@ rejects the whole fallback. Failed probes or insufficient capability likewise
 skip it with a diagnostic and retain CPU execution.
 Explicit CPU requests do not run this probe; ORT selection is independent.
 GPU requests retain the upstream `GGML_BACKEND_PATH` override behavior, but an
-override requires `12040` before any GPU plugin scan: its architecture list is
-unknown, so it cannot use the SM86 exception or bypass the fallback guard.
-Build-time custom `CUDA12_ARCHITECTURES` or an external `LLAMA_CPP_RUNTIME_DIR`
-also disable the exception. Replacing plugins after a build is outside this
-distribution contract.
+override requires `13010` before either GPU plugin scan: its architecture list
+is unknown, so it cannot use native-code exceptions or bypass either guard.
+Build-time custom architecture lists or an external `LLAMA_CPP_RUNTIME_DIR`
+also disable the corresponding exception. The primary exception requires
+explicit distribution targets or pinned `prebuilt` mode; `auto`/`source` builds
+without explicit targets conservatively require `13010`. Replacing plugins
+after a build is outside this distribution contract.
 This is a compatibility preflight, not subprocess isolation or a guarantee that
 every driver/runtime failure can be caught and retried on CPU.
 
@@ -675,7 +685,12 @@ npm run release:smoke
 
 `release:smoke` (also named `release:artifact-smoke`) only verifies existing
 collected artifacts; it never builds or packs packages. CUDA release targets
-require their complete default bundle. A failed local rebuild invalidates
+require their complete collected tarball set, but default `auto` installation
+may produce a verified CPU-only or CUDA installation depending on the host.
+Use `-- --accelerator auto --expect-cuda` when smoke must reject missing CUDA
+plugins (as GPU CI does); `--expect-cpu` instead requires zero CUDA requests on
+a CPU host. These expectations do not change the installer's Auto policy.
+A failed local rebuild invalidates
 `native-build.json`, so `--no-build` refuses reuse until a build completes.
 
 CI can package a previously built target artifact without rebuilding it:

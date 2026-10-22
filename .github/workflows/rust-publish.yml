@@ -400,7 +400,8 @@ jobs:
         run: npm install --global npm@11.21.0
       - uses: actions/download-artifact@v8
         with:
-          name: rust-release-${{ needs.source.outputs.version }}
+          # Registry smoke installs from npm; only release.json is read locally.
+          name: rust-verification-${{ needs.source.outputs.version }}
           path: rust/dist/npm/release/tarballs
       - name: Test registry packages without explicit native-package installation
         working-directory: rust

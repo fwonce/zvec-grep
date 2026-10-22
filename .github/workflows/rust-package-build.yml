@@ -69,7 +69,7 @@ jobs:
           arch: x64
           vsversion: "2022"
       - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && inputs.target != 'linux-x64-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev cmake ninja-build pkg-config
@@ -78,10 +78,10 @@ jobs:
         shell: bash
         run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
       - name: Install the pinned Rust toolchain, including rustup if missing
+        # Linux x64 compiles in Docker, but host packaging still uses cargo metadata.
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ steps.rust-version.outputs.channel }}
-          components: rustfmt, clippy
       - name: Restore Cargo build state
         id: cargo-cache
         uses: actions/cache/restore@v5
@@ -93,7 +93,8 @@ jobs:
             ${{ runner.os == 'Windows' && env.CARGO_HOME || '~/.cargo' }}/git/db/
             rust/target/release/
           # Per-commit keys would exhaust the 10 GB repository cache quota and evict Rust CI caches.
-          key: rust-release-v3-${{ inputs.target }}-${{ inputs.runner }}-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml') }}
+          # Refresh Linux x64 once so its immutable cache includes container downloads.
+          key: rust-release-${{ inputs.target == 'linux-x64-gnu' && 'v4' || 'v3' }}-${{ inputs.target }}-${{ inputs.runner }}-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml') }}
       - name: Cache the pinned llama native SDK
         uses: actions/cache@v5
         with:
@@ -162,9 +163,12 @@ jobs:
         if: inputs.target == 'linux-x64-gnu'
         working-directory: ${{ github.workspace }}
         run: |
+          mkdir -p "$HOME/.cargo/registry" "$HOME/.cargo/git"
           docker run --rm --platform linux/amd64 \
             --volume "${GITHUB_WORKSPACE}:/work:ro" \
             --volume "${GITHUB_WORKSPACE}/rust/target:/work-target" \
+            --volume "$HOME/.cargo/registry:/root/.cargo/registry" \
+            --volume "$HOME/.cargo/git:/root/.cargo/git" \
             --env CARGO_TARGET_DIR=/work-target \
             --env CARGO_BUILD_JOBS --env CMAKE_BUILD_PARALLEL_LEVEL \
             --env LLAMA_CPP_BUILD_MODE=prebuilt --env LLAMA_CPP_RUNTIME_CACHE=/work-target/llama-runtimes \
@@ -180,7 +184,13 @@ jobs:
             zvec-grep-cuda-builder bash scripts/cuda/check.sh /work-target/release/zg-cuda-staging
       - name: Restore ownership of Linux build output
         if: ${{ always() && inputs.target == 'linux-x64-gnu' }}
-        run: sudo chown -R "$(id -u):$(id -g)" target
+        run: |
+          # Docker writes as root. Host packaging/cache save must retain access.
+          for directory in target "$HOME/.cargo/registry" "$HOME/.cargo/git"; do
+            if [[ -d "$directory" ]]; then
+              sudo chown -R "$(id -u):$(id -g)" "$directory"
+            fi
+          done
       - name: Run the Linux bundle without any CUDA runtime installed
         if: inputs.target == 'linux-x64-gnu'
         working-directory: ${{ github.workspace }}

@@ -34,7 +34,15 @@ command. Restart any previously running daemon after successful installation.
 CPU mode disables downloads; it does not uninstall already verified plugins.
 Failed or interrupted CUDA additions leave the existing CPU payload intact.
 After correcting the failure, rerun the same rebuild command; no separate
-recovery command or download-resume feature is needed.
+recovery command or download-resume feature is normally needed. Concurrent
+installations are rejected. Stale-lock recovery is serialized and rechecks the
+owner before removal; releasing a lock never deletes a replacement owner's lock.
+If a process is killed during the brief lock-recovery operation itself, the
+installer fails closed on `.native-install.lock.recovery`. Stop all installers,
+inspect the lock and this guard directory in the installed meta package, and
+remove the abandoned empty guard before retrying. Never remove it while an
+installer is running. An invalid/partially written `.native-install.lock` also
+requires inspection instead of automatic deletion.
 
 `ZG_PLUGIN_DIR` selects an absolute directory containing the exact component
 `.tgz` files (no registry/cache fallback if a file is missing).

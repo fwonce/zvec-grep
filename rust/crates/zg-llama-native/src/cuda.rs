@@ -1,4 +1,4 @@
-//! Preflight for the distributed CUDA 12.4 GGUF plugin, before ggml opens it.
+//! Preflight for the distributed CUDA GGUF plugins, before ggml opens them.
 //! This checks driver capability, not the installed Toolkit or inference success.
 
 use std::{
@@ -26,6 +26,28 @@ static DRIVER: OnceLock<Result<libloading::Library, String>> = OnceLock::new();
 /// Rejects an unavailable/unknown driver, pre-CUDA-12 capability, or a driver
 /// below CUDA 12.4 when any visible device requires PTX 8.4 JIT compilation.
 pub fn check_cuda12_driver(native_sm86: bool) -> Result<(), String> {
+    let (driver, version) = active_driver()?;
+    check_capability(version, native_sm86, forced_ptx(), || capabilities(driver))
+}
+
+/// Check whether the driver/devices satisfy the CUDA 13.1 primary preflight.
+///
+/// `distribution_architectures` asserts the distribution's native SM75/80/86/89/90
+/// plus compute90 PTX contract. Unknown custom targets require CUDA 13.1 driver
+/// capability without a native-code exception. Like [`check_cuda12_driver`],
+/// this must only run on GPU requests and never opens a GGML plugin.
+///
+/// # Errors
+/// Rejects failed queries, insufficient driver capability, and known device/code
+/// incompatibilities (including forced PTX on devices older than compute90).
+pub fn check_cuda13_driver(distribution_architectures: bool) -> Result<(), String> {
+    let (driver, version) = active_driver()?;
+    check_cuda13_capability(version, distribution_architectures, forced_ptx(), || {
+        capabilities(driver)
+    })
+}
+
+fn active_driver() -> Result<(&'static libloading::Library, c_int), String> {
     let driver = DRIVER
         .get_or_init(|| {
             let name = match std::env::consts::OS {
@@ -54,11 +76,14 @@ pub fn check_cuda12_driver(native_sm86: bool) -> Result<(), String> {
             .map_err(|error| symbol_error(&error))?;
         succeeded("cuDriverGetVersion", get_version(&raw mut version))?;
     }
-    let force_ptx = force_ptx_jit(
+    Ok((driver, version))
+}
+
+fn forced_ptx() -> bool {
+    force_ptx_jit(
         std::env::var_os("CUDA_FORCE_PTX_JIT").as_deref(),
         std::env::var_os("CUDA_FORCE_JIT").as_deref(),
-    );
-    check_capability(version, native_sm86, force_ptx, || capabilities(driver))
+    )
 }
 
 fn force_ptx_jit(ptx: Option<&OsStr>, jit: Option<&OsStr>) -> bool {
@@ -150,6 +175,58 @@ fn check_capability(
         "CUDA 12.4 fallback may require PTX 8.4 JIT, but the driver reports {version}; \
          require CUDA driver capability >= 12040 or compatible native SM86 code on every visible GPU"
     ))
+}
+
+fn check_cuda13_capability(
+    version: c_int,
+    distribution_architectures: bool,
+    force_ptx: bool,
+    devices: impl FnOnce() -> Result<Vec<(c_int, c_int)>, String>,
+) -> Result<(), String> {
+    if version < 13000 {
+        return Err(format!(
+            "CUDA 13.1 primary requires at least CUDA 13 driver capability (reported {version})"
+        ));
+    }
+    if !distribution_architectures {
+        return if version >= 13010 {
+            Ok(())
+        } else {
+            Err(format!(
+                "CUDA 13.1 primary/custom targets may require PTX JIT; \
+                 require CUDA driver capability >= 13010 (reported {version})"
+            ))
+        };
+    }
+    let devices = devices()?;
+    if devices.is_empty() {
+        return Err("CUDA driver reports no visible devices".to_owned());
+    }
+    for (major, minor) in devices {
+        if major <= 0 || minor < 0 {
+            return Err(format!("Invalid CUDA compute capability {major}.{minor}"));
+        }
+        // Same-major, same-or-newer-minor cubin compatibility. In particular,
+        // SM90 cubins cannot execute on SM100; that path requires compute90 PTX.
+        let native = matches!(major, 8 | 9) || (major == 7 && minor >= 5);
+        if native && !force_ptx {
+            continue;
+        }
+        if major < 9 {
+            return Err(format!(
+                "CUDA 13.1 primary has no usable code for SM{major}{minor} \
+                 (forced PTX: {force_ptx}); its only PTX target is compute90"
+            ));
+        }
+        if version < 13010 {
+            return Err(format!(
+                "CUDA 13.1 primary requires PTX JIT on SM{major}{minor} \
+                 (forced PTX: {force_ptx}); require CUDA driver capability >= 13010 \
+                 (reported {version})"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

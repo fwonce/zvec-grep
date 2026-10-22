@@ -200,6 +200,9 @@ def run_zg(binary, workspace, logs, stage, args, env):
 def case_environment(work, backend):
     root = work.resolve() / backend
     env = dict(os.environ)
+    # An omitted --device must exercise the package's default Auto policy, not
+    # a device override inherited from the runner.
+    env.pop("ZVEC_GREP_DEVICE", None)
     env.update({
         # The registry is independent of ZVEC_GREP_HOME and XDG_CONFIG_HOME.
         # Each invocation/backend must own its registry, including on Windows.
@@ -212,7 +215,8 @@ def case_environment(work, backend):
     return env
 
 
-def run_case(binary, model_cache, work, logs, backend, model, expected_gguf_cuda, device="cuda"):
+def run_case(binary, model_cache, work, logs, backend, model, expected_gguf_cuda,
+             device="cuda", *, expect_cuda=True):
     workspace = work / backend / "workspace"
     workspace.mkdir(parents=True)
     logs.mkdir(parents=True)
@@ -225,7 +229,7 @@ def run_case(binary, model_cache, work, logs, backend, model, expected_gguf_cuda
     if device != "default":
         runtime_args += ["--device", device]
     def evidence(stderr):
-        if device == "cuda":
+        if expect_cuda:
             return cuda_evidence(stderr, backend, expected_gguf_cuda)
         return cpu_evidence(stderr, backend, device)
     _, index_err = run_zg(binary, workspace, logs, "index", [
@@ -246,8 +250,8 @@ def run_case(binary, model_cache, work, logs, backend, model, expected_gguf_cuda
     require(query, "model-fixture.md")
     require(query, MARKER)
     query_evidence = evidence(query_err)
-    result = {"model": model, "device": device,
-              "gguf_cuda": expected_gguf_cuda if backend == "gguf" and device == "cuda" else None,
+    result = {"model": model, "device": device, "expected_backend": "cuda" if expect_cuda else "cpu",
+              "gguf_cuda": expected_gguf_cuda if backend == "gguf" and expect_cuda else None,
               "index": index_evidence, "query": query_evidence}
     print(json.dumps(result, indent=2), flush=True)
     return result
@@ -264,11 +268,15 @@ def main():
                         help="Require a clean CPU host; test explicit CPU and default automatic fallback")
     parser.add_argument("--explicit-cpu", action="store_true",
                         help="Test a CPU-only installation on a GPU host without initializing CUDA")
+    parser.add_argument("--auto-only", action="store_true",
+                        help="Omit --device on a GPU host and require actual CUDA index/query execution")
     args = parser.parse_args()
     if (args.cpu_only or args.explicit_cpu) and args.expected_gguf_cuda:
         parser.error("--cpu-only cannot be combined with --expected-gguf-cuda")
     if args.cpu_only and args.explicit_cpu:
         parser.error("--cpu-only and --explicit-cpu are mutually exclusive")
+    if args.auto_only and (args.cpu_only or args.explicit_cpu):
+        parser.error("--auto-only cannot be combined with CPU validation")
     if not args.cpu_only and not args.explicit_cpu and not args.expected_gguf_cuda:
         parser.error("GPU validation requires --expected-gguf-cuda")
     bundle = args.bundle.resolve()
@@ -303,7 +311,14 @@ def main():
     results, failures = {}, []
     # Validate explicit CPU with GPU plugins and drivers present as well as
     # actual CUDA inference. Each CLI invocation owns a fresh process.
-    devices = ("cpu",) if args.explicit_cpu else (("cpu", "default") if args.cpu_only else ("cpu", "cuda"))
+    if args.auto_only:
+        devices = ("default",)
+    elif args.explicit_cpu:
+        devices = ("cpu",)
+    elif args.cpu_only:
+        devices = ("cpu", "default")
+    else:
+        devices = ("cpu", "cuda")
     # Windows runners have a short RUNNER_TEMP; the user-profile temp directory
     # leaves too little room for zvec's nested index paths. Keep Linux unchanged.
     temporary_parent = (os.environ.get("RUNNER_TEMP") or None) if os.name == "nt" else None
@@ -316,7 +331,8 @@ def main():
                 case = backend if device == "cuda" else f"{device}/{backend}"
                 try:
                     results[case] = run_case(binary, args.model_cache.resolve(), Path(temporary) / device,
-                                            logs / case, backend, model, args.expected_gguf_cuda, device)
+                                            logs / case, backend, model, args.expected_gguf_cuda, device,
+                                            expect_cuda=args.auto_only or device == "cuda")
                 except (AssertionError, OSError, subprocess.SubprocessError) as error:
                     failures.append(f"{case}: {error}")
                     print(f"FAILED: {failures[-1]}", flush=True)

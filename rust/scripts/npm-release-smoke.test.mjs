@@ -61,6 +61,7 @@ async function installedArtifact(fixture, prefix, variant = defaultReleaseVarian
   await write(directory, "lib/base-library", "base");
   const files = { [binary]: checksum("fixture-executable"), "lib/base-library": checksum("base") };
   const external = new Map();
+  const pinned = [];
   for (const component of components) {
     const root = installedPackageRoot(prefix, component.package);
     const content = `fixture component ${component.package}`;
@@ -69,16 +70,38 @@ async function installedArtifact(fixture, prefix, variant = defaultReleaseVarian
     await write(root, "checksums.json", JSON.stringify({ schemaVersion: 1, target: fixture.entry.target,
       component: component.package, files: { [component.payload]: checksum(content) } }));
     external.set(component.file, (external.get(component.file) ?? "") + content);
+    const pkg = fixture.release.packages.find((pkg) => pkg.name === component.package);
+    await packInstalledArtifact(fixture, prefix, pkg);
+    pinned.push({ ...component, version: pkg.version, tarball: pkg.file, archiveBytes: pkg.bytes,
+      integrity: pkg.integrity, checksum: checksum(content) });
+    await rm(root, { recursive: true });
   }
-  for (const [file, content] of external) files[file] = checksum(content);
-  await write(directory, "checksums.json", JSON.stringify({ schemaVersion: components.length ? 2 : 1,
-    target: fixture.entry.target, files, components: components.map((component) => component.package) }));
+  const checksums = { schemaVersion: components.length ? 3 : 1, target: fixture.entry.target, files };
+  if (components.length) {
+    checksums.coreId = coreIdentity(fixture.entry.target, fixture.release.version, files);
+    const plugins = JSON.stringify({ schemaVersion: 1, target: fixture.entry.target,
+      version: fixture.release.version, coreId: checksums.coreId, components: pinned,
+      files: Object.fromEntries([...external].map(([file, content]) => [file, checksum(content)])) });
+    checksums.pluginsSha256 = checksum(plugins).sha256;
+    await write(directory, "plugins.json", plugins);
+  }
+  await write(directory, "checksums.json", JSON.stringify(checksums));
   await writeFile(join(directory, "package.json"), JSON.stringify({
     name: fixture.entry.package, version: fixture.release.version, zvecGrep: { variant },
-    dependencies: Object.fromEntries(components.map((component) => [component.package, fixture.release.version])),
   }));
   await write(metaRoot, "package.json", JSON.stringify({ name: fixture.manifest.metaPackage, version: fixture.release.version }));
-  materialize({ metaRoot, platformRoot: directory, entry: fixture.entry, expectedVersion: fixture.release.version });
+  materialize({ metaRoot, platformRoot: directory, entry: fixture.entry, expectedVersion: fixture.release.version,
+    config: { mode: components.length ? "cuda" : "cpu", directory: fixture.tarballRoot, offline: true } });
+}
+
+async function packInstalledArtifact(fixture, prefix, pkg) {
+  const staging = join(fixture.tarballRoot, "packing", pkg.name.replaceAll("/", "-"));
+  await cp(installedPackageRoot(prefix, pkg.name), join(staging, "package"), { recursive: true });
+  run("tar", ["-czf", join(fixture.tarballRoot, pkg.file), "-C", staging, "package"],
+    { env: { ...process.env, COPYFILE_DISABLE: "1" } });
+  const bytes = await readFile(join(fixture.tarballRoot, pkg.file));
+  Object.assign(pkg, { sha256: createHash("sha256").update(bytes).digest("hex"),
+    integrity: `sha512-${createHash("sha512").update(bytes).digest("base64")}`, bytes: bytes.length });
 }
 
 test("artifact smoke installs the exact local tarballs offline and probes the installed package", async (t) => {
@@ -146,43 +169,9 @@ async function optionalArtifactFixture(t, componentTarget) {
   fixture.release.commit = "fixture-commit";
   const source = join(fixture.tarballRoot, "source");
   await installedArtifact(fixture, source);
-  const baseRoot = installedPackageRoot(source, fixture.entry.package);
   const metaRoot = installedPackageRoot(source, manifest.metaPackage);
-  const pack = async (pkg) => {
-    const staging = join(fixture.tarballRoot, "packing", pkg.name.replaceAll("/", "-"));
-    await cp(installedPackageRoot(source, pkg.name), join(staging, "package"), { recursive: true });
-    run("tar", ["-czf", join(fixture.tarballRoot, pkg.file), "-C", staging, "package"],
-      { env: { ...process.env, COPYFILE_DISABLE: "1" } });
-    const bytes = await readFile(join(fixture.tarballRoot, pkg.file));
-    Object.assign(pkg, { sha256: createHash("sha256").update(bytes).digest("hex"),
-      integrity: `sha512-${createHash("sha512").update(bytes).digest("base64")}`, bytes: bytes.length });
-  };
-  const checksums = JSON.parse(await readFile(join(baseRoot, "checksums.json"), "utf8"));
-  const files = {};
-  for (const { file } of fixture.entry.components) {
-    files[file] = checksums.files[file] ?? files[file];
-    delete checksums.files[file];
-  }
-  checksums.schemaVersion = 3;
-  delete checksums.components;
-  checksums.coreId = coreIdentity(fixture.entry.target, fixture.release.version, checksums.files);
-  const components = [];
-  for (const component of fixture.entry.components) {
-    const pkg = fixture.release.packages.find((pkg) => pkg.name === component.package);
-    await pack(pkg);
-    const payload = JSON.parse(await readFile(join(installedPackageRoot(source, pkg.name), "checksums.json"), "utf8"));
-    components.push({ ...component, version: pkg.version, tarball: pkg.file, archiveBytes: pkg.bytes,
-      integrity: pkg.integrity, checksum: payload.files[component.payload] });
-  }
-  const plugins = JSON.stringify({ schemaVersion: 1, target: fixture.entry.target,
-    version: fixture.release.version, coreId: checksums.coreId, components, files });
-  checksums.pluginsSha256 = createHash("sha256").update(plugins).digest("hex");
-  await writeFile(join(baseRoot, "plugins.json"), plugins);
-  await writeFile(join(baseRoot, "checksums.json"), JSON.stringify(checksums));
-  const metadata = JSON.parse(await readFile(join(baseRoot, "package.json"), "utf8"));
-  delete metadata.dependencies;
-  await writeFile(join(baseRoot, "package.json"), JSON.stringify(metadata));
   await rm(join(metaRoot, "lib"), { recursive: true });
+  await rm(join(metaRoot, "native-install.json"));
   await writeFile(join(metaRoot, "bin/zg.exe"), "uninstalled placeholder");
   for (const file of ["install.cjs", "plugins.cjs"]) {
     await copyFile(new URL(`../npm/meta/${file}`, import.meta.url), join(metaRoot, file));
@@ -192,12 +181,30 @@ async function optionalArtifactFixture(t, componentTarget) {
     version: fixture.release.version, scripts: { postinstall: "node install.cjs" },
     optionalDependencies: { [fixture.entry.package]: fixture.release.version } }));
   for (const name of [fixture.entry.package, manifest.metaPackage]) {
-    await pack(fixture.release.packages.find((pkg) => pkg.name === name));
+    await packInstalledArtifact(fixture, source, fixture.release.packages.find((pkg) => pkg.name === name));
   }
   return fixture;
 }
 
 for (const target of ["linux-x64-gnu", "win32-x64-msvc"]) {
+  test(`default auto artifact smoke accepts real CPU postinstall, but GPU expectations reject it: ${target}`, async (t) => {
+    if (detectNvidia()) return t.skip("default auto CPU installation requires a CPU host");
+    const fixture = await optionalArtifactFixture(t, target);
+    let probes = 0;
+    await smokeArtifactRelease({ ...fixture, probe: async ({ prefix }) => {
+      const installation = await verifyInstalledRelease({ ...fixture, version: fixture.release.version, prefix });
+      assert.deepEqual(installation.components, []);
+      probes++;
+    } });
+    assert.equal(probes, 1);
+    const report = JSON.parse(await readFile(join(fixture.prefixRoot, "installation.json"), "utf8"));
+    assert.equal(report.accelerator, "auto");
+    assert.equal(report.expectCuda, false);
+    await assert.rejects(smokeArtifactRelease({ ...fixture, expectCuda: true,
+      probe: () => assert.fail("GPU CI must reject CPU fallback before inference"),
+    }), /required CUDA plugins missing/);
+  });
+
   test(`real npm default CPU install makes zero CUDA requests, then rebuild preserves the installation: ${target}`, async (t) => {
     if (detectNvidia()) return t.skip("default auto CPU installation requires a CPU host");
     const fixture = await optionalArtifactFixture(t, target);
@@ -224,6 +231,41 @@ for (const target of ["linux-x64-gnu", "win32-x64-msvc"]) {
       /unexpectedly installed CUDA plugins/);
   });
 }
+
+test("CUDA expectations reject contradictory policies before npm runs", async (t) => {
+  const fixture = await artifactFixture(t, true);
+  for (const options of [{ expectCpu: true }, { accelerator: "cpu" }]) {
+    await assert.rejects(installArtifactRelease({ ...fixture, ...options, expectCuda: true,
+      runNpm: () => assert.fail("contradictory expectations"),
+    }), /conflicts with CPU/);
+  }
+  const cpuOnly = await artifactFixture(t);
+  await assert.rejects(installArtifactRelease({ ...cpuOnly, expectCuda: true,
+    runNpm: () => assert.fail("no CUDA component contract"),
+  }), /requires a platform with CUDA components/);
+});
+
+test("auto artifact smoke with GPU expectations accepts a verified complete CUDA installation", async (t) => {
+  const fixture = await artifactFixture(t, true);
+  await smokeArtifactRelease({ ...fixture, expectCuda: true,
+    runNpm: async (_, args, { env }) => {
+      assert.equal(env.ZG_INSTALL_ACCELERATOR, undefined); // Expectation must not force download policy.
+      await installedArtifact(fixture, args[args.indexOf("--prefix") + 1]);
+    }, probe: async () => {},
+  });
+  const report = JSON.parse(await readFile(join(fixture.prefixRoot, "installation.json"), "utf8"));
+  assert.equal(report.expectCuda, true);
+});
+
+test("CUDA expectations also reject a schema-1 CPU-only installation", async (t) => {
+  const fixture = await artifactFixture(t, true);
+  await assert.rejects(smokeArtifactRelease({ ...fixture, expectCuda: true,
+    runNpm: async (_, args) => installedArtifact(
+      { ...fixture, entry: { ...fixture.entry, components: undefined } },
+      args[args.indexOf("--prefix") + 1], defaultReleaseVariant(fixture.entry)),
+    probe: () => assert.fail("CPU-only format must not bypass CUDA verification"),
+  }), /required CUDA plugins missing/);
+});
 
 test("CPU auto verification rejects CUDA requests even if optional installation silently falls back", async (t) => {
   const fixture = await artifactFixture(t, true);
@@ -300,7 +342,7 @@ test("registry verification resolves native dependencies nested under the meta p
   const prefix = fixture.prefixRoot;
   await installedArtifact(fixture, prefix);
   const metaRoot = installedPackageRoot(prefix, manifest.metaPackage);
-  for (const { name } of nativePackageEntries(fixture.entry)) {
+  for (const name of [fixture.entry.package]) {
     const destination = join(metaRoot, "node_modules", name);
     await mkdir(dirname(destination), { recursive: true });
     await rename(installedPackageRoot(prefix, name), destination);
@@ -315,9 +357,9 @@ test("missing installed GPU components fail before a CPU CLI probe can mask them
     runNpm: async (_, args) => {
       const prefix = args[args.indexOf("--prefix") + 1];
       await installedArtifact(fixture, prefix);
-      await rm(installedPackageRoot(prefix, fixture.entry.components[0].package), { recursive: true });
+      await rm(join(installedPackageRoot(prefix, manifest.metaPackage), fixture.entry.components[0].file));
     }, probe: () => assert.fail("must not accept CPU fallback"),
-  }), /ENOENT|missing @zvec/);
+  }), /native payload files do not match/);
 });
 
 test("corrupt assembled libraries fail even when the executable is intact", async (t) => {

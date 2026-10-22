@@ -268,11 +268,13 @@ async function assertCpuInstallation({ installation, entry, prefixRoot, bundle }
 
 export async function installArtifactRelease({
   manifest, release, tarballRoot, prefixRoot, target,
-  accelerator = "auto", expectCpu = false,
+  accelerator = "auto", expectCpu = false, expectCuda = false,
   runNpm = runArtifactNpm, verifyInstalled = verifyInstalledRelease,
 }) {
   if (expectCpu && accelerator !== "auto") throw new Error("CPU-host verification must use default auto installation");
+  if (expectCuda && (expectCpu || accelerator === "cpu")) throw new Error("CUDA verification conflicts with CPU installation/verification");
   const { entry, tarballs } = await artifactInputs({ manifest, release, tarballRoot, target, accelerator, expectCpu });
+  if (expectCuda && !entry.components?.length) throw new Error("CUDA verification requires a platform with CUDA components");
   // Use the exact downloaded bytes, a fresh prefix/cache and no registry fallback.
   // Verification must never build or repack a package.
   const destination = resolve(prefixRoot);
@@ -309,14 +311,14 @@ export async function installArtifactRelease({
       });
   } else await install();
   const installation = await verifyInstalled({ manifest, entry, version: release.version, prefix,
-    requireCuda: Boolean(entry.components?.length && accelerator !== "cpu" && !expectCpu) });
+    requireCuda: expectCuda || accelerator === "cuda" });
   if (accelerator === "cpu" && installation.coreId && installation.components.length) {
     throw new Error("CPU artifact installation unexpectedly installed CUDA plugins");
   }
   const bundle = installedPackageRoot(prefix, manifest.metaPackage);
   if (expectCpu) await assertCpuInstallation({ installation, entry, prefixRoot, bundle });
   await writeFile(join(prefixRoot, "installation.json"), `${JSON.stringify({
-    ...installation, bundle, accelerator, expectCpu, commit: release.commit,
+    ...installation, bundle, accelerator, expectCpu, expectCuda, commit: release.commit,
     packages: release.packages.filter((pkg) => pkg.target === entry.target || pkg.target === "meta"),
   }, null, 2)}\n`);
   return { entry, prefix, bundle };

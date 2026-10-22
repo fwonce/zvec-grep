@@ -13,6 +13,24 @@ fn only_distribution_architectures_receive_the_native_code_exception() {
 }
 
 #[test]
+fn only_known_primary_targets_receive_the_native_code_exception() {
+    let targets = "75-real;80-real;86-real;89-real;90-real;90-virtual";
+    assert!(distribution_primary(None, None, Some("prebuilt")));
+    assert!(distribution_primary(Some(targets), None, Some("source")));
+    for mode in [None, Some("auto"), Some("source"), Some("external")] {
+        assert!(!distribution_primary(None, None, mode));
+    }
+    for targets in ["native", "75-virtual;80-virtual;86-real;90-virtual"] {
+        assert!(!distribution_primary(Some(targets), None, Some("source")));
+    }
+    assert!(!distribution_primary(
+        Some(targets),
+        Some("/custom/sdk"),
+        Some("external")
+    ));
+}
+
+#[test]
 fn cpu_initialization_does_not_register_gpu_plugins() {
     let state = BackendInitialization::new();
     assert_eq!(
@@ -118,7 +136,10 @@ fn working_primary_does_not_load_fallback() {
     let selected = load_with_fallback(
         root.path(),
         false,
-        |_| panic!("primary needs no preflight"),
+        |plugin| {
+            assert_eq!(plugin, CudaPlugin::Primary);
+            Ok(())
+        },
         |path| {
             loaded.push(path.to_path_buf());
             true
@@ -175,7 +196,10 @@ fn missing_fallback_is_not_loaded() {
         load_with_fallback(
             root.path(),
             false,
-            |_| panic!("no fallback"),
+            |plugin| {
+                assert_eq!(plugin, CudaPlugin::Primary);
+                Ok(())
+            },
             |_| {
                 attempts += 1;
                 false
@@ -200,9 +224,10 @@ fn rejected_fallback_is_never_opened_and_cpu_remains_usable() {
                 let selected = load_with_fallback(
                     root.path(),
                     false,
-                    |native_sm86| {
-                        assert!(native_sm86);
-                        Err("PTX requires a newer driver".to_owned())
+                    |plugin| match plugin {
+                        CudaPlugin::Primary => Ok(()),
+                        CudaPlugin::Fallback => Err("PTX requires a newer driver".to_owned()),
+                        CudaPlugin::Override => panic!("no override"),
                     },
                     |path| {
                         loaded.push(path.to_path_buf());
@@ -223,12 +248,13 @@ fn rejected_fallback_is_never_opened_and_cpu_remains_usable() {
 #[test]
 fn custom_plugin_cannot_bypass_preflight_through_the_primary_loader() {
     let root = tempfile::tempdir().expect("bundle");
+    std::fs::create_dir(root.path().join("cuda12")).expect("fallback");
     assert_eq!(
         load_with_fallback(
             root.path(),
             true,
-            |native_sm86| {
-                assert!(!native_sm86);
+            |plugin| {
+                assert_eq!(plugin, CudaPlugin::Override);
                 Err("custom architecture unknown on older driver".to_owned())
             },
             |_| panic!("must not load override")
@@ -245,8 +271,8 @@ fn custom_plugin_with_compatible_driver_retains_upstream_loader_behavior() {
         load_with_fallback(
             root.path(),
             true,
-            |native_sm86| {
-                checks.push(native_sm86);
+            |plugin| {
+                checks.push(plugin);
                 Ok(())
             },
             |path| {
@@ -256,5 +282,74 @@ fn custom_plugin_with_compatible_driver_retains_upstream_loader_behavior() {
         ),
         Some("13.1")
     );
-    assert_eq!(checks, [false]);
+    assert_eq!(checks, [CudaPlugin::Override, CudaPlugin::Primary]);
+}
+
+#[test]
+fn rejected_primary_is_never_opened_and_fallback_is_checked_before_loading() {
+    use std::cell::RefCell;
+    let root = tempfile::tempdir().expect("bundle");
+    let fallback = root.path().join("cuda12");
+    std::fs::create_dir(&fallback).expect("fallback");
+    let events = RefCell::new(Vec::new());
+    assert_eq!(
+        load_with_fallback(
+            root.path(),
+            false,
+            |plugin| match plugin {
+                CudaPlugin::Primary => {
+                    events.borrow_mut().push("check primary");
+                    Err("SM100 requires newer PTX support".to_owned())
+                }
+                CudaPlugin::Fallback => {
+                    events.borrow_mut().push("check fallback");
+                    Ok(())
+                }
+                CudaPlugin::Override => panic!("no override"),
+            },
+            |path| {
+                assert_eq!(path, fallback);
+                events.borrow_mut().push("load fallback");
+                true
+            },
+        ),
+        Some("12.4")
+    );
+    assert_eq!(
+        events.into_inner(),
+        ["check primary", "check fallback", "load fallback"]
+    );
+}
+
+#[test]
+fn rejected_plugins_never_open_and_preserve_cpu_initialization() {
+    let root = tempfile::tempdir().expect("bundle");
+    std::fs::create_dir(root.path().join("cuda12")).expect("fallback");
+    let state = BackendInitialization::new();
+    let mut checked = Vec::new();
+    state
+        .initialize(
+            true,
+            || Ok(7),
+            |_| {
+                assert_eq!(
+                    load_with_fallback(
+                        root.path(),
+                        false,
+                        |plugin| {
+                            checked.push(plugin);
+                            Err("incompatible driver".to_owned())
+                        },
+                        |_| panic!("rejected plugins must not be opened"),
+                    ),
+                    None
+                );
+            },
+        )
+        .expect("CPU core survives preflight rejection");
+    assert_eq!(checked, [CudaPlugin::Primary, CudaPlugin::Fallback]);
+    assert_eq!(
+        state.initialize(false, || panic!("reuse CPU"), |_| panic!("no GPU")),
+        Ok(&7)
+    );
 }
