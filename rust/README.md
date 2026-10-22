@@ -506,6 +506,24 @@ targets keep their existing non-CUDA backends. Plain Cargo builds remain
 non-CUDA unless `--features cuda` is selected. Explicit `prebuilt` mode selects
 the CUDA SDK on x64 without probing or requiring a CUDA compiler.
 
+For direct `cargo build --features cuda` builds using a shared SDK, zg stages
+the linked llama/ggml core libraries beside the executable (and in Cargo's
+`deps`/`examples` directories). Run `target/debug/zg` or `target/release/zg`
+without adding the SDK to `LD_LIBRARY_PATH`. Optional backends still use the
+verified SDK cache; this development output is not a portable distribution.
+Use the npm packaging commands below to assemble a distributable runtime.
+
+CUDA Cargo builds also deploy the pinned official ONNX Runtime CUDA 12 main
+library and its shared/CUDA providers beside the executable, using the same
+SHA-256-verified preparation script as npm packaging (requires Python 3 and
+curl; `PYTHON` can select the interpreter). The archive is reused from
+`target/ort-cuda12` (under the target triple for cross-target builds).
+`CARGO_NET_OFFLINE=true` requires that archive to be cached already. Both
+`--device cpu` and `--device cuda` can then load ORT without `ORT_DYLIB_PATH`
+or `LD_LIBRARY_PATH`; CUDA execution still requires a compatible NVIDIA driver,
+CUDA 12 runtime and cuDNN 9 installed on the host. Non-CUDA Cargo builds retain
+their existing ORT linking behavior and do not download this CUDA runtime.
+
 ```sh
 npm run build
 npm run build -- --cpu-only

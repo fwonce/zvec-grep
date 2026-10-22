@@ -1,0 +1,407 @@
+//! Tests for zg-owned deployment from Cargo's verified SDK metadata.
+#[path = "../llama_runtime_build.rs"]
+mod llama_runtime;
+
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{fmt::Write as _, fs, path::Path};
+
+// Exercise the exact shared preparer, using tiny local archives, not a second
+// Rust implementation of the Python extraction/download contract.
+const ORT_DEPLOYMENT_CHECK: &str = r"
+import importlib.util, io, os, subprocess, sys, tarfile, tempfile, zipfile
+from pathlib import Path
+from unittest.mock import patch
+spec = importlib.util.spec_from_file_location('prepare_ort', sys.argv[1])
+ort = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ort)
+
+def archive_at(path, platform, files):
+    if platform == 'linux':
+        with tarfile.open(path, 'w:gz') as archive:
+            for name in files:
+                data = name.encode()
+                entry = tarfile.TarInfo('bundle/' + name)
+                entry.size = len(data)
+                entry.mtime = 1700000000
+                archive.addfile(entry, io.BytesIO(data))
+    else:
+        with zipfile.ZipFile(path, 'w') as archive:
+            for name in files:
+                entry = zipfile.ZipInfo('bundle/' + name, (2023, 11, 14, 0, 0, 0))
+                archive.writestr(entry, name.encode())
+
+with tempfile.TemporaryDirectory() as temporary:
+    root = Path(temporary)
+    for platform in ('linux', 'win32'):
+        cache = root / platform / 'ort-cuda12'
+        cache.mkdir(parents=True)
+        archive = cache / ('fixture.tgz' if platform == 'linux' else 'fixture.zip')
+        wanted = {**ort.required_files(platform), 'LICENSE': 'licenses/onnxruntime-LICENSE',
+                  'ThirdPartyNotices.txt': 'licenses/onnxruntime-ThirdPartyNotices.txt'}
+        names = [*wanted, '../../unwanted-file']
+        archive_at(archive, platform, names)
+        checksum = ort.digest(archive)
+        ort.DISTRIBUTIONS[platform] = (archive.name, checksum)
+        with patch.object(ort.subprocess, 'run', side_effect=AssertionError('unexpected download')):
+            bundle = root / platform / 'npm-bundle/lib'
+            ort.prepare(cache, bundle, platform, offline=True)
+            assert {p.relative_to(bundle).as_posix() for p in bundle.rglob('*') if p.is_file()} == set(wanted.values())
+            for profile_name in ('debug', 'release', 'target-triple/custom-profile'):
+                profile = root / platform / profile_name
+                def stage():
+                    ort.prepare(cache, profile, platform, cargo=True, offline=True)
+                stage()
+                for directory in (profile, profile / 'deps', profile / 'examples'):
+                    for source, name in wanted.items():
+                        assert (directory / name).read_bytes() == source.encode()
+                        assert not (directory / name).is_symlink()
+                    assert not (directory / 'unwanted-file').exists()
+                files = [profile / name for name in wanted.values()]
+                mtimes = [p.stat().st_mtime_ns for p in files]
+                stage()
+                assert mtimes == [p.stat().st_mtime_ns for p in files]
+                files[0].unlink()
+                files[1].write_bytes(b'corrupt copy')
+                unrelated = profile / 'user-file'
+                unrelated.write_bytes(b'keep')
+                stage()
+                assert mtimes == [p.stat().st_mtime_ns for p in files]
+                assert unrelated.read_bytes() == b'keep'
+                assert ort.digest(archive) == checksum
+                if os.name != 'nt':
+                    files[0].unlink()
+                    files[0].symlink_to(unrelated)
+                    stage()
+                    assert not files[0].is_symlink()
+                    assert unrelated.read_bytes() == b'keep'
+            # Integrity errors must not touch already-deployed files or fetch
+            # in offline mode. This includes incomplete and duplicate payloads.
+            bad = cache / archive.name.replace('fixture', 'invalid')
+            for entries in (names[:-2], [*names, names[0]]):
+                archive_at(bad, platform, entries)
+                before = [p.read_bytes() for p in files]
+                try:
+                    ort.extract_runtime(bad, profile, platform, ort.digest(bad), cargo=True)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError('invalid archive accepted')
+                assert before == [p.read_bytes() for p in files]
+            archive.write_bytes(b'corrupt cache')
+            try:
+                stage()
+            except RuntimeError as error:
+                assert 'Offline build requires' in str(error)
+            else:
+                raise AssertionError('corrupt archive accepted')
+        # CLI routing must honor the current (possibly cross-target) OUT_DIR,
+        # never fall back to downloading when an explicit offline cache misses.
+        out = root / platform / 'isolated/triple/debug/build/zg-hash/out'
+        result = subprocess.run([sys.executable, sys.argv[1], '--platform', platform,
+                                 '--cargo-out-dir', str(out)], capture_output=True, text=True,
+                                env={**os.environ, 'CARGO_NET_OFFLINE': 'true'})
+        assert result.returncode != 0
+        assert 'Offline build requires' in result.stderr
+        assert str(out.parents[3] / 'ort-cuda12') in result.stderr
+";
+
+#[test]
+fn ort_cargo_deployment_is_verified_repeatable_and_repairs_outputs_on_both_platforms() {
+    let python = std::env::var_os("PYTHON")
+        .unwrap_or_else(|| if cfg!(windows) { "python" } else { "python3" }.into());
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/cuda/prepare-onnxruntime.py");
+    let result = std::process::Command::new(python)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg("-c")
+        .arg(ORT_DEPLOYMENT_CHECK)
+        .arg(script)
+        .output()
+        .expect("Python 3 for the shared ORT preparer tests");
+    assert!(
+        result.status.success(),
+        "ORT preparer test failed:\n{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+const LINUX: &str = "x86_64-unknown-linux-gnu";
+const WINDOWS: &str = "x86_64-pc-windows-msvc";
+
+fn save(root: &Path, manifest: &Value) {
+    fs::write(
+        root.join("manifest.json"),
+        serde_json::to_vec(manifest).expect("JSON"),
+    )
+    .expect("write manifest");
+}
+
+fn fixture(target: &str) -> (tempfile::TempDir, Value) {
+    let sdk = tempfile::tempdir().expect("SDK directory");
+    let mut manifest = json!({"schema": 1, "target": target, "linkage": "dynamic",
+        "link_libraries": ["dylib=llama", "dylib=ggml", "static=ggml-cpu"], "files": {}});
+    let names = if target == WINDOWS {
+        vec![
+            "llama.dll",
+            "llama.lib",
+            "ggml.dll",
+            "ggml.lib",
+            "ggml-cpu.lib",
+            "ggml-cpu-x64.dll",
+            "ggml-cuda.dll",
+            "cuda12/ggml-cuda.dll",
+        ]
+    } else {
+        vec![
+            "libllama.so",
+            "libllama.so.0",
+            "libllama.so.0.0.1",
+            "libggml.so",
+            "libggml.so.0",
+            "libggml-cpu.a",
+            "libggml-cpu.so",
+            "libggml-cpu-x64.so",
+            "libggml-cuda.so",
+            "cuda12/libggml-cuda.so",
+        ]
+    };
+    for name in names {
+        let relative = format!("lib/{name}");
+        let path = sdk.path().join(&relative);
+        fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+        fs::write(&path, name).expect("runtime fixture");
+        let mut digest = String::with_capacity(64);
+        for byte in Sha256::digest(name.as_bytes()) {
+            write!(digest, "{byte:02x}").expect("write digest");
+        }
+        manifest["files"][relative] = json!(digest);
+    }
+    save(sdk.path(), &manifest);
+    (sdk, manifest)
+}
+
+#[test]
+fn linux_sonames_are_staged_for_binaries_tests_and_examples_in_each_profile() {
+    for profile in [
+        "debug",
+        "release",
+        "x86_64-unknown-linux-gnu/custom-profile",
+    ] {
+        let (sdk, _) = fixture(LINUX);
+        let target = tempfile::tempdir().expect("target");
+        let profile = target.path().join(profile);
+        let files = llama_runtime::stage(
+            sdk.path(),
+            &sdk.path().join("manifest.json"),
+            LINUX,
+            &profile.join("build/zg-hash/out"),
+        )
+        .expect("stage");
+        assert_eq!(files.len(), 15);
+        for directory in [
+            profile.clone(),
+            profile.join("deps"),
+            profile.join("examples"),
+        ] {
+            for name in [
+                "libllama.so",
+                "libllama.so.0",
+                "libllama.so.0.0.1",
+                "libggml.so",
+                "libggml.so.0",
+            ] {
+                assert_eq!(
+                    fs::read(directory.join(name)).expect("staged library"),
+                    name.as_bytes()
+                );
+            }
+            assert!(!directory.join("cuda12").exists());
+            assert!(!directory.join("libggml-cuda.so").exists());
+            assert!(!directory.join("libggml-cpu.so").exists());
+        }
+    }
+}
+
+#[test]
+fn windows_stages_dlls_not_import_libraries_or_plugins() {
+    let (sdk, _) = fixture(WINDOWS);
+    let target = tempfile::tempdir().expect("target");
+    let files = llama_runtime::stage(
+        sdk.path(),
+        &sdk.path().join("manifest.json"),
+        WINDOWS,
+        &target.path().join("release/build/zg/out"),
+    )
+    .expect("stage");
+    assert_eq!(files.len(), 6);
+    assert!(files.iter().all(|p| {
+        ["llama.dll", "ggml.dll"]
+            .contains(&p.file_name().expect("filename").to_str().expect("UTF-8"))
+    }));
+}
+
+#[test]
+fn unchanged_build_preserves_copies_and_rebuild_repairs_missing_or_modified_files() {
+    let (sdk, _) = fixture(LINUX);
+    let target = tempfile::tempdir().expect("target");
+    let profile = target.path().join("release");
+    let out = profile.join("build/zg/out");
+    let stage = || llama_runtime::stage(sdk.path(), &sdk.path().join("manifest.json"), LINUX, &out);
+    let files = stage().expect("stage");
+    assert_eq!(
+        fs::metadata(profile.join("libllama.so.0"))
+            .expect("staged file")
+            .modified()
+            .expect("mtime"),
+        fs::metadata(sdk.path().join("lib/libllama.so.0"))
+            .expect("SDK")
+            .modified()
+            .expect("mtime"),
+    );
+    let before = fs::metadata(&files[0])
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    stage().expect("incremental stage");
+    assert_eq!(
+        before,
+        fs::metadata(&files[0])
+            .expect("metadata")
+            .modified()
+            .expect("mtime")
+    );
+    fs::write(profile.join("libllama.so.0"), "consumer modification").expect("modify copy");
+    fs::remove_file(profile.join("deps/libggml.so.0")).expect("remove staged file");
+    fs::write(profile.join("unrelated.dll"), "keep").expect("unrelated file");
+    stage().expect("repair");
+    assert_eq!(
+        fs::read(profile.join("libllama.so.0")).expect("repaired"),
+        b"libllama.so.0"
+    );
+    assert_eq!(
+        fs::read(profile.join("deps/libggml.so.0")).expect("restored"),
+        b"libggml.so.0"
+    );
+    assert_eq!(
+        fs::read(sdk.path().join("lib/libllama.so.0")).expect("SDK unchanged"),
+        b"libllama.so.0"
+    );
+    assert_eq!(
+        fs::read(profile.join("unrelated.dll")).expect("preserved"),
+        b"keep"
+    );
+}
+
+#[test]
+fn wrong_metadata_or_modified_sdk_fails_instead_of_using_another_cached_sdk() {
+    let (sdk, manifest) = fixture(LINUX);
+    let target = tempfile::tempdir().expect("target");
+    let out = target.path().join("release/build/zg/out");
+    for (field, value) in [
+        ("schema", json!(2)),
+        ("target", json!(WINDOWS)),
+        ("linkage", json!("unknown")),
+    ] {
+        let mut changed = manifest.clone();
+        changed[field] = value;
+        save(sdk.path(), &changed);
+        assert!(
+            llama_runtime::stage(sdk.path(), &sdk.path().join("manifest.json"), LINUX, &out)
+                .is_err()
+        );
+    }
+    save(sdk.path(), &manifest);
+    fs::write(sdk.path().join("lib/libllama.so.0"), "corrupted SDK").expect("corrupt fixture");
+    assert!(
+        llama_runtime::stage(sdk.path(), &sdk.path().join("manifest.json"), LINUX, &out).is_err()
+    );
+    assert!(
+        llama_runtime::stage(
+            target.path(),
+            &sdk.path().join("manifest.json"),
+            LINUX,
+            &out
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn static_sdk_has_no_shared_library_deployment() {
+    let (sdk, mut manifest) = fixture(LINUX);
+    manifest["linkage"] = json!("static");
+    save(sdk.path(), &manifest);
+    let target = tempfile::tempdir().expect("target");
+    let profile = target.path().join("release");
+    assert!(
+        llama_runtime::stage(
+            sdk.path(),
+            &sdk.path().join("manifest.json"),
+            LINUX,
+            &profile.join("build/zg/out")
+        )
+        .expect("static SDK")
+        .is_empty()
+    );
+    assert!(!profile.exists());
+}
+
+#[test]
+fn deployment_failure_is_retryable_without_touching_sdk() {
+    let (sdk, _) = fixture(LINUX);
+    let target = tempfile::tempdir().expect("target");
+    let profile = target.path().join("release");
+    fs::create_dir(&profile).expect("profile");
+    fs::write(profile.join("examples"), "not a directory").expect("block directory");
+    let stage = || {
+        llama_runtime::stage(
+            sdk.path(),
+            &sdk.path().join("manifest.json"),
+            LINUX,
+            &profile.join("build/zg/out"),
+        )
+    };
+    assert!(stage().is_err());
+    fs::remove_file(profile.join("examples")).expect("unblock fixture");
+    stage().expect("retry succeeds");
+    assert_eq!(
+        fs::read(sdk.path().join("lib/libggml.so.0")).expect("SDK unchanged"),
+        b"libggml.so.0"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn replaces_destination_symlinks_without_changing_their_targets_or_hardlinking_sdk() {
+    use std::os::unix::fs::MetadataExt;
+    let (sdk, _) = fixture(LINUX);
+    let target = tempfile::tempdir().expect("target");
+    let profile = target.path().join("release");
+    fs::create_dir(&profile).expect("profile");
+    let unrelated = target.path().join("unrelated");
+    fs::write(&unrelated, "keep").expect("unrelated file");
+    std::os::unix::fs::symlink(&unrelated, profile.join("libllama.so.0")).expect("symlink");
+    llama_runtime::stage(
+        sdk.path(),
+        &sdk.path().join("manifest.json"),
+        LINUX,
+        &profile.join("build/zg/out"),
+    )
+    .expect("stage");
+    assert_eq!(fs::read(&unrelated).expect("preserved"), b"keep");
+    assert!(
+        !fs::symlink_metadata(profile.join("libllama.so.0"))
+            .expect("copy")
+            .is_symlink()
+    );
+    assert_ne!(
+        fs::metadata(profile.join("libllama.so.0"))
+            .expect("copy")
+            .ino(),
+        fs::metadata(sdk.path().join("lib/libllama.so.0"))
+            .expect("SDK")
+            .ino()
+    );
+}
